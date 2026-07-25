@@ -30,7 +30,7 @@ pub struct ReplayDetectionEvent {
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReplayMetrics {
-    /// Total number of replay attempts detected since initialization
+    /// Total number of replay attempts detected (rejected) since initialization
     pub total_replay_attempts: u64,
     /// Number of unique request IDs that have been replayed
     pub unique_replayed_ids: u64,
@@ -38,6 +38,10 @@ pub struct ReplayMetrics {
     pub last_replay_at: u64,
     /// Ledger sequence when metrics were last updated
     pub last_updated_ledger: u32,
+    /// Total number of attestations accepted (passed all checks including replay detection)
+    pub accepted_events: u64,
+    /// Total number of events skipped (e.g. pre-flight checks failed before reaching replay check)
+    pub skipped_events: u64,
 }
 
 impl Default for ReplayMetrics {
@@ -47,6 +51,8 @@ impl Default for ReplayMetrics {
             unique_replayed_ids: 0,
             last_replay_at: 0,
             last_updated_ledger: 0,
+            accepted_events: 0,
+            skipped_events: 0,
         }
     }
 }
@@ -177,6 +183,43 @@ pub fn get_replay_count_for_id(env: &Env, request_id: &Bytes) -> u64 {
         .instance()
         .get::<_, u32>(&attempt_key)
         .unwrap_or(0) as u64
+}
+
+/// Record a successfully accepted event (passed all checks including replay detection).
+///
+/// Should be called after an attestation is committed to storage.
+///
+/// # Arguments
+///
+/// * `env` - The Soroban environment
+pub fn record_accepted_event(env: &Env) {
+    let metrics_key = soroban_sdk::symbol_short!("REPLAYM");
+    let mut metrics: ReplayMetrics = env
+        .storage()
+        .instance()
+        .get::<_, ReplayMetrics>(&metrics_key)
+        .unwrap_or_default();
+    metrics.accepted_events += 1;
+    metrics.last_updated_ledger = env.ledger().sequence();
+    env.storage().instance().set(&metrics_key, &metrics);
+}
+
+/// Record a skipped event (rejected before or outside the replay check, e.g. timestamp invalid,
+/// rate limit exceeded, or attestor not registered).
+///
+/// # Arguments
+///
+/// * `env` - The Soroban environment
+pub fn record_skipped_event(env: &Env) {
+    let metrics_key = soroban_sdk::symbol_short!("REPLAYM");
+    let mut metrics: ReplayMetrics = env
+        .storage()
+        .instance()
+        .get::<_, ReplayMetrics>(&metrics_key)
+        .unwrap_or_default();
+    metrics.skipped_events += 1;
+    metrics.last_updated_ledger = env.ledger().sequence();
+    env.storage().instance().set(&metrics_key, &metrics);
 }
 
 /// Get a specific replay detection event record by ID.
