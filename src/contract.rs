@@ -458,6 +458,9 @@ pub enum KycStatus {
     Approved = 2,
     Rejected = 3,
     Expired = 4,
+    /// An admin has explicitly reopened a previously rejected application,
+    /// allowing the subject to re-submit without waiting for a new review cycle.
+    Reopened = 5,
 }
 
 #[contracttype]
@@ -1164,10 +1167,23 @@ fn current_kyc_status(env: &Env, record: &KycRecord) -> KycStatus {
         2 => KycStatus::Approved,
         3 => KycStatus::Rejected,
         4 => KycStatus::Expired,
+        5 => KycStatus::Reopened,
         _ => KycStatus::NotSubmitted,
     }
 }
 
+/// Validate whether transitioning from `current` to `next` is permitted.
+///
+/// Allowed state machine edges:
+/// ```text
+/// NotSubmitted ──► Pending
+/// Expired      ──► Pending
+/// Rejected     ──► Pending   (direct re-submission after 24 h cooldown)
+/// Reopened     ──► Pending   (admin-reopened, subject re-submits)
+/// Pending      ──► Approved
+/// Pending      ──► Rejected
+/// Rejected     ──► Reopened  (admin explicitly re-opens for review)
+/// ```
 fn validate_kyc_transition(current: KycStatus, next: KycStatus, record: &KycRecord, now: u64) -> bool {
     if next == KycStatus::Pending && now.saturating_sub(record.submitted_at) < 86400 {
         return false;
@@ -1177,8 +1193,10 @@ fn validate_kyc_transition(current: KycStatus, next: KycStatus, record: &KycReco
         (KycStatus::NotSubmitted, KycStatus::Pending) => true,
         (KycStatus::Expired, KycStatus::Pending) => true,
         (KycStatus::Rejected, KycStatus::Pending) => true,
+        (KycStatus::Reopened, KycStatus::Pending) => true,
         (KycStatus::Pending, KycStatus::Approved) => true,
         (KycStatus::Pending, KycStatus::Rejected) => true,
+        (KycStatus::Rejected, KycStatus::Reopened) => true,
         _ => false,
     }
 }
@@ -4213,6 +4231,44 @@ impl AnchorKitContract {
         );
     }
 
+    /// Reopen a rejected KYC record so the subject may re-submit.
+    ///
+    /// `operator` must be the primary admin or hold [`AdminRole::KycAdmin`].
+    /// The record transitions `Rejected → Reopened`, which then allows
+    /// `submit_kyc` to advance it to `Pending` without the usual 24 h cooldown
+    /// being re-applied from the original submission timestamp.
+    pub fn reopen_kyc(env: Env, operator: Address, subject: Address) {
+        Self::require_admin_or_role(&env, &operator, AdminRole::KycAdmin);
+        let now = env.ledger().timestamp();
+        let key = kyc_record_key(&env, &subject);
+        let mut record: KycRecord = env.storage().persistent().get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::KycNotFound));
+        let current_status = current_kyc_status(&env, &record);
+        if !validate_kyc_transition(current_status, KycStatus::Reopened, &record, now) {
+            panic_with_error!(&env, ErrorCode::IllegalTransition);
+        }
+        record.status = KycStatus::Reopened as u32;
+        record.reviewed_at = Some(now);
+        env.storage().persistent().set(&key, &record);
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_TTL, PERSISTENT_TTL);
+        AdminAuditLog::log_action(
+            &env,
+            &operator,
+            "reopen_kyc",
+            subject.to_string(),
+            "Rejected",
+            "Reopened",
+        );
+        env.events().publish(
+            (symbol_short!("kyc"), symbol_short!("reopened"), subject.clone()),
+            KycStatusChangedEvent {
+                subject,
+                new_status: KycStatus::Reopened as u32,
+                timestamp: now,
+            },
+        );
+    }
+
     pub fn get_kyc_status(env: Env, subject: Address) -> KycStatus {
         let key = kyc_record_key(&env, &subject);
         if !env.storage().persistent().has(&key) {
@@ -4231,6 +4287,7 @@ impl AnchorKitContract {
             2 => KycStatus::Approved,
             3 => KycStatus::Rejected,
             4 => KycStatus::Expired,
+            5 => KycStatus::Reopened,
             _ => KycStatus::NotSubmitted,
         }
     }
@@ -6896,6 +6953,7 @@ impl AnchorKitContract {
             2 => KycStatus::Approved,
             3 => KycStatus::Rejected,
             4 => KycStatus::Expired,
+            5 => KycStatus::Reopened,
             _ => KycStatus::NotSubmitted,
         }
     }
