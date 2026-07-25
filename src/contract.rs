@@ -58,6 +58,15 @@ pub struct Quote {
     pub routing_reason: Option<String>,
 }
 
+/// Explicit lifecycle state for a quote (#591, also used by fallback routing).
+#[contracttype]
+#[derive(Copy, Clone, Debug, PartialEq)]
+#[repr(u32)]
+pub enum QuoteLifecycleState {
+    Active = 0,
+    Invalidated = 1,
+}
+
 /// Pre-v2 quote layout without `routing_reason`. Used when reading legacy records
 /// that were persisted before the field was added to the schema.
 #[contracttype]
@@ -1204,6 +1213,12 @@ fn kyc_record_key(env: &Env, subject: &Address) -> BytesN<32> {
     let xdr = subject.clone().to_xdr(env);
     let raw = xdr_to_vec(&xdr);
     make_storage_key(env, &[b"KYC", &raw])
+}
+
+fn quote_lifecycle_key(env: &Env, anchor: &Address, quote_id: u64) -> BytesN<32> {
+    let xdr = anchor.clone().to_xdr(env);
+    let raw = xdr_to_vec(&xdr);
+    make_storage_key(env, &[b"QLIFE", &raw, &quote_id.to_be_bytes()])
 }
 
 fn compliance_check_key(env: &Env, subject: &Address, check_type: &String) -> BytesN<32> {
@@ -6107,6 +6122,74 @@ impl AnchorKitContract {
         );
 
         best
+    }
+
+    // -----------------------------------------------------------------------
+    // Fallback quote selection (#593)
+    // -----------------------------------------------------------------------
+
+    /// Route a transaction with explicit fallback anchor support.
+    ///
+    /// Behaves identically to [`route_transaction`] but first attempts to use
+    /// the quote from `preferred_anchor`. If that anchor is unavailable,
+    /// blacklisted, or has no valid non-invalidated quote for the requested
+    /// asset pair, the function falls back to the normal scoring strategy over
+    /// all remaining candidates and emits a `quote/fallback` event so the
+    /// selection is auditable.
+    pub fn route_with_fallback(
+        env: Env,
+        options: RoutingOptions,
+        preferred_anchor: Address,
+    ) -> Quote {
+        validate_currency_code(&env, &options.request.base_asset);
+        validate_currency_code(&env, &options.request.quote_asset);
+        let now = env.ledger().timestamp();
+
+        // Try the preferred anchor first.
+        let preferred_quote: Option<Quote> = (|| {
+            if Self::is_anchor_blacklisted_internal(&env, &preferred_anchor) {
+                return None;
+            }
+            let meta: RoutingAnchorMeta = anchor_meta_opt(&env, &preferred_anchor)?;
+            if !meta.is_active { return None; }
+            let anchor_xdr = preferred_anchor.clone().to_xdr(&env);
+            let anchor_raw = xdr_to_vec(&anchor_xdr);
+            let lq_key = make_storage_key(&env, &[b"LATESTQ", &anchor_raw]);
+            let quote_id: u64 = env.storage().persistent().get(&lq_key)?;
+            let q_key = make_storage_key(&env, &[b"QUOTE", &anchor_raw, &quote_id.to_be_bytes()]);
+            let quote: Quote = env.storage().persistent().get(&q_key)?;
+            if quote.base_asset != options.request.base_asset
+                || quote.quote_asset != options.request.quote_asset
+            {
+                return None;
+            }
+            if quote.valid_until <= now { return None; }
+            let lc_key = quote_lifecycle_key(&env, &preferred_anchor, quote_id);
+            let lc: u32 = env.storage().persistent().get(&lc_key).unwrap_or(0u32);
+            if lc == QuoteLifecycleState::Invalidated as u32 { return None; }
+            if options.request.amount < quote.minimum_amount
+                || (quote.maximum_amount != 0 && options.request.amount > quote.maximum_amount)
+            {
+                return None;
+            }
+            Some(quote)
+        })();
+
+        if let Some(q) = preferred_quote {
+            env.events().publish(
+                (symbol_short!("quote"), symbol_short!("routed"), q.quote_id),
+                q.quote_id,
+            );
+            return q;
+        }
+
+        // Preferred anchor unavailable — fall back to standard routing and
+        // emit a fallback event so the decision is auditable.
+        env.events().publish(
+            (symbol_short!("quote"), symbol_short!("fallback"), 0u64),
+            0u64,
+        );
+        Self::route_transaction(env, options)
     }
 
     /// Return up to `max_results` quotes sorted by descending weighted composite score.
