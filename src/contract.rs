@@ -534,6 +534,19 @@ pub struct MetadataFreshnessReport {
     pub age_seconds: u64,
     /// Whether a background refresh is recommended.
     pub needs_refresh: bool,
+    /// Freshness confidence score in the range [0, 100].
+    ///
+    /// Reflects how trustworthy the cached value is given its age, validation
+    /// history, and lifecycle state.  Callers use this to rank cached entries
+    /// and decide when to proactively refresh rather than serving stale data.
+    ///
+    /// | Score range | Meaning |
+    /// |-------------|---------|
+    /// | 80–100      | Fresh — within primary TTL |
+    /// | 50–79       | Stale — within SWR grace window; refresh recommended |
+    /// | 1–49        | Aging — primary TTL nearly exhausted; still usable |
+    /// | 0           | Missing or expired — do not serve |
+    pub freshness_score: u32,
 }
 
 /// Rate limiter health report returned by [`AnchorKitContract::get_rate_limiter_health`].
@@ -7109,8 +7122,23 @@ impl AnchorKitContract {
     /// Metadata freshness report for a given anchor.
     ///
     /// Returns the cache state together with the age of the entry in seconds
-    /// (zero when missing). Callers can use this to detect stale or expired
-    /// metadata without triggering a panic.
+    /// (zero when missing), and a [`MetadataFreshnessReport::freshness_score`]
+    /// in [0, 100] that operators can use to rank cached values and decide when
+    /// to refresh proactively.
+    ///
+    /// ## Scoring heuristics
+    ///
+    /// The score combines three factors:
+    ///
+    /// 1. **Age factor** — linear decay from 100 → 0 over `ttl_seconds`.
+    ///    Entries close to expiry score lower.
+    /// 2. **State bonus/penalty** — `Fresh` keeps the age score unchanged;
+    ///    `Stale` (SWR window) halves it; `Expired` or `Missing` → 0.
+    /// 3. **Needs-refresh penalty** — deducts 10 points when `needs_refresh`
+    ///    is already set in the stored entry, signalling a known staleness.
+    ///
+    /// The result is clamped to [0, 100].  Callers should prefer entries
+    /// with higher scores when multiple cached anchors are available.
     pub fn get_metadata_freshness(env: Env, anchor: Address) -> MetadataFreshnessReport {
         let key = (symbol_short!("METACACHE"), anchor.clone());
         match env.storage().temporary().get::<_, MetadataCache>(&key) {
@@ -7119,6 +7147,7 @@ impl AnchorKitContract {
                 state: MetadataCacheState::Missing,
                 age_seconds: 0,
                 needs_refresh: false,
+                freshness_score: 0,
             },
             Some(entry) => {
                 let now = env.ledger().timestamp();
@@ -7130,14 +7159,72 @@ impl AnchorKitContract {
                 } else {
                     MetadataCacheState::Expired
                 };
+                let needs_refresh = entry.needs_refresh || state != MetadataCacheState::Fresh;
+                let freshness_score = Self::compute_freshness_score(
+                    age,
+                    entry.ttl_seconds,
+                    entry.stale_ttl_seconds,
+                    state,
+                    entry.needs_refresh,
+                );
                 MetadataFreshnessReport {
                     anchor,
                     state,
                     age_seconds: age,
-                    needs_refresh: entry.needs_refresh || state != MetadataCacheState::Fresh,
+                    needs_refresh,
+                    freshness_score,
                 }
             }
         }
+    }
+
+    /// Compute a freshness score in [0, 100] for a cache entry.
+    ///
+    /// Internal helper split out so it can be tested independently.
+    ///
+    /// ## Algorithm
+    ///
+    /// 1. If `state` is `Expired` or `Missing` → return 0.
+    /// 2. Compute `age_score` = `100 * (1 - age / ttl_seconds)`, clamped to [0, 100].
+    /// 3. If `state` is `Stale`, halve `age_score` (SWR penalty).
+    /// 4. If `needs_refresh_flag` is set, subtract 10 (known-stale penalty).
+    /// 5. Clamp the result to [0, 100].
+    fn compute_freshness_score(
+        age_seconds: u64,
+        ttl_seconds: u64,
+        _stale_ttl_seconds: u64,
+        state: MetadataCacheState,
+        needs_refresh_flag: bool,
+    ) -> u32 {
+        match state {
+            MetadataCacheState::Missing | MetadataCacheState::Expired => return 0,
+            MetadataCacheState::Fresh | MetadataCacheState::Stale => {}
+        }
+
+        // Age factor: linear decay from 100 down to 0 over the primary TTL.
+        let age_score: u32 = if ttl_seconds == 0 {
+            // No TTL configured — treat as perfectly fresh.
+            100
+        } else if age_seconds >= ttl_seconds {
+            // Past the primary TTL — in the SWR window.
+            0
+        } else {
+            // age_ratio is in [0, 1); invert to get freshness.
+            let remaining = ttl_seconds.saturating_sub(age_seconds);
+            // Scale to [0, 100]
+            ((remaining * 100) / ttl_seconds) as u32
+        };
+
+        // State penalty: halve the score when in the SWR stale window.
+        let after_state: u32 = if state == MetadataCacheState::Stale {
+            age_score / 2
+        } else {
+            age_score
+        };
+
+        // Needs-refresh penalty.
+        let penalty: u32 = if needs_refresh_flag { 10 } else { 0 };
+        after_state.saturating_sub(penalty).min(100)
     }
 
     /// Rate limiter health for a given attestor.

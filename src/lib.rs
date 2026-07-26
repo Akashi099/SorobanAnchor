@@ -123,7 +123,7 @@ extern crate alloc;
 
 // ── Core modules (all build variants) ────────────────────────────────────────
 pub mod deterministic_hash;
-mod domain_validator;
+pub mod domain_validator;
 pub mod errors;
 pub mod sep10_jwt;
 pub mod rate_limiter;
@@ -168,6 +168,7 @@ pub mod mock;
 
 // ── Core re-exports ───────────────────────────────────────────────────────────
 pub use domain_validator::validate_anchor_domain;
+pub use domain_validator::{validate_anchor_domain_with_policy, DomainPolicy, DomainPolicyRule, PolicyAction};
 pub use errors::{AnchorKitError, ErrorCode};
 pub use errors::normalize_asset_code;
 /// Backward-compatible alias. Prefer [`AnchorKitError`] for new code.
@@ -186,7 +187,11 @@ pub use config::{load_runtime_config_file, parse_runtime_config_str, ConfigForma
 
 // ── Host-only re-exports ──────────────────────────────────────────────────────
 #[cfg(not(feature = "wasm"))]
-pub use http_client::{ProxyConfig, build_client, fetch_stellar_toml_with_proxy, deliver_webhook_with_proxy};
+pub use http_client::{ProxyConfig, build_client, build_client_with_policy, fetch_stellar_toml_with_proxy, deliver_webhook_with_proxy};
+#[cfg(not(feature = "wasm"))]
+pub use http_client::{ConnectionPolicy, TransportErrorKind, classify_transport_error, is_transport_error_retryable};
+#[cfg(not(feature = "wasm"))]
+pub use http_client::{OutboundRequestOptions, post_with_options, verify_outbound_signature};
 #[cfg(not(feature = "wasm"))]
 pub use response_validator::{
     validate_anchor_info_response, validate_deposit_response, validate_quote_response,
