@@ -136,6 +136,7 @@ pub mod anchor_health;
 pub mod service_management;
 pub mod admin_audit_log;
 pub mod cache_governance;
+pub mod url_normalizer;
 
 // ── std-only modules (filesystem, runtime config) ─────────────────────────────
 #[cfg(feature = "std")]
@@ -179,6 +180,8 @@ pub use contract::{AnchorKitContract, AnchorTomlProvenance, EndpointUpdated, Cac
 pub use transaction_state_tracker::{TransactionState, TransactionStateRecord, RecoveryMetadata, OptRecovery};
 pub use transaction_state_tracker::{StorageBudgetMonitor, TransactionStateTracker};
 pub use transaction_state_tracker::TransactionSummary;
+pub use url_normalizer::{normalize_url, normalize_and_validate, extract_hostname, UrlFilterPolicy, UrlFilterEntry};
+pub use cache_governance::{CachePolicy, CachePolicySet, CacheEntryType, CacheGovernanceConfig};
 
 // ── std-only re-exports ───────────────────────────────────────────────────────
 #[cfg(feature = "std")]
