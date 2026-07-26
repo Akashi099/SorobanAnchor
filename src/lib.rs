@@ -136,6 +136,8 @@ pub mod anchor_health;
 pub mod service_management;
 pub mod admin_audit_log;
 pub mod cache_governance;
+pub mod session_state_machine;
+pub mod migration;
 
 // ── std-only modules (filesystem, runtime config) ─────────────────────────────
 #[cfg(feature = "std")]
@@ -176,6 +178,9 @@ pub use rate_limiter::{RateLimiter, RateLimitConfig, RateLimitState};
 pub use retry::{retry_with_backoff, is_retryable, RetryConfig, JitterSource, LedgerJitterSource, MockJitterSource};
 pub use deterministic_hash::{compute_payload_hash, verify_payload_hash};
 pub use contract::{AnchorKitContract, AnchorTomlProvenance, EndpointUpdated, CacheConfig};
+pub use contract::{AdminRole, AdminCapability};
+pub use session_state_machine::{SessionState, SessionTransitionError};
+pub use migration::{MigrationRecord, MigrationError, MigrationStep, SCHEMA_V1, SCHEMA_V2, LATEST_SCHEMA_VERSION};
 pub use transaction_state_tracker::{TransactionState, TransactionStateRecord, RecoveryMetadata, OptRecovery};
 pub use transaction_state_tracker::{StorageBudgetMonitor, TransactionStateTracker};
 pub use transaction_state_tracker::TransactionSummary;

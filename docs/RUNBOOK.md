@@ -11,8 +11,9 @@ This document describes the complete lifecycle for building, deploying, validati
 3. [Deployment](#deployment)
 4. [Post-Deployment Validation](#post-deployment-validation)
 5. [Upgrade Procedure](#upgrade-procedure)
-6. [Failure Recovery / Rollback](#failure-recovery--rollback)
-7. [Troubleshooting Common Issues](#troubleshooting-common-issues)
+6. [Admin Capability Management](#admin-capability-management)
+7. [Failure Recovery / Rollback](#failure-recovery--rollback)
+8. [Troubleshooting Common Issues](#troubleshooting-common-issues)
 
 ---
 
@@ -154,15 +155,18 @@ soroban contract invoke \
 
 ### Pre-Upgrade Steps
 
-1. Create a configuration snapshot (if applicable):
-```rust
-// Using the service management API
-let snapshot_id = ServiceManager::create_snapshot(
-    &env,
-    &anchor,
-    &current_services,
-    "pre_upgrade_2024_06_01",
-);
+1. Create a configuration snapshot before any change:
+```bash
+soroban contract invoke \
+  --id <contract-id> \
+  --source $ANCHOR_ADMIN_SECRET \
+  --network $SOROBAN_NETWORK \
+  -- \
+  snapshot_services \
+  --caller <admin-address> \
+  --anchor <anchor-address> \
+  --services '[1,2,3]' \
+  --description '"pre_upgrade_$(date +%Y%m%d)"'
 ```
 
 2. Build the new version:
@@ -170,19 +174,22 @@ let snapshot_id = ServiceManager::create_snapshot(
 make release
 ```
 
-3. Verify the new WASM checksum against published release notes.
+3. Verify the new WASM checksum against published release notes — **never upgrade with an unverified hash**.
 
 ### Perform Upgrade
 
-1. Deploy the new WASM:
+The upgrade is a two-step process: `upgrade` (swaps the WASM binary) followed by `migrate` (advances the schema version). Both steps require admin authorization.
+
+**Step 1 — Install the new WASM:**
 ```bash
 soroban contract install \
   --wasm dist/anchorkit-<NEW-VERSION>/anchorkit.wasm \
   --source $ANCHOR_ADMIN_SECRET \
   --network $SOROBAN_NETWORK
+# Capture the printed WASM hash — you will need it in step 2.
 ```
 
-2. Upgrade the contract:
+**Step 2 — Upgrade the live contract:**
 ```bash
 soroban contract invoke \
   --id <contract-id> \
@@ -190,12 +197,103 @@ soroban contract invoke \
   --network $SOROBAN_NETWORK \
   -- \
   upgrade \
-  --wasm_hash <new-wasm-hash>
+  --new_wasm_hash <new-wasm-hash>
 ```
+
+> The contract validates that `new_wasm_hash` is **not all-zero bytes** before applying the upgrade. A zeroed hash causes an immediate `ValidationError` (code 15) before any state is modified.
+
+**Step 3 — Run the schema migration (if the new version adds one):**
+```bash
+soroban contract invoke \
+  --id <contract-id> \
+  --source $ANCHOR_ADMIN_SECRET \
+  --network $SOROBAN_NETWORK \
+  -- \
+  migrate \
+  --new_schema_version <target-version> \
+  --batch_size 100
+```
+
+If the migration processes records in batches (e.g., v1→v2 quote rewrite), re-run the command until `get_schema_version` returns the target version:
+
+```bash
+# Check current version
+soroban contract invoke --id <contract-id> --network $SOROBAN_NETWORK -- get_schema_version
+
+# Keep running until version matches target
+while [ "$(soroban contract invoke --id <contract-id> --network $SOROBAN_NETWORK -- get_schema_version)" != "<target-version>" ]; do
+  soroban contract invoke --id <contract-id> --source $ANCHOR_ADMIN_SECRET --network $SOROBAN_NETWORK -- migrate --new_schema_version <target-version> --batch_size 100
+done
+```
+
+> `migrate` rejects any `new_schema_version` higher than the highest version the current WASM binary understands. This prevents accidentally committing a schema the code cannot interpret.
 
 ### Post-Upgrade Validation
 
 Repeat all steps in [Post-Deployment Validation](#post-deployment-validation).
+
+---
+
+## Admin Capability Management
+
+AnchorKit uses a fine-grained capability model in addition to the coarse-grained role model. The primary admin implicitly holds every capability and role. Delegates can be granted individual capabilities without receiving a full admin role.
+
+### Capability reference
+
+| Capability | Numeric | Grants access to |
+|-----------|---------|-----------------|
+| `UpgradeContract` | 0 | `upgrade` |
+| `MigrateSchema` | 1 | `migrate` |
+| `SetCacheConfig` | 2 | `set_cache_config`, `set_governance_config` |
+| `ManageAttestors` | 3 | `register_attestor`, `revoke_attestor` and session variants |
+| `ManageKyc` | 4 | `approve_kyc`, `reject_kyc` |
+| `ManageCacheEntries` | 5 | All `cache_*` and `refresh_*_cache*` methods |
+| `ToggleServices` | 6 | `enable_service`, `disable_service`, `snapshot_services`, `rollback_services` |
+| `SetRateLimits` | 7 | `set_rate_limit_config`, `set_role_rate_limit` |
+| `SetJwtConfig` | 8 | `set_sep10_jwt_verifying_key`, `rotate_sep10_key`, `set_jwt_max_len`, `set_jwt_skew` |
+| `ManageAnchorMetadata` | 9 | `set_anchor_metadata`, `reactivate_anchor`, `blacklist_anchor`, `unblacklist_anchor` |
+
+### Granting a capability
+
+```bash
+soroban contract invoke \
+  --id <contract-id> \
+  --source $ANCHOR_ADMIN_SECRET \
+  --network $SOROBAN_NETWORK \
+  -- \
+  grant_capability \
+  --grantee <delegate-address> \
+  --capability 6   # ToggleServices
+```
+
+### Revoking a capability
+
+```bash
+soroban contract invoke \
+  --id <contract-id> \
+  --source $ANCHOR_ADMIN_SECRET \
+  --network $SOROBAN_NETWORK \
+  -- \
+  revoke_capability \
+  --grantee <delegate-address> \
+  --capability 6
+```
+
+### Checking a capability
+
+```bash
+soroban contract invoke \
+  --id <contract-id> \
+  --network $SOROBAN_NETWORK \
+  -- \
+  has_capability \
+  --address <delegate-address> \
+  --capability 6
+```
+
+### Authorization failure behaviour
+
+All privilege failures return `Unauthorized` (code 28) regardless of whether the check was a role check, a capability check, or a raw admin check. This makes authorization failures consistent and unambiguous in logs and monitoring.
 
 ---
 
@@ -205,9 +303,17 @@ Repeat all steps in [Post-Deployment Validation](#post-deployment-validation).
 
 If a deployment or upgrade causes issues:
 
-1. **Pause affected services** (using service management API):
-```rust
-ServiceManager::disable_all_services(&env, &anchor, &all_services);
+1. **Pause affected services** (using the service toggle API):
+```bash
+soroban contract invoke \
+  --id <contract-id> \
+  --source $ANCHOR_ADMIN_SECRET \
+  --network $SOROBAN_NETWORK \
+  -- \
+  disable_service \
+  --caller <admin-address> \
+  --anchor <anchor-address> \
+  --service_code 1   # repeat for each service code
 ```
 
 2. **Collect diagnostic information**:
@@ -239,15 +345,63 @@ soroban contract invoke \
 ```
 
 4. Restore service configuration from snapshot:
-```rust
-ServiceManager::rollback_to_snapshot(&env, snapshot_id);
+```bash
+soroban contract invoke \
+  --id <contract-id> \
+  --source $ANCHOR_ADMIN_SECRET \
+  --network $SOROBAN_NETWORK \
+  -- \
+  rollback_services \
+  --caller <admin-address> \
+  --snapshot_id <snapshot-id>
 ```
 
 5. Verify rollback with validation steps.
 
 ---
 
-## Troubleshooting Common Issues
+## Migration Framework
+
+All schema upgrades are managed through the formal migration framework (`src/migration.rs`). This ensures every upgrade is validated, recorded, and auditable.
+
+### How it works
+
+1. `initialize()` stamps the initial schema version (`V1 = 1`) using `migration::set_version`.
+2. `migrate(new_schema_version, batch_size)` validates the target version against the registered migration step table, runs the data transformation, then calls `migration::commit_version` which atomically advances the stored version **and** writes a `MigrationRecord` to persistent storage.
+3. The stored version is never advanced until all data writes are complete. A batch that is still in progress returns early without committing — call `migrate` again to continue.
+
+### Checking migration history
+
+```bash
+# Current schema version
+soroban contract invoke --id <contract-id> --network $SOROBAN_NETWORK \
+  -- get_schema_version
+
+# Number of migrations applied
+soroban contract invoke --id <contract-id> --network $SOROBAN_NETWORK \
+  -- get_migration_count
+
+# Details of the first migration (index 0)
+soroban contract invoke --id <contract-id> --network $SOROBAN_NETWORK \
+  -- get_migration_record --idx 0
+```
+
+### Schema version table
+
+| Version | Constant | Description |
+|---------|----------|-------------|
+| 1 | `SCHEMA_V1` | Initial schema — written by `initialize()` |
+| 2 | `SCHEMA_V2` | Adds `routing_reason` field to `Quote` records |
+
+### Adding a new migration in future releases
+
+1. Increment `LATEST_SCHEMA_VERSION` in `src/migration.rs`.
+2. Add a new `MigrationStep::ToV<N>` variant with `required_from`, `produces`, and `label` implementations.
+3. Add the step to the `ALL_STEPS` slice.
+4. Implement the data transformation in `AnchorKitContract::migrate` in `contract.rs`.
+5. The framework will automatically enforce version ordering and record the migration history.
+
+---
 
 ### Issue: Deployment Fails with "Invalid WASM"
 
@@ -259,9 +413,12 @@ ServiceManager::rollback_to_snapshot(&env, snapshot_id);
 ### Issue: Contract Invocation Fails with "Unauthorized"
 
 **Solution**:
-1. Verify the source account has admin privileges
-2. Check the SEP-10 JWT (if applicable) is valid and not expired
-3. Verify the multi-signature setup (if used)
+1. Verify the source account is the primary admin, or holds the required role/capability for the operation
+2. Use `has_role` or `has_capability` to check what the caller currently holds
+3. Check the SEP-10 JWT (if applicable) is valid and not expired
+4. For service-toggle operations, ensure the caller has `AdminCapability::ToggleServices` (code 6)
+5. For KYC operations, ensure the caller has `AdminRole::KycAdmin` (0) or `AdminCapability::ManageKyc` (4)
+6. All authorization failures now return `Unauthorized` (code 28) — see the [Contract Functions](./CONTRACT_FUNCTIONS.md) error codes table
 
 ### Issue: Service State Not Persisting
 
