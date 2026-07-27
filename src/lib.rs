@@ -136,6 +136,8 @@ pub mod anchor_health;
 pub mod service_management;
 pub mod admin_audit_log;
 pub mod cache_governance;
+pub mod session_state_machine;
+pub mod migration;
 
 // ── std-only modules (filesystem, runtime config) ─────────────────────────────
 #[cfg(feature = "std")]
