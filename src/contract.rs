@@ -143,6 +143,40 @@ pub struct Attestation {
     pub schema_version: u32,
 }
 
+/// Filter parameters accepted by [`AnchorKitContract::get_attestations_paginated`].
+///
+/// Every field is optional; `None` means "no restriction on this dimension".
+/// When multiple fields are set the results must satisfy **all** of them
+/// (logical AND).
+#[contracttype]
+#[derive(Clone)]
+pub struct AttestationFilter {
+    /// When `Some`, only attestations whose `issuer` matches are returned.
+    pub issuer: Option<Address>,
+    /// When `Some`, only attestations whose `subject` matches are returned.
+    pub subject: Option<Address>,
+    /// When `Some`, only attestations with `timestamp >= from_timestamp` are returned.
+    pub from_timestamp: Option<u64>,
+    /// When `Some`, only attestations with `timestamp <= to_timestamp` are returned.
+    pub to_timestamp: Option<u64>,
+    /// When `Some`, only attestations whose numeric `id >= min_id` are returned.
+    pub min_id: Option<u64>,
+}
+
+/// A single page of attestation records returned by
+/// [`AnchorKitContract::get_attestations_paginated`].
+#[contracttype]
+#[derive(Clone)]
+pub struct AttestationPage {
+    /// The attestation records in this page, in ascending ID order.
+    pub records: Vec<Attestation>,
+    /// The offset that should be passed to the next call to continue iteration,
+    /// or `total` when this is the last page.
+    pub next_offset: u64,
+    /// Total number of attestations stored (unfiltered upper bound for iteration).
+    pub total: u64,
+}
+
 /// Input record for [`AnchorKitContract::submit_attestation_batch`].
 #[contracttype]
 #[derive(Clone)]
@@ -1154,6 +1188,14 @@ const INSTANCE_TTL: u32 = 518_400;
 
 /// Default session lifetime in seconds (1 hour). Used when session_ttl_seconds is zero.
 pub const DEFAULT_SESSION_TTL: u64 = 3600;
+
+/// Maximum number of attestations that can be submitted in a single batch call.
+pub const MAX_BATCH_SIZE: usize = 25;
+
+/// Rate-limit slot multiplier applied per attestation in a batch submission.
+/// Each attestation in a batch consumes this many rate-limit slots so that
+/// batch callers cannot trivially bypass per-submission limits.
+pub const BATCH_ATTESTATION_RATE_MULTIPLIER: u32 = 5;
 
 /// Maximum operations allowed per session before it is considered exhausted.
 pub const MAX_OPS_PER_SESSION: u64 = 100;
@@ -4101,6 +4143,124 @@ impl AnchorKitContract {
             .persistent()
             .get::<_, u64>(&used_key)
             .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::AttestationNotFound))
+    }
+
+    /// Return a filtered, paginated page of attestation records.
+    ///
+    /// Records are iterated in ascending ID order. The caller supplies an
+    /// `offset` (number of matching records to skip) and a `limit` (max
+    /// records to return, capped at 50). An optional [`AttestationFilter`]
+    /// narrows results by `issuer`, `subject`, timestamp range, or minimum ID.
+    ///
+    /// # Arguments
+    ///
+    /// * `offset` - Number of matching records to skip before collecting.
+    /// * `limit`  - Maximum records to include in the page (capped at 50).
+    /// * `filter` - Optional filter; pass `None` to retrieve all attestations.
+    ///
+    /// # Returns
+    ///
+    /// An [`AttestationPage`] containing the matching records, the next offset
+    /// for continued iteration, and the total unfiltered attestation count.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use soroban_sdk::Env;
+    /// use anchorkit::contract::{AnchorKitContract, AttestationFilter};
+    ///
+    /// let env = Env::default();
+    /// // First page, no filter
+    /// let page = AnchorKitContract::get_attestations_paginated(env, 0, 20, None);
+    /// ```
+    pub fn get_attestations_paginated(
+        env: Env,
+        offset: u64,
+        limit: u64,
+        filter: Option<AttestationFilter>,
+    ) -> AttestationPage {
+        const PAGE_CAP: u64 = 50;
+        let effective_limit = limit.min(PAGE_CAP);
+
+        // Read the global ATIDX index — it holds every attestation ID in
+        // insertion order. An absent index means no attestations have been
+        // submitted yet.
+        let idx_key = make_storage_key(&env, &[b"ATIDX"]);
+        let all_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&idx_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let total = all_ids.len() as u64;
+        let mut records = Vec::new(&env);
+        let mut skipped: u64 = 0;
+        let mut next_offset = total; // default: last page
+
+        for id in all_ids.iter() {
+            // Fast-path: apply min_id filter without loading the record.
+            if let Some(ref f) = filter {
+                if let Some(min_id) = f.min_id {
+                    if id < min_id {
+                        continue;
+                    }
+                }
+            }
+
+            let attest_key = make_storage_key(&env, &[b"ATTEST", &id.to_be_bytes()]);
+            let record: Attestation = match env.storage().persistent().get(&attest_key) {
+                Some(r) => r,
+                None => continue, // expired entry — skip silently
+            };
+
+            // Apply remaining filter dimensions.
+            if let Some(ref f) = filter {
+                if let Some(ref issuer) = f.issuer {
+                    if record.issuer != *issuer {
+                        continue;
+                    }
+                }
+                if let Some(ref subject) = f.subject {
+                    if record.subject != *subject {
+                        continue;
+                    }
+                }
+                if let Some(from_ts) = f.from_timestamp {
+                    if record.timestamp < from_ts {
+                        continue;
+                    }
+                }
+                if let Some(to_ts) = f.to_timestamp {
+                    if record.timestamp > to_ts {
+                        continue;
+                    }
+                }
+            }
+
+            // This record passes the filter. Check if we're still in the skip
+            // window.
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+
+            // Check if the page is full — record next_offset so the caller
+            // knows where to resume.
+            if records.len() as u64 >= effective_limit {
+                // next_offset is the number of *matching* records up to (but
+                // not including) this one — i.e. offset + effective_limit.
+                next_offset = offset.saturating_add(effective_limit);
+                break;
+            }
+
+            records.push_back(record);
+        }
+
+        AttestationPage {
+            records,
+            next_offset,
+            total,
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -7230,6 +7390,20 @@ impl AnchorKitContract {
         let key = make_storage_key(env, &[b"ATTEST", &id.to_be_bytes()]);
         env.storage().persistent().set(&key, &attestation);
         env.storage().persistent().extend_ttl(&key, PERSISTENT_TTL, PERSISTENT_TTL);
+
+        // Maintain the global attestation ID index (ATIDX) so paginated
+        // retrieval can iterate all IDs without scanning the full ID space.
+        let idx_key = make_storage_key(env, &[b"ATIDX"]);
+        let mut ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&idx_key)
+            .unwrap_or_else(|| Vec::new(env));
+        ids.push_back(id);
+        env.storage().persistent().set(&idx_key, &ids);
+        env.storage()
+            .persistent()
+            .extend_ttl(&idx_key, PERSISTENT_TTL, PERSISTENT_TTL);
     }
 
     fn store_span(

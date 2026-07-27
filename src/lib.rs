@@ -220,6 +220,7 @@ pub use sep24::{
     RawInteractiveDepositResponse, RawInteractiveWithdrawalResponse, RawSep24TransactionResponse,
 };
 pub use contract::{ServiceRetirementInfo, AnchorServices};
+pub use contract::{AttestationFilter, AttestationPage};
 pub use service_management::{ServiceManager, ServiceToggleState, ServiceConfigSnapshot};
 pub use admin_audit_log::{AdminAuditLog, AdminConfigChangeEvent, AdminAuditLogConfig};
 pub use contract::{HealthStatus, MetadataFreshnessReport, RateLimiterHealth};
