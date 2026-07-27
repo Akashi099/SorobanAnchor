@@ -384,6 +384,14 @@ pub fn verify_sep10_jwt(
 
     // Enforce maximum token lifetime: exp - iat must not exceed 24 hours.
     let iat = parse_json_iat(&payload_dec).ok_or(())?;
+    if iat == 0 {
+        return Err(());
+    }
+    // iat must not be in the future — a token cannot claim to have been issued
+    // after the current ledger time (allow the same clock-skew tolerance).
+    if iat > now.saturating_add(skew) {
+        return Err(());
+    }
     if exp.saturating_sub(iat) > MAX_JWT_LIFETIME {
         return Err(());
     }
@@ -424,17 +432,203 @@ pub fn verify_sep10_jwt(
         env.storage().persistent().extend_ttl(&jti_key, ttl_ledgers, ttl_ledgers);
     }
 
+    // iss claim: must be present, non-empty, and must not be whitespace-only
+    // or contain ASCII control characters. Normalize by trimming before the
+    // emptiness check so `"iss":" "` is correctly rejected.
+    let iss_bytes = match parse_json_iss(&payload_dec) {
+        Some(b) if !b.is_empty() => b,
+        _ => return Err(()),
+    };
+    // Trim leading/trailing whitespace and reject if nothing remains.
+    let iss_trimmed_len = iss_bytes
+        .iter()
+        .rev()
+        .skip_while(|b| b.is_ascii_whitespace())
+        .count();
+    let iss_leading = iss_bytes.iter().take_while(|b| b.is_ascii_whitespace()).count();
+    if iss_trimmed_len == 0 || (iss_leading >= iss_bytes.len()) {
+        return Err(());
+    }
+    // Reject any control characters (0x00–0x1F, 0x7F) in the issuer.
+    if iss_bytes.iter().any(|&b| b < 0x20 || b == 0x7F) {
+        return Err(());
+    }
+
     let sub = parse_json_sub(env, &payload_dec)?;
+    // sub must be non-empty — an empty subject offers no identity binding.
+    if sub.len() == 0 {
+        return Err(());
+    }
+
     if let Some(expected) = expected_sub {
         if sub != *expected {
             return Err(());
         }
     }
 
-    // iss claim must be present and non-empty (SEP-10 requirement)
-    match parse_json_iss(&payload_dec) {
-        Some(iss) if !iss.is_empty() => {}
+    Ok(())
+}
+
+/// Verify a SEP-10 JWT and additionally assert that the `iss` claim matches
+/// `expected_issuer` (case-sensitive, after whitespace trimming on both sides).
+///
+/// This is a strict wrapper around [`verify_sep10_jwt`] for call sites where
+/// the anchor identity is known ahead of time and must be explicitly validated
+/// rather than merely present. All other checks from [`verify_sep10_jwt`]
+/// apply unchanged.
+///
+/// # Arguments
+///
+/// * `env`              - Soroban execution environment.
+/// * `token`            - Compact JWS token string.
+/// * `anchor_public_key`- 32-byte Ed25519 public key.
+/// * `expected_sub`     - Optional expected `sub` claim value.
+/// * `expected_issuer`  - The issuer string that the `iss` claim must match
+///                        (trimmed, case-sensitive comparison).
+///
+/// # Returns
+///
+/// `Ok(())` when all checks pass, `Err(())` otherwise.
+pub fn verify_sep10_jwt_with_issuer(
+    env: &Env,
+    token: &String,
+    anchor_public_key: &Bytes,
+    expected_sub: Option<&String>,
+    expected_issuer: &str,
+) -> Result<(), ()> {
+    if anchor_public_key.len() != 32 {
+        return Err(());
+    }
+
+    // Reject an empty expected issuer immediately — a caller passing "" would
+    // trivially accept any token and indicates a programming error.
+    let expected_issuer_trimmed = expected_issuer.trim();
+    if expected_issuer_trimmed.is_empty() {
+        return Err(());
+    }
+
+    // Run the full base verification first (sig, exp, iat, nbf, jti, sub, iss).
+    verify_sep10_jwt(env, token, anchor_public_key, expected_sub)?;
+
+    // Re-decode the payload to extract iss for the explicit comparison.
+    let max_len: u32 = env
+        .storage()
+        .instance()
+        .get::<_, u32>(&soroban_sdk::symbol_short!("JWTMAXLEN"))
+        .unwrap_or(MAX_JWT_LEN);
+
+    let n = token.len() as usize;
+    let mut buf: Vec<u8> = alloc::vec![0u8; max_len as usize];
+    token.copy_into_slice(&mut buf[..n]);
+
+    let mut dots = [0usize; 2];
+    let mut dot_count = 0usize;
+    for i in 0..n {
+        if buf[i] == b'.' {
+            if dot_count < 2 {
+                dots[dot_count] = i;
+                dot_count += 1;
+            }
+        }
+    }
+    if dot_count != 2 {
+        return Err(());
+    }
+
+    let payload_b64 = &buf[dots[0] + 1..dots[1]];
+    let payload_dec = base64url_decode(payload_b64).map_err(|_| ())?;
+
+    let iss_bytes = match parse_json_iss(&payload_dec) {
+        Some(b) if !b.is_empty() => b,
         _ => return Err(()),
+    };
+
+    // Trim and compare (case-sensitive).
+    let iss_str = core::str::from_utf8(&iss_bytes).map_err(|_| ())?;
+    if iss_str.trim() != expected_issuer_trimmed {
+        return Err(());
+    }
+
+    Ok(())
+}
+/// `expected_issuer` (case-sensitive, after whitespace trimming on both sides).
+///
+/// This is a strict wrapper around [`verify_sep10_jwt`] for call sites where
+/// the anchor identity is known ahead of time and must be explicitly validated
+/// rather than merely present. All other checks from [`verify_sep10_jwt`]
+/// apply unchanged.
+///
+/// # Arguments
+///
+/// * `env`             - Soroban execution environment.
+/// * `token`           - Compact JWS token string.
+/// * `anchor_public_key` - 32-byte Ed25519 public key.
+/// * `expected_sub`    - Optional expected `sub` claim value.
+/// * `expected_issuer` - The exact issuer string that the `iss` claim must match.
+///
+/// # Returns
+///
+/// `Ok(())` when all checks pass, `Err(())` otherwise.
+pub fn verify_sep10_jwt_with_issuer(
+    env: &Env,
+    token: &String,
+    anchor_public_key: &Bytes,
+    expected_sub: Option<&String>,
+    expected_issuer: &str,
+) -> Result<(), ()> {
+    if anchor_public_key.len() != 32 {
+        return Err(());
+    }
+
+    // Reject an empty expected issuer immediately — a caller passing "" would
+    // trivially accept any token and indicates a programming error.
+    let expected_issuer_trimmed = expected_issuer.trim();
+    if expected_issuer_trimmed.is_empty() {
+        return Err(());
+    }
+
+    // Run base verification first.
+    verify_sep10_jwt(env, token, anchor_public_key, expected_sub)?;
+
+    // Decode payload again to extract iss for comparison.
+    let max_len: u32 = env
+        .storage()
+        .instance()
+        .get::<_, u32>(&soroban_sdk::symbol_short!("JWTMAXLEN"))
+        .unwrap_or(MAX_JWT_LEN);
+
+    let n = token.len() as usize;
+    let mut buf: Vec<u8> = alloc::vec![0u8; max_len as usize];
+    token.copy_into_slice(&mut buf[..n]);
+
+    // Re-locate the dots to find the payload segment.
+    let mut dots = [0usize; 2];
+    let mut dot_count = 0usize;
+    for i in 0..n {
+        if buf[i] == b'.' {
+            if dot_count < 2 {
+                dots[dot_count] = i;
+                dot_count += 1;
+            }
+        }
+    }
+    if dot_count != 2 {
+        return Err(());
+    }
+
+    let payload_b64 = &buf[dots[0] + 1..dots[1]];
+    let payload_dec = base64url_decode(payload_b64).map_err(|_| ())?;
+
+    let iss_bytes = match parse_json_iss(&payload_dec) {
+        Some(b) if !b.is_empty() => b,
+        _ => return Err(()),
+    };
+
+    // Trim and compare — reject if the trimmed iss does not byte-equal the
+    // trimmed expected_issuer.
+    let iss_str = core::str::from_utf8(&iss_bytes).map_err(|_| ())?;
+    if iss_str.trim() != expected_issuer_trimmed {
+        return Err(());
     }
 
     Ok(())

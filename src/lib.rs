@@ -178,9 +178,12 @@ pub use rate_limiter::{RateLimiter, RateLimitConfig, RateLimitState};
 pub use retry::{retry_with_backoff, is_retryable, RetryConfig, JitterSource, LedgerJitterSource, MockJitterSource};
 pub use deterministic_hash::{compute_payload_hash, verify_payload_hash};
 pub use contract::{AnchorKitContract, AnchorTomlProvenance, EndpointUpdated, CacheConfig};
-pub use contract::{AdminRole, AdminCapability};
-pub use session_state_machine::{SessionState, SessionTransitionError};
-pub use migration::{MigrationRecord, MigrationError, MigrationStep, SCHEMA_V1, SCHEMA_V2, LATEST_SCHEMA_VERSION};
+pub use contract::{AttestorRevocationRecord};
+pub use contract::{
+    ContractInitializedEvent, AttestorRegisteredEvent, AttestorRevokedEvent,
+    AttestorReactivatedEvent, RateLimitHitEvent, QuoteExpiredEvent,
+    WebhookRegisteredEvent, ServicesConfiguredEvent,
+};
 pub use transaction_state_tracker::{TransactionState, TransactionStateRecord, RecoveryMetadata, OptRecovery};
 pub use transaction_state_tracker::{StorageBudgetMonitor, TransactionStateTracker};
 pub use transaction_state_tracker::TransactionSummary;
@@ -225,6 +228,7 @@ pub use sep24::{
     RawInteractiveDepositResponse, RawInteractiveWithdrawalResponse, RawSep24TransactionResponse,
 };
 pub use contract::{ServiceRetirementInfo, AnchorServices};
+pub use contract::{AttestationFilter, AttestationPage};
 pub use service_management::{ServiceManager, ServiceToggleState, ServiceConfigSnapshot};
 pub use admin_audit_log::{AdminAuditLog, AdminConfigChangeEvent, AdminAuditLogConfig};
 pub use contract::{HealthStatus, MetadataFreshnessReport, RateLimiterHealth};

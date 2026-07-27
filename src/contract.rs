@@ -64,6 +64,20 @@ pub struct Quote {
     pub routing_reason: Option<String>,
 }
 
+/// Explicit lifecycle state for a quote.
+///
+/// Quotes progress linearly through `Active → Expired` as time passes, or
+/// can be moved to `Invalidated` by an admin at any point before expiry.
+#[contracttype]
+#[derive(Copy, Clone, Debug, PartialEq)]
+#[repr(u32)]
+pub enum QuoteLifecycleState {
+    /// Quote has been submitted and its validity window has not passed.
+    Active = 0,
+    /// Quote was manually voided by an admin before its natural expiry.
+    Invalidated = 1,
+}
+
 /// Pre-v2 quote layout without `routing_reason`. Used when reading legacy records
 /// that were persisted before the field was added to the schema.
 #[contracttype]
@@ -133,6 +147,40 @@ pub struct Attestation {
     pub signature: Bytes,
     /// Schema version for this record. See [`SCHEMA_V1`].
     pub schema_version: u32,
+}
+
+/// Filter parameters accepted by [`AnchorKitContract::get_attestations_paginated`].
+///
+/// Every field is optional; `None` means "no restriction on this dimension".
+/// When multiple fields are set the results must satisfy **all** of them
+/// (logical AND).
+#[contracttype]
+#[derive(Clone)]
+pub struct AttestationFilter {
+    /// When `Some`, only attestations whose `issuer` matches are returned.
+    pub issuer: Option<Address>,
+    /// When `Some`, only attestations whose `subject` matches are returned.
+    pub subject: Option<Address>,
+    /// When `Some`, only attestations with `timestamp >= from_timestamp` are returned.
+    pub from_timestamp: Option<u64>,
+    /// When `Some`, only attestations with `timestamp <= to_timestamp` are returned.
+    pub to_timestamp: Option<u64>,
+    /// When `Some`, only attestations whose numeric `id >= min_id` are returned.
+    pub min_id: Option<u64>,
+}
+
+/// A single page of attestation records returned by
+/// [`AnchorKitContract::get_attestations_paginated`].
+#[contracttype]
+#[derive(Clone)]
+pub struct AttestationPage {
+    /// The attestation records in this page, in ascending ID order.
+    pub records: Vec<Attestation>,
+    /// The offset that should be passed to the next call to continue iteration,
+    /// or `total` when this is the last page.
+    pub next_offset: u64,
+    /// Total number of attestations stored (unfiltered upper bound for iteration).
+    pub total: u64,
 }
 
 /// Input record for [`AnchorKitContract::submit_attestation_batch`].
@@ -217,6 +265,37 @@ pub const SERVICE_WITHDRAWALS: u32 = 2;
 pub const SERVICE_QUOTES: u32 = 3;
 pub const SERVICE_KYC: u32 = 4;
 pub const SERVICE_SEP31: u32 = 5;
+
+// ---------------------------------------------------------------------------
+// Attestor revocation record — stored when an attestor is revoked so that
+// recovery can be performed without losing the original public key or audit
+// history.
+// ---------------------------------------------------------------------------
+
+/// Persisted metadata capturing the circumstances of an attestor revocation.
+///
+/// Written by `revoke_attestor` and read by `reactivate_attestor` and
+/// `get_attestor_revocation_info`.  The record is never deleted, which means
+/// the full revocation/reactivation history is always available for audit.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct AttestorRevocationRecord {
+    /// Address of the attestor that was revoked.
+    pub attestor: Address,
+    /// Ledger timestamp when the revocation was executed.
+    pub revoked_at: u64,
+    /// Address of the admin that performed the revocation.
+    pub revoked_by: Address,
+    /// Human-readable reason supplied at revocation time (may be empty).
+    pub reason: String,
+    /// Copy of the attestor's public key preserved so that re-registration is
+    /// not required after reactivation.
+    pub public_key: BytesN<32>,
+    /// Whether this attestor has been reactivated after this revocation.
+    pub reactivated: bool,
+    /// Ledger timestamp when the attestor was reactivated (0 = not yet reactivated).
+    pub reactivated_at: u64,
+}
 
 // ---------------------------------------------------------------------------
 // #344 — Admin permission model
@@ -540,6 +619,9 @@ pub enum KycStatus {
     Approved = 2,
     Rejected = 3,
     Expired = 4,
+    /// An admin has explicitly reopened a previously rejected application,
+    /// allowing the subject to re-submit without waiting for a new review cycle.
+    Reopened = 5,
 }
 
 #[contracttype]
@@ -1210,6 +1292,77 @@ struct UpgradeEvent {
     upgraded_at: u64,
 }
 
+/// Event emitted when `initialize` completes successfully.
+#[contracttype]
+#[derive(Clone)]
+pub struct ContractInitializedEvent {
+    pub admin: Address,
+    pub timestamp: u64,
+}
+
+/// Rich event emitted when an attestor is registered.
+#[contracttype]
+#[derive(Clone)]
+pub struct AttestorRegisteredEvent {
+    pub attestor: Address,
+    pub timestamp: u64,
+}
+
+/// Rich event emitted when an attestor is revoked.
+#[contracttype]
+#[derive(Clone)]
+pub struct AttestorRevokedEvent {
+    pub attestor: Address,
+    pub revoked_by: Address,
+    pub timestamp: u64,
+}
+
+/// Rich event emitted when a previously revoked attestor is reactivated.
+#[contracttype]
+#[derive(Clone)]
+pub struct AttestorReactivatedEvent {
+    pub attestor: Address,
+    pub reactivated_by: Address,
+    pub timestamp: u64,
+}
+
+/// Event emitted when a rate limit is enforced (request dropped).
+#[contracttype]
+#[derive(Clone)]
+pub struct RateLimitHitEvent {
+    pub attestor: Address,
+    pub timestamp: u64,
+    pub ledger_sequence: u32,
+}
+
+/// Event emitted when a quote is rejected because its validity window has closed.
+#[contracttype]
+#[derive(Clone)]
+pub struct QuoteExpiredEvent {
+    pub quote_id: u64,
+    pub anchor: Address,
+    pub valid_until: u64,
+    pub expired_at: u64,
+}
+
+/// Event emitted when a webhook URL is registered for an attestor.
+#[contracttype]
+#[derive(Clone)]
+pub struct WebhookRegisteredEvent {
+    pub attestor: Address,
+    pub timestamp: u64,
+}
+
+/// Event emitted when an anchor's services are (re)configured.
+#[contracttype]
+#[derive(Clone)]
+pub struct ServicesConfiguredEvent {
+    pub anchor: Address,
+    pub service_count: u32,
+    pub capability_version: u32,
+    pub timestamp: u64,
+}
+
 // ---------------------------------------------------------------------------
 // TTLs (in ledgers)
 // ---------------------------------------------------------------------------
@@ -1220,11 +1373,26 @@ const INSTANCE_TTL: u32 = 518_400;
 /// Default session lifetime in seconds (1 hour). Used when session_ttl_seconds is zero.
 pub const DEFAULT_SESSION_TTL: u64 = 3600;
 
+/// Maximum number of attestations that can be submitted in a single batch call.
+pub const MAX_BATCH_SIZE: usize = 25;
+
+/// Rate-limit slot multiplier applied per attestation in a batch submission.
+/// Each attestation in a batch consumes this many rate-limit slots so that
+/// batch callers cannot trivially bypass per-submission limits.
+pub const BATCH_ATTESTATION_RATE_MULTIPLIER: u32 = 5;
+
 /// Maximum operations allowed per session before it is considered exhausted.
 pub const MAX_OPS_PER_SESSION: u64 = 100;
 
 /// Minimum TTL for replay-protection entries (7 days in ledgers at ~5 s/ledger).
 pub const REPLAY_TTL: u32 = 120_960;
+
+/// Maximum number of attestations allowed in a single batch submission.
+pub const MAX_BATCH_SIZE: usize = 100;
+
+/// Rate-limit slot multiplier applied per attestation in a batch submission.
+/// Each attestation in a batch consumes this many slots from the rate-limit window.
+pub const BATCH_ATTESTATION_RATE_MULTIPLIER: u32 = 1;
 
 /// Inclusive lower bound for the configurable JWT max-length (set_jwt_max_len).
 const MIN_JWT_MAX_LEN: u32 = 2048;
@@ -1246,10 +1414,23 @@ fn current_kyc_status(env: &Env, record: &KycRecord) -> KycStatus {
         2 => KycStatus::Approved,
         3 => KycStatus::Rejected,
         4 => KycStatus::Expired,
+        5 => KycStatus::Reopened,
         _ => KycStatus::NotSubmitted,
     }
 }
 
+/// Validate whether transitioning from `current` to `next` is permitted.
+///
+/// Allowed state machine edges:
+/// ```text
+/// NotSubmitted ──► Pending
+/// Expired      ──► Pending
+/// Rejected     ──► Pending   (direct re-submission after 24 h cooldown)
+/// Reopened     ──► Pending   (admin-reopened, subject re-submits)
+/// Pending      ──► Approved
+/// Pending      ──► Rejected
+/// Rejected     ──► Reopened  (admin explicitly re-opens for review)
+/// ```
 fn validate_kyc_transition(current: KycStatus, next: KycStatus, record: &KycRecord, now: u64) -> bool {
     if next == KycStatus::Pending && now.saturating_sub(record.submitted_at) < 86400 {
         return false;
@@ -1259,8 +1440,10 @@ fn validate_kyc_transition(current: KycStatus, next: KycStatus, record: &KycReco
         (KycStatus::NotSubmitted, KycStatus::Pending) => true,
         (KycStatus::Expired, KycStatus::Pending) => true,
         (KycStatus::Rejected, KycStatus::Pending) => true,
+        (KycStatus::Reopened, KycStatus::Pending) => true,
         (KycStatus::Pending, KycStatus::Approved) => true,
         (KycStatus::Pending, KycStatus::Rejected) => true,
+        (KycStatus::Rejected, KycStatus::Reopened) => true,
         _ => false,
     }
 }
@@ -1286,6 +1469,12 @@ fn kyc_record_key(env: &Env, subject: &Address) -> BytesN<32> {
     let xdr = subject.clone().to_xdr(env);
     let raw = xdr_to_vec(&xdr);
     make_storage_key(env, &[b"KYC", &raw])
+}
+
+fn quote_lifecycle_key(env: &Env, anchor: &Address, quote_id: u64) -> BytesN<32> {
+    let xdr = anchor.clone().to_xdr(env);
+    let raw = xdr_to_vec(&xdr);
+    make_storage_key(env, &[b"QLIFE", &raw, &quote_id.to_be_bytes()])
 }
 
 fn compliance_check_key(env: &Env, subject: &Address, check_type: &String) -> BytesN<32> {
@@ -1486,6 +1675,10 @@ impl AnchorKitContract {
         // consistent with each other.
         migration::set_version(&env, SCHEMA_V1);
         env.storage().instance().extend_ttl(INSTANCE_TTL, INSTANCE_TTL);
+        env.events().publish(
+            (symbol_short!("contract"), symbol_short!("init")),
+            ContractInitializedEvent { admin, timestamp: env.ledger().timestamp() },
+        );
     }
 
     /// Check if the contract has been initialized.
@@ -2721,8 +2914,8 @@ impl AnchorKitContract {
         );
 
         env.events().publish(
-            (symbol_short!("attestor"), symbol_short!("added"), attestor),
-            (),
+            (symbol_short!("attestor"), symbol_short!("added"), attestor.clone()),
+            AttestorRegisteredEvent { attestor, timestamp: env.ledger().timestamp() },
         );
     }
 
@@ -2777,28 +2970,185 @@ impl AnchorKitContract {
         if !env.storage().persistent().has(&key) {
             panic_with_error!(&env, ErrorCode::AttestorNotRegistered);
         }
-        env.storage().persistent().remove(&key);
+
+        // Read the public key before removing it so the revocation record can
+        // preserve it for a future reactivation.
         let pk_key = make_storage_key(&env, &[b"ATPUBKEY", &raw]);
+        let public_key: BytesN<32> = env
+            .storage()
+            .persistent()
+            .get(&pk_key)
+            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::AttestorNotRegistered));
+
+        // Remove the active registration keys so `check_attestor` / `is_attestor`
+        // start returning false immediately.
+        env.storage().persistent().remove(&key);
         env.storage().persistent().remove(&pk_key);
-        
+
+        // Persist a revocation record so the attestor can be safely reactivated
+        // later without needing to re-register from scratch.
+        let admin = Self::get_admin_internal(&env);
+        let revoc_record = AttestorRevocationRecord {
+            attestor: attestor.clone(),
+            revoked_at: env.ledger().timestamp(),
+            revoked_by: admin.clone(),
+            reason: String::from_str(&env, ""),
+            public_key,
+            reactivated: false,
+            reactivated_at: 0,
+        };
+        let revoc_key = (symbol_short!("ATREVOC"), attestor.clone());
+        env.storage().persistent().set(&revoc_key, &revoc_record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&revoc_key, PERSISTENT_TTL, PERSISTENT_TTL);
+
         // Decrement count
         let current_count = Self::get_attestor_count_internal(&env);
         if current_count > 0 {
             env.storage().instance().set(&Self::attestor_count_key(&env), &(current_count - 1));
-            
+
             let mut attestors_list = env.storage().instance().get::<_, soroban_sdk::Vec<Address>>(&Self::attestor_list_key(&env)).unwrap_or_else(|| soroban_sdk::Vec::new(&env));
             if let Some(idx) = attestors_list.first_index_of(&attestor) {
                 attestors_list.remove(idx);
                 env.storage().instance().set(&Self::attestor_list_key(&env), &attestors_list);
             }
-            
+
             env.storage().instance().extend_ttl(INSTANCE_TTL, INSTANCE_TTL);
         }
 
-        env.events().publish(
-            (symbol_short!("attestor"), symbol_short!("removed"), attestor),
-            (),
+        AdminAuditLog::log_action(
+            &env,
+            &admin,
+            "revoke_attestor",
+            attestor.to_string(),
+            "registered",
+            "revoked",
         );
+
+        env.events().publish(
+            (symbol_short!("attestor"), symbol_short!("removed"), attestor.clone()),
+            AttestorRevokedEvent { attestor, revoked_by: admin, timestamp: env.ledger().timestamp() },
+        );
+    }
+
+    /// Reactivate an attestor that was previously revoked.
+    ///
+    /// Restores the attestor's registration and public key, allowing them to
+    /// submit attestations again. Audit history from the original revocation
+    /// is preserved. Only the primary admin or an [`AdminRole::AttestorAdmin`]
+    /// holder may call this function.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment context.
+    /// * `attestor` - Address of the attestor to reactivate.
+    ///
+    /// # Authorization
+    ///
+    /// Requires admin or `AttestorAdmin` role.
+    ///
+    /// # Errors
+    ///
+    /// Panics with:
+    /// - [`ErrorCode::AttestorNotRegistered`] if no revocation record exists for the attestor
+    /// - [`ErrorCode::AttestorAlreadyRegistered`] if the attestor is currently active
+    ///
+    /// # Side effects
+    ///
+    /// - Restores `ATTESTOR` and `ATPUBKEY` storage entries
+    /// - Marks the revocation record as reactivated with a timestamp
+    /// - Emits `attestor.restored` event
+    /// - Writes an admin audit log entry
+    pub fn reactivate_attestor(env: Env, attestor: Address) {
+        Self::require_admin(&env);
+
+        let xdr = attestor.clone().to_xdr(&env);
+        let raw = xdr_to_vec(&xdr);
+        let active_key = make_storage_key(&env, &[b"ATTESTOR", &raw]);
+
+        // Fail early if already active — nothing to recover.
+        if env.storage().persistent().has(&active_key) {
+            panic_with_error!(&env, ErrorCode::AttestorAlreadyRegistered);
+        }
+
+        // Load the revocation record — this is our proof of a prior valid registration.
+        let revoc_key = (symbol_short!("ATREVOC"), attestor.clone());
+        let mut revoc_record: AttestorRevocationRecord = env
+            .storage()
+            .persistent()
+            .get(&revoc_key)
+            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::AttestorNotRegistered));
+
+        // Restore the active registration flag and public key.
+        env.storage().persistent().set(&active_key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&active_key, PERSISTENT_TTL, PERSISTENT_TTL);
+
+        let pk_key = make_storage_key(&env, &[b"ATPUBKEY", &raw]);
+        env.storage().persistent().set(&pk_key, &revoc_record.public_key);
+        env.storage()
+            .persistent()
+            .extend_ttl(&pk_key, PERSISTENT_TTL, PERSISTENT_TTL);
+
+        // Update the revocation record to record reactivation timestamp.
+        revoc_record.reactivated = true;
+        revoc_record.reactivated_at = env.ledger().timestamp();
+        env.storage().persistent().set(&revoc_key, &revoc_record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&revoc_key, PERSISTENT_TTL, PERSISTENT_TTL);
+
+        // Add back to the active attestors list and increment count.
+        let current_count = Self::get_attestor_count_internal(&env);
+        env.storage().instance().set(&Self::attestor_count_key(&env), &(current_count + 1));
+
+        let mut attestors_list = env
+            .storage()
+            .instance()
+            .get::<_, soroban_sdk::Vec<Address>>(&Self::attestor_list_key(&env))
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+        if !attestors_list.contains(&attestor) {
+            attestors_list.push_back(attestor.clone());
+            env.storage().instance().set(&Self::attestor_list_key(&env), &attestors_list);
+        }
+        env.storage().instance().extend_ttl(INSTANCE_TTL, INSTANCE_TTL);
+
+        let admin = Self::get_admin_internal(&env);
+        AdminAuditLog::log_action(
+            &env,
+            &admin,
+            "reactivate_attestor",
+            attestor.to_string(),
+            "revoked",
+            "registered",
+        );
+
+        env.events().publish(
+            (symbol_short!("attestor"), symbol_short!("restored"), attestor.clone()),
+            AttestorReactivatedEvent { attestor, reactivated_by: admin, timestamp: env.ledger().timestamp() },
+        );
+    }
+
+    /// Return the revocation record for an attestor, if one exists.
+    ///
+    /// Returns `Some(AttestorRevocationRecord)` when the attestor has been
+    /// revoked at least once.  The record's `reactivated` field indicates
+    /// whether the attestor is currently active again.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment context.
+    /// * `attestor` - Address of the attestor to query.
+    ///
+    /// # Returns
+    ///
+    /// `Some(AttestorRevocationRecord)` if found, `None` if the attestor was
+    /// never revoked.
+    pub fn get_attestor_revocation_info(env: Env, attestor: Address) -> Option<AttestorRevocationRecord> {
+        let revoc_key = (symbol_short!("ATREVOC"), attestor);
+        env.storage().persistent().get(&revoc_key)
     }
 
     /// Check if an address is a registered attestor.
@@ -3047,10 +3397,7 @@ impl AnchorKitContract {
         Self::save_profile(&env, &profile);
         env.events().publish(
             (symbol_short!("webhook"), symbol_short!("reg")),
-            EndpointUpdated {
-                attestor,
-                endpoint: webhook_url,
-            },
+            WebhookRegisteredEvent { attestor, timestamp: env.ledger().timestamp() },
         );
     }
 
@@ -3256,11 +3603,19 @@ impl AnchorKitContract {
 
         // Also sync services into the unified AttestorProfile.
         let mut profile = Self::load_or_init_profile(&env, &anchor);
-        profile.services = normalized;
+        profile.services = normalized.clone();
         profile.updated_at = env.ledger().timestamp();
         Self::save_profile(&env, &profile);
 
-        env.events().publish((symbol_short!("services"), symbol_short!("config")), record);
+        env.events().publish(
+            (symbol_short!("services"), symbol_short!("config"), anchor.clone()),
+            ServicesConfiguredEvent {
+                anchor,
+                service_count: normalized.len() as u32,
+                capability_version: version,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
     }
 
     /// The service-capability schema version this contract understands.
@@ -3722,6 +4077,9 @@ impl AnchorKitContract {
             .persistent()
             .extend_ttl(&used_key, REPLAY_TTL, REPLAY_TTL);
 
+        // Record accepted event for observability metrics.
+        replay_detection::record_accepted_event(&env);
+
         env.events().publish(
             (symbol_short!("attest"), symbol_short!("recorded"), id, subject),
             AttestEvent {
@@ -3752,7 +4110,7 @@ impl AnchorKitContract {
 
         let batch_size = attestations.len() as usize;
         if batch_size > MAX_BATCH_SIZE {
-            panic_with_error!(&env, ErrorCode::ValidationError);
+            panic_with_error!(&env, ErrorCode::BatchSizeExceeded);
         }
 
         if batch_size == 0 {
@@ -3847,7 +4205,7 @@ impl AnchorKitContract {
                 match kyc_status {
                     KycStatus::Pending => panic_with_error!(&env, ErrorCode::KycPending),
                     KycStatus::Rejected => panic_with_error!(&env, ErrorCode::KycRejected),
-                    KycStatus::Expired => panic_with_error!(&env, ErrorCode::ComplianceNotMet),
+                    KycStatus::Expired => panic_with_error!(&env, ErrorCode::KycExpired),
                     KycStatus::NotSubmitted => panic_with_error!(&env, ErrorCode::KycNotFound),
                     _ => panic_with_error!(&env, ErrorCode::ComplianceNotMet),
                 }
@@ -3902,6 +4260,8 @@ impl AnchorKitContract {
                 payload_hash,
             },
         );
+        // Record accepted event for observability metrics.
+        replay_detection::record_accepted_event(&env);
         id
     }
 
@@ -3966,6 +4326,8 @@ impl AnchorKitContract {
                 transaction_id: id, timestamp, payload_hash,
             },
         );
+        // Record accepted event for observability metrics.
+        replay_detection::record_accepted_event(&env);
         id
     }
 
@@ -4272,6 +4634,124 @@ impl AnchorKitContract {
             .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::AttestationNotFound))
     }
 
+    /// Return a filtered, paginated page of attestation records.
+    ///
+    /// Records are iterated in ascending ID order. The caller supplies an
+    /// `offset` (number of matching records to skip) and a `limit` (max
+    /// records to return, capped at 50). An optional [`AttestationFilter`]
+    /// narrows results by `issuer`, `subject`, timestamp range, or minimum ID.
+    ///
+    /// # Arguments
+    ///
+    /// * `offset` - Number of matching records to skip before collecting.
+    /// * `limit`  - Maximum records to include in the page (capped at 50).
+    /// * `filter` - Optional filter; pass `None` to retrieve all attestations.
+    ///
+    /// # Returns
+    ///
+    /// An [`AttestationPage`] containing the matching records, the next offset
+    /// for continued iteration, and the total unfiltered attestation count.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use soroban_sdk::Env;
+    /// use anchorkit::contract::{AnchorKitContract, AttestationFilter};
+    ///
+    /// let env = Env::default();
+    /// // First page, no filter
+    /// let page = AnchorKitContract::get_attestations_paginated(env, 0, 20, None);
+    /// ```
+    pub fn get_attestations_paginated(
+        env: Env,
+        offset: u64,
+        limit: u64,
+        filter: Option<AttestationFilter>,
+    ) -> AttestationPage {
+        const PAGE_CAP: u64 = 50;
+        let effective_limit = limit.min(PAGE_CAP);
+
+        // Read the global ATIDX index — it holds every attestation ID in
+        // insertion order. An absent index means no attestations have been
+        // submitted yet.
+        let idx_key = make_storage_key(&env, &[b"ATIDX"]);
+        let all_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&idx_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let total = all_ids.len() as u64;
+        let mut records = Vec::new(&env);
+        let mut skipped: u64 = 0;
+        let mut next_offset = total; // default: last page
+
+        for id in all_ids.iter() {
+            // Fast-path: apply min_id filter without loading the record.
+            if let Some(ref f) = filter {
+                if let Some(min_id) = f.min_id {
+                    if id < min_id {
+                        continue;
+                    }
+                }
+            }
+
+            let attest_key = make_storage_key(&env, &[b"ATTEST", &id.to_be_bytes()]);
+            let record: Attestation = match env.storage().persistent().get(&attest_key) {
+                Some(r) => r,
+                None => continue, // expired entry — skip silently
+            };
+
+            // Apply remaining filter dimensions.
+            if let Some(ref f) = filter {
+                if let Some(ref issuer) = f.issuer {
+                    if record.issuer != *issuer {
+                        continue;
+                    }
+                }
+                if let Some(ref subject) = f.subject {
+                    if record.subject != *subject {
+                        continue;
+                    }
+                }
+                if let Some(from_ts) = f.from_timestamp {
+                    if record.timestamp < from_ts {
+                        continue;
+                    }
+                }
+                if let Some(to_ts) = f.to_timestamp {
+                    if record.timestamp > to_ts {
+                        continue;
+                    }
+                }
+            }
+
+            // This record passes the filter. Check if we're still in the skip
+            // window.
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+
+            // Check if the page is full — record next_offset so the caller
+            // knows where to resume.
+            if records.len() as u64 >= effective_limit {
+                // next_offset is the number of *matching* records up to (but
+                // not including) this one — i.e. offset + effective_limit.
+                next_offset = offset.saturating_add(effective_limit);
+                break;
+            }
+
+            records.push_back(record);
+        }
+
+        AttestationPage {
+            records,
+            next_offset,
+            total,
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Deterministic hash utilities (#192)
     // -----------------------------------------------------------------------
@@ -4434,6 +4914,44 @@ impl AnchorKitContract {
         );
     }
 
+    /// Reopen a rejected KYC record so the subject may re-submit.
+    ///
+    /// `operator` must be the primary admin or hold [`AdminRole::KycAdmin`].
+    /// The record transitions `Rejected → Reopened`, which then allows
+    /// `submit_kyc` to advance it to `Pending` without the usual 24 h cooldown
+    /// being re-applied from the original submission timestamp.
+    pub fn reopen_kyc(env: Env, operator: Address, subject: Address) {
+        Self::require_admin_or_role(&env, &operator, AdminRole::KycAdmin);
+        let now = env.ledger().timestamp();
+        let key = kyc_record_key(&env, &subject);
+        let mut record: KycRecord = env.storage().persistent().get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::KycNotFound));
+        let current_status = current_kyc_status(&env, &record);
+        if !validate_kyc_transition(current_status, KycStatus::Reopened, &record, now) {
+            panic_with_error!(&env, ErrorCode::IllegalTransition);
+        }
+        record.status = KycStatus::Reopened as u32;
+        record.reviewed_at = Some(now);
+        env.storage().persistent().set(&key, &record);
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_TTL, PERSISTENT_TTL);
+        AdminAuditLog::log_action(
+            &env,
+            &operator,
+            "reopen_kyc",
+            subject.to_string(),
+            "Rejected",
+            "Reopened",
+        );
+        env.events().publish(
+            (symbol_short!("kyc"), symbol_short!("reopened"), subject.clone()),
+            KycStatusChangedEvent {
+                subject,
+                new_status: KycStatus::Reopened as u32,
+                timestamp: now,
+            },
+        );
+    }
+
     pub fn get_kyc_status(env: Env, subject: Address) -> KycStatus {
         let key = kyc_record_key(&env, &subject);
         if !env.storage().persistent().has(&key) {
@@ -4452,6 +4970,7 @@ impl AnchorKitContract {
             2 => KycStatus::Approved,
             3 => KycStatus::Rejected,
             4 => KycStatus::Expired,
+            5 => KycStatus::Reopened,
             _ => KycStatus::NotSubmitted,
         }
     }
@@ -4767,6 +5286,11 @@ impl AnchorKitContract {
         let q_key = make_storage_key(&env, &[b"QUOTE", &anchor_raw, &next.to_be_bytes()]);
         env.storage().persistent().set(&q_key, &quote);
         env.storage().persistent().extend_ttl(&q_key, PERSISTENT_TTL, PERSISTENT_TTL);
+
+        let lc_key = quote_lifecycle_key(&env, &anchor, next);
+        env.storage().persistent().set(&lc_key, &(QuoteLifecycleState::Active as u32));
+        env.storage().persistent().extend_ttl(&lc_key, PERSISTENT_TTL, PERSISTENT_TTL);
+
         Self::append_quote_index(&env, next, &anchor);
 
         let lq_key = make_storage_key(&env, &[b"LATESTQ", &anchor_raw]);
@@ -4808,6 +5332,94 @@ impl AnchorKitContract {
         quote
     }
 
+    // -----------------------------------------------------------------------
+    // Quote lifecycle management (#591)
+    // -----------------------------------------------------------------------
+
+    /// Return the current [`QuoteLifecycleState`] for a quote.
+    ///
+    /// A quote with no lifecycle entry (created before lifecycle tracking was
+    /// introduced) is treated as `Active`. Once a quote's `valid_until` has
+    /// passed the runtime considers it logically expired regardless of the
+    /// stored state.
+    pub fn get_quote_lifecycle_state(env: Env, anchor: Address, quote_id: u64) -> QuoteLifecycleState {
+        let lc_key = quote_lifecycle_key(&env, &anchor, quote_id);
+        let raw: u32 = env.storage().persistent().get(&lc_key).unwrap_or(0u32);
+        if raw == QuoteLifecycleState::Invalidated as u32 {
+            QuoteLifecycleState::Invalidated
+        } else {
+            QuoteLifecycleState::Active
+        }
+    }
+
+    /// Manually invalidate a quote before its natural expiry (admin-only).
+    ///
+    /// Invalidated quotes are excluded from routing candidate selection and
+    /// cannot be received. The underlying quote record is retained for audit
+    /// purposes.
+    pub fn invalidate_quote(env: Env, anchor: Address, quote_id: u64) {
+        Self::require_admin(&env);
+        let anchor_xdr = anchor.clone().to_xdr(&env);
+        let anchor_raw = xdr_to_vec(&anchor_xdr);
+        let q_key = make_storage_key(&env, &[b"QUOTE", &anchor_raw, &quote_id.to_be_bytes()]);
+        if !env.storage().persistent().has(&q_key) {
+            panic_with_error!(&env, ErrorCode::QuoteNotFound);
+        }
+        let lc_key = quote_lifecycle_key(&env, &anchor, quote_id);
+        env.storage().persistent().set(&lc_key, &(QuoteLifecycleState::Invalidated as u32));
+        env.storage().persistent().extend_ttl(&lc_key, PERSISTENT_TTL, PERSISTENT_TTL);
+        env.events().publish(
+            (symbol_short!("quote"), symbol_short!("invalid"), quote_id),
+            quote_id,
+        );
+    }
+
+    /// Remove expired and invalidated quotes from the quote index (admin-only).
+    ///
+    /// Iterates the global quote index and drops entries whose `valid_until`
+    /// has passed or whose lifecycle state is `Invalidated`. Quote records are
+    /// left intact for audit trails; only the index pointer is pruned.
+    pub fn purge_expired_quotes(env: Env) {
+        Self::require_admin(&env);
+        let now = env.ledger().timestamp();
+        let idx_key = make_storage_key(&env, &[b"QIDX"]);
+        let ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<u64>>(&idx_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut live: Vec<u64> = Vec::new(&env);
+        for quote_id in ids.iter() {
+            let anch_key = make_storage_key(&env, &[b"QANCH", &quote_id.to_be_bytes()]);
+            let anchor_opt: Option<Address> = env.storage().persistent().get(&anch_key);
+            let keep = if let Some(anchor) = anchor_opt {
+                let anchor_xdr = anchor.clone().to_xdr(&env);
+                let anchor_raw = xdr_to_vec(&anchor_xdr);
+                let q_key = make_storage_key(&env, &[b"QUOTE", &anchor_raw, &quote_id.to_be_bytes()]);
+                let quote_opt: Option<Quote> = env.storage().persistent().get(&q_key);
+                match quote_opt {
+                    Some(q) if q.valid_until > now => {
+                        let lc_key = quote_lifecycle_key(&env, &anchor, quote_id);
+                        let lc: u32 = env.storage().persistent().get(&lc_key).unwrap_or(0u32);
+                        lc != QuoteLifecycleState::Invalidated as u32
+                    }
+                    _ => false,
+                }
+            } else {
+                false
+            };
+            if keep {
+                live.push_back(quote_id);
+            }
+        }
+
+        if live.len() < ids.len() {
+            env.storage().persistent().set(&idx_key, &live);
+            env.storage().persistent().extend_ttl(&idx_key, PERSISTENT_TTL, PERSISTENT_TTL);
+        }
+    }
+
     /// Accept a quote with compliance gating (#297).
     ///
     /// Verifies that the subject has passed compliance checks before accepting the quote.
@@ -4843,6 +5455,16 @@ impl AnchorKitContract {
         let q_key = make_storage_key(&env, &[b"QUOTE", &anchor_raw, &quote_id.to_be_bytes()]);
         let quote: Quote = env.storage().persistent().get(&q_key)
             .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::QuoteNotFound));
+
+        // Reject the quote if its validity window has closed.
+        let now = env.ledger().timestamp();
+        if quote.valid_until <= now {
+            env.events().publish(
+                (symbol_short!("quote"), symbol_short!("expired"), quote_id),
+                QuoteExpiredEvent { quote_id, anchor: anchor.clone(), valid_until: quote.valid_until, expired_at: now },
+            );
+            panic_with_error!(&env, ErrorCode::QuoteExpired);
+        }
 
         // #297: Enforce compliance gating if required
         if require_compliance {
@@ -4966,6 +5588,8 @@ impl AnchorKitContract {
                 result_data: 0,
             },
         );
+        // Record accepted event for observability metrics.
+        replay_detection::record_accepted_event(&env);
         id
     }
 
@@ -5021,7 +5645,10 @@ impl AnchorKitContract {
         env.storage().persistent().set(&slog_key, &log_id);
         env.storage().persistent().extend_ttl(&slog_key, PERSISTENT_TTL, PERSISTENT_TTL);
 
-        env.events().publish((symbol_short!("attestor"), symbol_short!("added"), attestor), ());
+        env.events().publish(
+            (symbol_short!("attestor"), symbol_short!("added"), attestor.clone()),
+            AttestorRegisteredEvent { attestor, timestamp: env.ledger().timestamp() },
+        );
         env.events().publish(
             (symbol_short!("audit"), symbol_short!("logged"), log_id),
             AuditLogEvent {
@@ -5083,7 +5710,14 @@ impl AnchorKitContract {
         env.storage().persistent().set(&slog_key, &log_id);
         env.storage().persistent().extend_ttl(&slog_key, PERSISTENT_TTL, PERSISTENT_TTL);
 
-        env.events().publish((symbol_short!("attestor"), symbol_short!("removed"), attestor), ());
+        env.events().publish(
+            (symbol_short!("attestor"), symbol_short!("removed"), attestor.clone()),
+            AttestorRevokedEvent {
+                attestor,
+                revoked_by: operator,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
         env.events().publish(
             (symbol_short!("audit"), symbol_short!("logged"), log_id),
             AuditLogEvent {
@@ -6237,6 +6871,11 @@ impl AnchorKitContract {
             // Filter expired quotes
             if quote.valid_until <= now { continue; }
 
+            // Skip manually invalidated quotes (#591)
+            let lc_key = quote_lifecycle_key(&env, &anchor, quote.quote_id);
+            let lc: u32 = env.storage().persistent().get(&lc_key).unwrap_or(0u32);
+            if lc == QuoteLifecycleState::Invalidated as u32 { continue; }
+
             // Filter by amount limits
             if options.request.amount < quote.minimum_amount
                 || (quote.maximum_amount != 0 && options.request.amount > quote.maximum_amount)
@@ -6272,7 +6911,7 @@ impl AnchorKitContract {
                 match kyc_status {
                     KycStatus::Pending      => panic_with_error!(&env, ErrorCode::KycPending),
                     KycStatus::Rejected     => panic_with_error!(&env, ErrorCode::KycRejected),
-                    KycStatus::Expired      => panic_with_error!(&env, ErrorCode::ComplianceNotMet),
+                    KycStatus::Expired      => panic_with_error!(&env, ErrorCode::KycExpired),
                     KycStatus::NotSubmitted => panic_with_error!(&env, ErrorCode::KycNotFound),
                     _ => panic_with_error!(&env, ErrorCode::ComplianceNotMet),
                 }
@@ -6382,6 +7021,74 @@ impl AnchorKitContract {
         );
 
         best
+    }
+
+    // -----------------------------------------------------------------------
+    // Fallback quote selection (#593)
+    // -----------------------------------------------------------------------
+
+    /// Route a transaction with explicit fallback anchor support.
+    ///
+    /// Behaves identically to [`route_transaction`] but first attempts to use
+    /// the quote from `preferred_anchor`. If that anchor is unavailable,
+    /// blacklisted, or has no valid non-invalidated quote for the requested
+    /// asset pair, the function falls back to the normal scoring strategy over
+    /// all remaining candidates and emits a `quote/fallback` event so the
+    /// selection is auditable.
+    pub fn route_with_fallback(
+        env: Env,
+        options: RoutingOptions,
+        preferred_anchor: Address,
+    ) -> Quote {
+        validate_currency_code(&env, &options.request.base_asset);
+        validate_currency_code(&env, &options.request.quote_asset);
+        let now = env.ledger().timestamp();
+
+        // Try the preferred anchor first.
+        let preferred_quote: Option<Quote> = (|| {
+            if Self::is_anchor_blacklisted_internal(&env, &preferred_anchor) {
+                return None;
+            }
+            let meta: RoutingAnchorMeta = anchor_meta_opt(&env, &preferred_anchor)?;
+            if !meta.is_active { return None; }
+            let anchor_xdr = preferred_anchor.clone().to_xdr(&env);
+            let anchor_raw = xdr_to_vec(&anchor_xdr);
+            let lq_key = make_storage_key(&env, &[b"LATESTQ", &anchor_raw]);
+            let quote_id: u64 = env.storage().persistent().get(&lq_key)?;
+            let q_key = make_storage_key(&env, &[b"QUOTE", &anchor_raw, &quote_id.to_be_bytes()]);
+            let quote: Quote = env.storage().persistent().get(&q_key)?;
+            if quote.base_asset != options.request.base_asset
+                || quote.quote_asset != options.request.quote_asset
+            {
+                return None;
+            }
+            if quote.valid_until <= now { return None; }
+            let lc_key = quote_lifecycle_key(&env, &preferred_anchor, quote_id);
+            let lc: u32 = env.storage().persistent().get(&lc_key).unwrap_or(0u32);
+            if lc == QuoteLifecycleState::Invalidated as u32 { return None; }
+            if options.request.amount < quote.minimum_amount
+                || (quote.maximum_amount != 0 && options.request.amount > quote.maximum_amount)
+            {
+                return None;
+            }
+            Some(quote)
+        })();
+
+        if let Some(q) = preferred_quote {
+            env.events().publish(
+                (symbol_short!("quote"), symbol_short!("routed"), q.quote_id),
+                q.quote_id,
+            );
+            return q;
+        }
+
+        // Preferred anchor unavailable — fall back to standard routing and
+        // emit a fallback event so the decision is auditable.
+        env.events().publish(
+            (symbol_short!("quote"), symbol_short!("fallback"), 0u64),
+            0u64,
+        );
+        Self::route_transaction(env, options)
     }
 
     /// Return up to `max_results` quotes sorted by descending weighted composite score.
@@ -6984,6 +7691,14 @@ impl AnchorKitContract {
             .map(|r| Symbol::new(env, Self::role_name(*r)));
         let config = RateLimiter::resolve_config(env, attestor, role);
         if RateLimiter::check_and_increment(env, attestor, &config).is_err() {
+            env.events().publish(
+                (symbol_short!("ratelimit"), symbol_short!("hit"), attestor.clone()),
+                RateLimitHitEvent {
+                    attestor: attestor.clone(),
+                    timestamp: env.ledger().timestamp(),
+                    ledger_sequence: env.ledger().sequence(),
+                },
+            );
             panic_with_error!(env, ErrorCode::RateLimitExceeded);
         }
     }
@@ -7151,6 +7866,12 @@ impl AnchorKitContract {
             .persistent()
             .has(&make_storage_key(env, &[b"ATTESTOR", &raw]))
         {
+            // Distinguish revoked attestors (have a revocation record but no active
+            // registration key) from ones that were never registered at all.
+            let revoc_key = (symbol_short!("ATREVOC"), attestor.clone());
+            if env.storage().persistent().has(&revoc_key) {
+                panic_with_error!(env, ErrorCode::AttestorRevoked);
+            }
             panic_with_error!(env, ErrorCode::AttestorNotRegistered);
         }
     }
@@ -7240,6 +7961,7 @@ impl AnchorKitContract {
             2 => KycStatus::Approved,
             3 => KycStatus::Rejected,
             4 => KycStatus::Expired,
+            5 => KycStatus::Reopened,
             _ => KycStatus::NotSubmitted,
         }
     }
@@ -7285,10 +8007,10 @@ impl AnchorKitContract {
             .get(&make_storage_key(env, &[b"ATPUBKEY", &raw]))
             .unwrap_or_else(|| panic_with_error!(env, ErrorCode::UnauthorizedAttestor));
         if signature.len() != 64 {
-            panic_with_error!(env, ErrorCode::UnauthorizedAttestor);
+            panic_with_error!(env, ErrorCode::SignatureVerificationFailed);
         }
         let signature_bytes: BytesN<64> = signature.clone().try_into().unwrap_or_else(|_| {
-            panic_with_error!(env, ErrorCode::UnauthorizedAttestor)
+            panic_with_error!(env, ErrorCode::SignatureVerificationFailed)
         });
         env.crypto()
             .ed25519_verify(&pk, payload_hash, &signature_bytes);
@@ -7330,6 +8052,20 @@ impl AnchorKitContract {
         let key = make_storage_key(env, &[b"ATTEST", &id.to_be_bytes()]);
         env.storage().persistent().set(&key, &attestation);
         env.storage().persistent().extend_ttl(&key, PERSISTENT_TTL, PERSISTENT_TTL);
+
+        // Maintain the global attestation ID index (ATIDX) so paginated
+        // retrieval can iterate all IDs without scanning the full ID space.
+        let idx_key = make_storage_key(env, &[b"ATIDX"]);
+        let mut ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&idx_key)
+            .unwrap_or_else(|| Vec::new(env));
+        ids.push_back(id);
+        env.storage().persistent().set(&idx_key, &ids);
+        env.storage()
+            .persistent()
+            .extend_ttl(&idx_key, PERSISTENT_TTL, PERSISTENT_TTL);
     }
 
     fn store_span(
