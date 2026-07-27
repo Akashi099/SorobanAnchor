@@ -177,6 +177,7 @@ pub use errors::normalize_asset_code;
 pub use errors::Error;
 pub use rate_limiter::{RateLimiter, RateLimitConfig, RateLimitState};
 pub use retry::{retry_with_backoff, is_retryable, RetryConfig, JitterSource, LedgerJitterSource, MockJitterSource};
+pub use retry::{BackoffStrategy, JitterPolicy};
 pub use deterministic_hash::{compute_payload_hash, verify_payload_hash};
 pub use contract::{AnchorKitContract, AnchorTomlProvenance, EndpointUpdated, CacheConfig};
 pub use contract::{AttestorRevocationRecord};
@@ -244,7 +245,7 @@ pub use transaction_state_tracker::{BudgetStatus, BudgetAlert};
 #[cfg(not(feature = "wasm"))]
 pub use sep38::{CrossAnchorFeeAggregator, FeeAnomalyReport};
 #[cfg(not(feature = "wasm"))]
-pub use streaming_monitor::{StreamingTransactionMonitor, TransactionStatusUpdate};
+pub use streaming_monitor::{StreamingTransactionMonitor, TransactionStatusUpdate, StateTransition, BackpressureConfig};
 
 #[cfg(all(test, not(feature = "wasm")))]
 mod stellar_toml_tests;

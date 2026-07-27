@@ -1334,6 +1334,201 @@ impl TransactionStateTracker {
         }
     }
 
+    // ── Recovery metadata export / import ──────────────────────────────────────
+
+    /// Serialize the [`RecoveryMetadata`] for a failed transaction into a JSON
+    /// string that can be stored or transferred between environments.
+    ///
+    /// Only available when the `std` feature is enabled (requires `serde_json`).
+    ///
+    /// # Arguments
+    ///
+    /// * `transaction_id` - The ID of the failed transaction.
+    /// * `env` - The Soroban execution environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `String` error if the transaction is not found, is not in the
+    /// `Failed` state, has no recovery metadata, or serialization fails.
+    #[cfg(feature = "std")]
+    pub fn export_recovery_state(
+        &self,
+        transaction_id: u64,
+        env: &Env,
+    ) -> Result<alloc::string::String, alloc::string::String> {
+        use alloc::string::ToString;
+
+        let meta = self.get_recovery_metadata(transaction_id, env)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| alloc::format!("No recovery metadata for transaction {}", transaction_id))?;
+
+        #[derive(serde::Serialize)]
+        struct Export {
+            failure_reason: alloc::string::String,
+            last_updated_ledger: u32,
+            failed_from_state: alloc::string::String,
+            retry_count: u32,
+            transaction_id: u64,
+        }
+
+        let export = Export {
+            failure_reason: meta.failure_reason.to_string(),
+            last_updated_ledger: meta.last_updated_ledger,
+            failed_from_state: alloc::string::String::from(meta.failed_from_state.as_str()),
+            retry_count: meta.retry_count,
+            transaction_id,
+        };
+
+        serde_json::to_string(&export).map_err(|e| alloc::format!("Serialization error: {}", e))
+    }
+
+    /// Deserialize a JSON string and import (create or update) the recovery
+    /// metadata for a failed transaction.
+    ///
+    /// If a transaction with the given ID already exists, it must be in the
+    /// [`Failed`](TransactionState::Failed) state and its recovery metadata will
+    /// be replaced. If no transaction exists, a new one is created in the
+    /// [`Failed`](TransactionState::Failed) state with the imported metadata.
+    ///
+    /// Only available when the `std` feature is enabled (requires `serde_json`).
+    ///
+    /// # Arguments
+    ///
+    /// * `json_data` - A JSON string matching the export format.
+    /// * `initiator` - The Stellar address that initiated the transaction
+    ///   (used only when creating a new record).
+    /// * `env` - The Soroban execution environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `String` error if the JSON is malformed, a required field is
+    /// missing, the `failed_from_state` is not a recognised state name, or
+    /// the existing transaction is not in the `Failed` state.
+    #[cfg(feature = "std")]
+    pub fn import_recovery_state(
+        &mut self,
+        json_data: &str,
+        initiator: Address,
+        env: &Env,
+    ) -> Result<(), alloc::string::String> {
+        use alloc::string::ToString;
+
+        #[derive(serde::Deserialize)]
+        struct Import {
+            failure_reason: alloc::string::String,
+            last_updated_ledger: u32,
+            failed_from_state: alloc::string::String,
+            retry_count: u32,
+            transaction_id: u64,
+        }
+
+        let import: Import = serde_json::from_str(json_data)
+            .map_err(|e| alloc::format!("Invalid recovery state JSON: {}", e))?;
+
+        let failed_from = TransactionState::from_str(&import.failed_from_state)
+            .ok_or_else(|| alloc::format!(
+                "Invalid failed_from_state '{}': must be one of: pending, in_progress, completed, failed",
+                import.failed_from_state
+            ))?;
+
+        if failed_from.is_terminal() {
+            return Err(alloc::format!(
+                "Invalid failed_from_state '{}': cannot be a terminal state",
+                import.failed_from_state
+            ));
+        }
+
+        let current_ledger = env.ledger().sequence();
+        let new_meta = RecoveryMetadata {
+            failure_reason: String::from_str(env, &import.failure_reason),
+            last_updated_ledger: import.last_updated_ledger,
+            failed_from_state: failed_from,
+            retry_count: import.retry_count,
+        };
+
+        // Check if transaction already exists.
+        let existing = self.get_transaction_state(import.transaction_id, env)
+            .map_err(|e| e.to_string())?;
+
+        match existing {
+            Some(record) => {
+                // Transaction exists — must be in Failed state.
+                if record.state != TransactionState::Failed {
+                    return Err(alloc::format!(
+                        "Cannot import recovery state: transaction {} is in state '{}', expected 'failed'",
+                        import.transaction_id,
+                        record.state.as_str(),
+                    ));
+                }
+                // Replace recovery metadata in-place.
+                if self.is_dev_mode {
+                    for rec in self.cache.iter_mut() {
+                        if rec.transaction_id == import.transaction_id {
+                            rec.recovery_metadata = OptRecovery::Some(new_meta.clone());
+                            rec.last_updated = env.ledger().timestamp();
+                            rec.last_updated_ledger = current_ledger;
+                            break;
+                        }
+                    }
+                } else {
+                    let key = (symbol_short!("TXSTATE"), import.transaction_id);
+                    let mut stored: TransactionStateRecord = env
+                        .storage()
+                        .persistent()
+                        .get(&key)
+                        .ok_or_else(|| alloc::format!("Transaction not found"))?;
+                    stored.recovery_metadata = OptRecovery::Some(new_meta);
+                    stored.last_updated = env.ledger().timestamp();
+                    stored.last_updated_ledger = current_ledger;
+                    env.storage().persistent().set(&key, &stored);
+                    env.storage().persistent().extend_ttl(&key, TXSTATE_TTL, TXSTATE_TTL);
+                }
+                Ok(())
+            }
+            None => {
+                // No existing transaction — create a new one in Failed state.
+                let current_time = env.ledger().timestamp();
+                let mut history = Vec::new(env);
+                history.push_back((TransactionState::Pending, current_time));
+                history.push_back((failed_from, current_time));
+                history.push_back((TransactionState::Failed, current_time));
+
+                let record = TransactionStateRecord {
+                    transaction_id: import.transaction_id,
+                    state: TransactionState::Failed,
+                    initiator,
+                    timestamp: current_time,
+                    last_updated: current_time,
+                    last_updated_ledger: current_ledger,
+                    error_message: Some(String::from_str(env, &import.failure_reason)),
+                    state_history: history,
+                    recovery_metadata: OptRecovery::Some(new_meta),
+                    routing_reason: None,
+                };
+
+                if self.is_dev_mode {
+                    const APPROX_RECORD_BYTES: u64 = 256;
+                    self.cache.push(record);
+                    self.known_ids.push(import.transaction_id);
+                    self.budget_monitor.record_entry(APPROX_RECORD_BYTES);
+                } else {
+                    let key = (symbol_short!("TXSTATE"), import.transaction_id);
+                    env.storage().persistent().set(&key, &record);
+                    env.storage().persistent().extend_ttl(&key, TXSTATE_TTL, TXSTATE_TTL);
+
+                    let ids_key = symbol_short!("TXIDS");
+                    let mut ids: Vec<u64> = env
+                        .storage().persistent().get(&ids_key)
+                        .unwrap_or_else(|| Vec::new(env));
+                    ids.push_back(import.transaction_id);
+                    env.storage().persistent().set(&ids_key, &ids);
+                    env.storage().persistent().extend_ttl(&ids_key, TXSTATE_TTL, TXSTATE_TTL);
+                }
+                Ok(())
+            }
+        }
+    }
+
     // ── Batch query helpers ──────────────────────────────────────────────────
 
     /// Return up to `limit` transaction records whose IDs fall in the inclusive
@@ -2157,5 +2352,208 @@ mod tests {
         let mut monitor = StorageBudgetMonitor::new();
         monitor.record_entry(850);
         assert!(monitor.is_near_limit(80, 1000));
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #626 — recovery metadata export / import tests (std-only)
+    // -----------------------------------------------------------------------
+
+    /// Export produces a valid JSON string with all fields.
+    #[test]
+    #[cfg(feature = "std")]
+    fn test_export_recovery_state_returns_json() {
+        let env = Env::default();
+        let mut tracker = TransactionStateTracker::new(true);
+        let initiator = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+
+        tracker.create_transaction(1, initiator, &env).unwrap();
+        tracker.start_transaction(1, &env).unwrap();
+        tracker.fail_transaction(1, String::from_str(&env, "network timeout"), &env).unwrap();
+
+        let json = tracker.export_recovery_state(1, &env).unwrap();
+        assert!(json.contains("failure_reason"));
+        assert!(json.contains("network timeout"));
+        assert!(json.contains("transaction_id"));
+        assert!(json.contains("failed_from_state"));
+        assert!(json.contains("in_progress"));
+    }
+
+    /// Export returns error for non-existent transaction.
+    #[test]
+    #[cfg(feature = "std")]
+    fn test_export_missing_transaction_returns_error() {
+        let env = Env::default();
+        let tracker = TransactionStateTracker::new(true);
+        let result = tracker.export_recovery_state(99, &env);
+        assert!(result.is_err());
+    }
+
+    /// Export returns error for non-failed transaction.
+    #[test]
+    #[cfg(feature = "std")]
+    fn test_export_non_failed_transaction_returns_error() {
+        let env = Env::default();
+        let mut tracker = TransactionStateTracker::new(true);
+        let initiator = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+        tracker.create_transaction(1, initiator, &env).unwrap();
+        let result = tracker.export_recovery_state(1, &env);
+        assert!(result.is_err());
+    }
+
+    /// Import valid JSON creates a new failed transaction record.
+    #[test]
+    #[cfg(feature = "std")]
+    fn test_import_recovery_state_creates_new_transaction() {
+        let env = Env::default();
+        let mut tracker = TransactionStateTracker::new(true);
+        let initiator = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+
+        let json = r#"{
+            "failure_reason": "imported timeout",
+            "last_updated_ledger": 42,
+            "failed_from_state": "in_progress",
+            "retry_count": 1,
+            "transaction_id": 100
+        }"#;
+
+        tracker.import_recovery_state(json, initiator.clone(), &env).unwrap();
+
+        let record = tracker.get_transaction_state(100, &env).unwrap().unwrap();
+        assert_eq!(record.state, TransactionState::Failed);
+        assert!(record.recovery_metadata.is_some());
+        let meta = record.recovery_metadata.unwrap();
+        assert_eq!(meta.failure_reason.to_string(), "imported timeout");
+        assert_eq!(meta.retry_count, 1);
+        assert_eq!(meta.failed_from_state, TransactionState::InProgress);
+    }
+
+    /// Import updates recovery metadata on an existing failed transaction.
+    #[test]
+    #[cfg(feature = "std")]
+    fn test_import_updates_existing_failed_transaction() {
+        let env = Env::default();
+        let mut tracker = TransactionStateTracker::new(true);
+        let initiator = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+
+        tracker.create_transaction(1, initiator.clone(), &env).unwrap();
+        tracker.start_transaction(1, &env).unwrap();
+        tracker.fail_transaction(1, String::from_str(&env, "original error"), &env).unwrap();
+
+        let json = r#"{
+            "failure_reason": "updated reason",
+            "last_updated_ledger": 99,
+            "failed_from_state": "pending",
+            "retry_count": 5,
+            "transaction_id": 1
+        }"#;
+
+        tracker.import_recovery_state(json, initiator.clone(), &env).unwrap();
+
+        let meta = tracker.get_recovery_metadata(1, &env).unwrap().unwrap();
+        assert_eq!(meta.failure_reason.to_string(), "updated reason");
+        assert_eq!(meta.retry_count, 5);
+        assert_eq!(meta.failed_from_state, TransactionState::Pending);
+    }
+
+    /// Import rejects invalid JSON.
+    #[test]
+    #[cfg(feature = "std")]
+    fn test_import_invalid_json_returns_error() {
+        let env = Env::default();
+        let mut tracker = TransactionStateTracker::new(true);
+        let initiator = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+
+        let result = tracker.import_recovery_state("not json at all", initiator, &env);
+        assert!(result.is_err());
+    }
+
+    /// Import rejects unknown failed_from_state.
+    #[test]
+    #[cfg(feature = "std")]
+    fn test_import_invalid_state_name_returns_error() {
+        let env = Env::default();
+        let mut tracker = TransactionStateTracker::new(true);
+        let initiator = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+
+        let json = r#"{
+            "failure_reason": "bad state",
+            "last_updated_ledger": 0,
+            "failed_from_state": "unknown_state",
+            "retry_count": 0,
+            "transaction_id": 1
+        }"#;
+
+        let result = tracker.import_recovery_state(json, initiator, &env);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown_state"));
+    }
+
+    /// Import rejects terminal failed_from_state.
+    #[test]
+    #[cfg(feature = "std")]
+    fn test_import_terminal_failed_from_state_returns_error() {
+        let env = Env::default();
+        let mut tracker = TransactionStateTracker::new(true);
+        let initiator = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+
+        let json = r#"{
+            "failure_reason": "terminal from_state",
+            "last_updated_ledger": 0,
+            "failed_from_state": "completed",
+            "retry_count": 0,
+            "transaction_id": 1
+        }"#;
+
+        let result = tracker.import_recovery_state(json, initiator, &env);
+        assert!(result.is_err());
+    }
+
+    /// Import rejects non-failed existing transaction.
+    #[test]
+    #[cfg(feature = "std")]
+    fn test_import_existing_non_failed_returns_error() {
+        let env = Env::default();
+        let mut tracker = TransactionStateTracker::new(true);
+        let initiator = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+
+        tracker.create_transaction(1, initiator.clone(), &env).unwrap();
+        // Transaction is Pending, not Failed
+
+        let json = r#"{
+            "failure_reason": "trying to overwrite",
+            "last_updated_ledger": 0,
+            "failed_from_state": "pending",
+            "retry_count": 0,
+            "transaction_id": 1
+        }"#;
+
+        let result = tracker.import_recovery_state(json, initiator, &env);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("pending"));
+    }
+
+    /// Round-trip: export then import produces equivalent state.
+    #[test]
+    #[cfg(feature = "std")]
+    fn test_export_import_round_trip() {
+        let env = Env::default();
+        let mut tracker = TransactionStateTracker::new(true);
+        let initiator = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+
+        tracker.create_transaction(1, initiator.clone(), &env).unwrap();
+        tracker.start_transaction(1, &env).unwrap();
+        tracker.fail_transaction(1, String::from_str(&env, "round-trip error"), &env).unwrap();
+
+        // Export
+        let json = tracker.export_recovery_state(1, &env).unwrap();
+
+        // Create a new tracker and import
+        let mut tracker2 = TransactionStateTracker::new(true);
+        tracker2.import_recovery_state(&json, initiator.clone(), &env).unwrap();
+
+        let meta = tracker2.get_recovery_metadata(1, &env).unwrap().unwrap();
+        assert_eq!(meta.failure_reason.to_string(), "round-trip error");
+        assert_eq!(meta.failed_from_state, TransactionState::InProgress);
+        assert_eq!(meta.retry_count, 0);
     }
 }
