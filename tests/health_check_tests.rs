@@ -192,3 +192,124 @@ fn test_rate_limiter_health_resets_after_window() {
     assert_eq!(report.submission_count, 0);
     assert!(!report.is_throttled);
 }
+
+// ---------------------------------------------------------------------------
+// MetadataFreshnessReport freshness_score
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_freshness_score_missing_is_zero() {
+    let env = Env::default(); let client = setup_env(&env);
+    init_contract(&env, &client);
+    let anchor = Address::generate(&env);
+    let report = client.get_metadata_freshness(&anchor);
+    assert_eq!(report.freshness_score, 0, "missing entry must have score 0");
+}
+
+#[test]
+fn test_freshness_score_fresh_near_100() {
+    let env = Env::default(); let client = setup_env(&env);
+    init_contract(&env, &client);
+    let anchor = Address::generate(&env);
+    let metadata = make_metadata(&env, &anchor);
+    // Cache with a 3600s TTL, zero time elapsed → score near 100.
+    client.cache_metadata(&anchor, &metadata, &3600u64);
+    let report = client.get_metadata_freshness(&anchor);
+    assert_eq!(report.state, MetadataCacheState::Fresh);
+    assert!(report.freshness_score >= 90,
+        "freshly cached entry at t=0 should score >= 90, got {}", report.freshness_score);
+}
+
+#[test]
+fn test_freshness_score_decreases_with_age() {
+    let env = Env::default(); let client = setup_env(&env);
+    init_contract(&env, &client);
+    let anchor = Address::generate(&env);
+    let metadata = make_metadata(&env, &anchor);
+    client.cache_metadata(&anchor, &metadata, &100u64);
+
+    // Score at t=0
+    let report_fresh = client.get_metadata_freshness(&anchor);
+
+    // Advance time to 50% of TTL
+    env.ledger().set(LedgerInfo {
+        timestamp: env.ledger().timestamp() + 50,
+        ..env.ledger().get()
+    });
+    let report_half = client.get_metadata_freshness(&anchor);
+
+    // Score should be lower after aging
+    assert!(report_half.freshness_score < report_fresh.freshness_score,
+        "score should decrease as entry ages: fresh={}, half={}", 
+        report_fresh.freshness_score, report_half.freshness_score);
+    // At 50% of TTL, score should be around 50
+    assert!(report_half.freshness_score >= 40 && report_half.freshness_score <= 60,
+        "at 50% TTL score should be near 50, got {}", report_half.freshness_score);
+}
+
+#[test]
+fn test_freshness_score_stale_is_halved() {
+    let env = Env::default(); let client = setup_env(&env);
+    init_contract(&env, &client);
+    let anchor = Address::generate(&env);
+    let metadata = make_metadata(&env, &anchor);
+    // 10s TTL, 20s stale window
+    client.cache_metadata_swr(&anchor, &metadata, &10u64, &20u64);
+
+    // Move into the stale window (age = 15s, past 10s TTL)
+    env.ledger().set(LedgerInfo {
+        timestamp: env.ledger().timestamp() + 15,
+        ..env.ledger().get()
+    });
+
+    let report = client.get_metadata_freshness(&anchor);
+    assert_eq!(report.state, MetadataCacheState::Stale);
+    // Stale score is halved relative to the age_score at the TTL boundary (which is 0),
+    // so the base is 0/2 = 0 — but the SWR window is still usable.
+    // The score should be low (0–25 range) due to being past the TTL.
+    assert!(report.freshness_score <= 25,
+        "stale entry score should be <= 25, got {}", report.freshness_score);
+}
+
+#[test]
+fn test_freshness_score_expired_is_zero() {
+    let env = Env::default(); let client = setup_env(&env);
+    init_contract(&env, &client);
+    let anchor = Address::generate(&env);
+    let metadata = make_metadata(&env, &anchor);
+    client.cache_metadata_swr(&anchor, &metadata, &10u64, &5u64);
+
+    // Move past both TTL and stale window
+    env.ledger().set(LedgerInfo {
+        timestamp: env.ledger().timestamp() + 20,
+        ..env.ledger().get()
+    });
+
+    let report = client.get_metadata_freshness(&anchor);
+    assert_eq!(report.state, MetadataCacheState::Expired);
+    assert_eq!(report.freshness_score, 0, "expired entry must have score 0");
+}
+
+#[test]
+fn test_freshness_score_influences_refresh_decision() {
+    let env = Env::default(); let client = setup_env(&env);
+    init_contract(&env, &client);
+    let anchor = Address::generate(&env);
+    let metadata = make_metadata(&env, &anchor);
+    client.cache_metadata(&anchor, &metadata, &100u64);
+
+    // At t=0, high score → no refresh needed
+    let report_now = client.get_metadata_freshness(&anchor);
+    assert!(!report_now.needs_refresh);
+    assert!(report_now.freshness_score > 50,
+        "high-score entry should not need refresh, score={}", report_now.freshness_score);
+
+    // Advance to 95% of TTL — score drops, refresh recommended
+    env.ledger().set(LedgerInfo {
+        timestamp: env.ledger().timestamp() + 95,
+        ..env.ledger().get()
+    });
+    let report_old = client.get_metadata_freshness(&anchor);
+    assert!(report_old.freshness_score < report_now.freshness_score,
+        "aging should reduce score");
+}
