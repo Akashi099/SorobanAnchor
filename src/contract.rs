@@ -58,6 +58,20 @@ pub struct Quote {
     pub routing_reason: Option<String>,
 }
 
+/// Explicit lifecycle state for a quote.
+///
+/// Quotes progress linearly through `Active → Expired` as time passes, or
+/// can be moved to `Invalidated` by an admin at any point before expiry.
+#[contracttype]
+#[derive(Copy, Clone, Debug, PartialEq)]
+#[repr(u32)]
+pub enum QuoteLifecycleState {
+    /// Quote has been submitted and its validity window has not passed.
+    Active = 0,
+    /// Quote was manually voided by an admin before its natural expiry.
+    Invalidated = 1,
+}
+
 /// Pre-v2 quote layout without `routing_reason`. Used when reading legacy records
 /// that were persisted before the field was added to the schema.
 #[contracttype]
@@ -1222,6 +1236,12 @@ fn kyc_record_key(env: &Env, subject: &Address) -> BytesN<32> {
     let xdr = subject.clone().to_xdr(env);
     let raw = xdr_to_vec(&xdr);
     make_storage_key(env, &[b"KYC", &raw])
+}
+
+fn quote_lifecycle_key(env: &Env, anchor: &Address, quote_id: u64) -> BytesN<32> {
+    let xdr = anchor.clone().to_xdr(env);
+    let raw = xdr_to_vec(&xdr);
+    make_storage_key(env, &[b"QLIFE", &raw, &quote_id.to_be_bytes()])
 }
 
 fn compliance_check_key(env: &Env, subject: &Address, check_type: &String) -> BytesN<32> {
@@ -4570,6 +4590,11 @@ impl AnchorKitContract {
         let q_key = make_storage_key(&env, &[b"QUOTE", &anchor_raw, &next.to_be_bytes()]);
         env.storage().persistent().set(&q_key, &quote);
         env.storage().persistent().extend_ttl(&q_key, PERSISTENT_TTL, PERSISTENT_TTL);
+
+        let lc_key = quote_lifecycle_key(&env, &anchor, next);
+        env.storage().persistent().set(&lc_key, &(QuoteLifecycleState::Active as u32));
+        env.storage().persistent().extend_ttl(&lc_key, PERSISTENT_TTL, PERSISTENT_TTL);
+
         Self::append_quote_index(&env, next, &anchor);
 
         let lq_key = make_storage_key(&env, &[b"LATESTQ", &anchor_raw]);
@@ -4609,6 +4634,94 @@ impl AnchorKitContract {
             QuoteReceivedEvent { quote_id, receiver, timestamp: env.ledger().timestamp() },
         );
         quote
+    }
+
+    // -----------------------------------------------------------------------
+    // Quote lifecycle management (#591)
+    // -----------------------------------------------------------------------
+
+    /// Return the current [`QuoteLifecycleState`] for a quote.
+    ///
+    /// A quote with no lifecycle entry (created before lifecycle tracking was
+    /// introduced) is treated as `Active`. Once a quote's `valid_until` has
+    /// passed the runtime considers it logically expired regardless of the
+    /// stored state.
+    pub fn get_quote_lifecycle_state(env: Env, anchor: Address, quote_id: u64) -> QuoteLifecycleState {
+        let lc_key = quote_lifecycle_key(&env, &anchor, quote_id);
+        let raw: u32 = env.storage().persistent().get(&lc_key).unwrap_or(0u32);
+        if raw == QuoteLifecycleState::Invalidated as u32 {
+            QuoteLifecycleState::Invalidated
+        } else {
+            QuoteLifecycleState::Active
+        }
+    }
+
+    /// Manually invalidate a quote before its natural expiry (admin-only).
+    ///
+    /// Invalidated quotes are excluded from routing candidate selection and
+    /// cannot be received. The underlying quote record is retained for audit
+    /// purposes.
+    pub fn invalidate_quote(env: Env, anchor: Address, quote_id: u64) {
+        Self::require_admin(&env);
+        let anchor_xdr = anchor.clone().to_xdr(&env);
+        let anchor_raw = xdr_to_vec(&anchor_xdr);
+        let q_key = make_storage_key(&env, &[b"QUOTE", &anchor_raw, &quote_id.to_be_bytes()]);
+        if !env.storage().persistent().has(&q_key) {
+            panic_with_error!(&env, ErrorCode::QuoteNotFound);
+        }
+        let lc_key = quote_lifecycle_key(&env, &anchor, quote_id);
+        env.storage().persistent().set(&lc_key, &(QuoteLifecycleState::Invalidated as u32));
+        env.storage().persistent().extend_ttl(&lc_key, PERSISTENT_TTL, PERSISTENT_TTL);
+        env.events().publish(
+            (symbol_short!("quote"), symbol_short!("invalid"), quote_id),
+            quote_id,
+        );
+    }
+
+    /// Remove expired and invalidated quotes from the quote index (admin-only).
+    ///
+    /// Iterates the global quote index and drops entries whose `valid_until`
+    /// has passed or whose lifecycle state is `Invalidated`. Quote records are
+    /// left intact for audit trails; only the index pointer is pruned.
+    pub fn purge_expired_quotes(env: Env) {
+        Self::require_admin(&env);
+        let now = env.ledger().timestamp();
+        let idx_key = make_storage_key(&env, &[b"QIDX"]);
+        let ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<u64>>(&idx_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut live: Vec<u64> = Vec::new(&env);
+        for quote_id in ids.iter() {
+            let anch_key = make_storage_key(&env, &[b"QANCH", &quote_id.to_be_bytes()]);
+            let anchor_opt: Option<Address> = env.storage().persistent().get(&anch_key);
+            let keep = if let Some(anchor) = anchor_opt {
+                let anchor_xdr = anchor.clone().to_xdr(&env);
+                let anchor_raw = xdr_to_vec(&anchor_xdr);
+                let q_key = make_storage_key(&env, &[b"QUOTE", &anchor_raw, &quote_id.to_be_bytes()]);
+                let quote_opt: Option<Quote> = env.storage().persistent().get(&q_key);
+                match quote_opt {
+                    Some(q) if q.valid_until > now => {
+                        let lc_key = quote_lifecycle_key(&env, &anchor, quote_id);
+                        let lc: u32 = env.storage().persistent().get(&lc_key).unwrap_or(0u32);
+                        lc != QuoteLifecycleState::Invalidated as u32
+                    }
+                    _ => false,
+                }
+            } else {
+                false
+            };
+            if keep {
+                live.push_back(quote_id);
+            }
+        }
+
+        if live.len() < ids.len() {
+            env.storage().persistent().set(&idx_key, &live);
+            env.storage().persistent().extend_ttl(&idx_key, PERSISTENT_TTL, PERSISTENT_TTL);
+        }
     }
 
     /// Accept a quote with compliance gating (#297).
@@ -6018,6 +6131,11 @@ impl AnchorKitContract {
 
             // Filter expired quotes
             if quote.valid_until <= now { continue; }
+
+            // Skip manually invalidated quotes (#591)
+            let lc_key = quote_lifecycle_key(&env, &anchor, quote.quote_id);
+            let lc: u32 = env.storage().persistent().get(&lc_key).unwrap_or(0u32);
+            if lc == QuoteLifecycleState::Invalidated as u32 { continue; }
 
             // Filter by amount limits
             if options.request.amount < quote.minimum_amount
