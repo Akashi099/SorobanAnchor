@@ -1,9 +1,50 @@
 use alloc::vec::Vec;
 
+/// The backoff strategy to use when computing retry delays.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BackoffStrategy {
+    /// Classic exponential backoff: `base * multiplier^attempt` (capped at max).
+    Exponential,
+    /// Linear backoff: `base * (attempt + 1)` (capped at max).
+    Linear,
+    /// Constant backoff: always `base_delay_ms` (capped at max).
+    Constant,
+    /// No retry — the operation is attempted exactly once regardless of
+    /// `max_attempts`. Equivalent to setting `max_attempts = 1`.
+    NoRetry,
+}
+
+impl Default for BackoffStrategy {
+    fn default() -> Self {
+        BackoffStrategy::Exponential
+    }
+}
+
+/// The jitter policy applied to retry delays.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum JitterPolicy {
+    /// Full jitter in `[0, base_delay_ms / 2]` added to the computed delay
+    /// (the current behaviour). Provides good spread for thundering-herd prevention.
+    Full,
+    /// Equal jitter: delay is adjusted symmetrically by up to ±25% of the
+    /// computed delay, producing less variance than Full.
+    Equal,
+    /// No jitter — every retry at the same attempt level waits the exact same
+    /// amount of time. Useful for deterministic testing or when the caller
+    /// manages jitter externally.
+    None,
+}
+
+impl Default for JitterPolicy {
+    fn default() -> Self {
+        JitterPolicy::Full
+    }
+}
+
 /// Retry configuration for off-chain anchor requests.
 ///
 /// Controls how many times a failing operation is retried and how long to wait
-/// between attempts. The delay grows exponentially and is capped at
+/// between attempts. The delay grows according to `strategy` and is capped at
 /// `max_delay_ms` to prevent unbounded waits.
 ///
 /// # Examples
@@ -29,6 +70,10 @@ pub struct RetryConfig {
     pub max_delay_ms: u64,
     /// Multiplier applied to the delay after each failed attempt.
     pub backoff_multiplier: u32,
+    /// Backoff strategy governing how delays grow between attempts.
+    pub strategy: BackoffStrategy,
+    /// Jitter policy for adding variance to computed delays.
+    pub jitter_policy: JitterPolicy,
 }
 
 impl Default for RetryConfig {
@@ -38,6 +83,8 @@ impl Default for RetryConfig {
             base_delay_ms: 100,
             max_delay_ms: 5_000,
             backoff_multiplier: 2,
+            strategy: BackoffStrategy::default(),
+            jitter_policy: JitterPolicy::default(),
         }
     }
 }
@@ -55,7 +102,8 @@ impl RetryConfig {
     ///
     /// # Returns
     ///
-    /// A new [`RetryConfig`].
+    /// A new [`RetryConfig`] with default [`BackoffStrategy::Exponential`] and
+    /// [`JitterPolicy::Full`].
     ///
     /// # Examples
     ///
@@ -77,6 +125,27 @@ impl RetryConfig {
             base_delay_ms,
             max_delay_ms,
             backoff_multiplier,
+            strategy: BackoffStrategy::default(),
+            jitter_policy: JitterPolicy::default(),
+        }
+    }
+
+    /// Full configuration constructor including strategy and jitter policy.
+    pub fn with_strategy(
+        max_attempts: u32,
+        base_delay_ms: u64,
+        max_delay_ms: u64,
+        backoff_multiplier: u32,
+        strategy: BackoffStrategy,
+        jitter_policy: JitterPolicy,
+    ) -> Self {
+        RetryConfig {
+            max_attempts,
+            base_delay_ms,
+            max_delay_ms,
+            backoff_multiplier,
+            strategy,
+            jitter_policy,
         }
     }
 
@@ -87,6 +156,8 @@ impl RetryConfig {
             base_delay_ms: 50,
             max_delay_ms: 2_000,
             backoff_multiplier: 2,
+            strategy: BackoffStrategy::default(),
+            jitter_policy: JitterPolicy::default(),
         }
     }
 
@@ -97,25 +168,90 @@ impl RetryConfig {
             base_delay_ms: 500,
             max_delay_ms: 10_000,
             backoff_multiplier: 2,
+            strategy: BackoffStrategy::default(),
+            jitter_policy: JitterPolicy::default(),
+        }
+    }
+
+    /// Linear strategy: 6 attempts, 100 ms base, 5 s max — for predictable delays.
+    pub fn linear() -> Self {
+        RetryConfig {
+            max_attempts: 6,
+            base_delay_ms: 100,
+            max_delay_ms: 5_000,
+            backoff_multiplier: 2,
+            strategy: BackoffStrategy::Linear,
+            jitter_policy: JitterPolicy::Full,
+        }
+    }
+
+    /// Constant strategy: 5 attempts, 500 ms fixed delay — for steady retries.
+    pub fn constant() -> Self {
+        RetryConfig {
+            max_attempts: 5,
+            base_delay_ms: 500,
+            max_delay_ms: 500,
+            backoff_multiplier: 1,
+            strategy: BackoffStrategy::Constant,
+            jitter_policy: JitterPolicy::None,
+        }
+    }
+
+    /// Set the backoff strategy on an existing config.
+    pub fn with_backoff_strategy(mut self, strategy: BackoffStrategy) -> Self {
+        self.strategy = strategy;
+        self
+    }
+
+    /// Set the jitter policy on an existing config.
+    pub fn with_jitter_policy(mut self, jitter_policy: JitterPolicy) -> Self {
+        self.jitter_policy = jitter_policy;
+        self
+    }
+
+    /// Compute the base delay (ms) for a given attempt index (0-based) using
+    /// the configured [`BackoffStrategy`], before jitter is applied.
+    fn base_delay_for_attempt(&self, attempt: u32) -> u64 {
+        match self.strategy {
+            BackoffStrategy::Exponential => {
+                let exp = (self.backoff_multiplier as u64).saturating_pow(attempt);
+                self.base_delay_ms.saturating_mul(exp).min(self.max_delay_ms)
+            }
+            BackoffStrategy::Linear => {
+                let factor = (attempt as u64).saturating_add(1);
+                self.base_delay_ms.saturating_mul(factor).min(self.max_delay_ms)
+            }
+            BackoffStrategy::Constant => self.base_delay_ms.min(self.max_delay_ms),
+            BackoffStrategy::NoRetry => 0,
         }
     }
 
     /// Compute the delay (ms) for a given attempt index (0-based), drawing
-    /// jitter from `jitter_source`.
+    /// jitter from `jitter_source` according to [`JitterPolicy`].
     ///
-    /// The exponential component is `min(base * multiplier^attempt, max_delay_ms)`.
-    /// Jitter is drawn from `[0, base_delay_ms / 2]` and added to that, then
-    /// the total is capped at `max_delay_ms` so the configured ceiling is never
+    /// The total is capped at `max_delay_ms` so the configured ceiling is never
     /// exceeded regardless of the jitter seed.
-    ///
-    /// `delay = min(min(base * multiplier^attempt, max) + jitter(0..=base/2), max)`
     pub fn delay_for_attempt(&self, attempt: u32, jitter_source: &mut impl JitterSource) -> u64 {
-        let exp = (self.backoff_multiplier as u64).saturating_pow(attempt);
-        let raw = self.base_delay_ms.saturating_mul(exp);
-        let capped = raw.min(self.max_delay_ms);
-        let jitter_bound = self.base_delay_ms / 2 + 1;
-        let jitter = if jitter_bound == 0 { 0 } else { jitter_source.next_seed() % jitter_bound };
-        capped.saturating_add(jitter).min(self.max_delay_ms)
+        let base = self.base_delay_for_attempt(attempt);
+        match self.jitter_policy {
+            JitterPolicy::Full => {
+                let jitter_bound = self.base_delay_ms / 2 + 1;
+                let jitter = if jitter_bound == 0 { 0 } else { jitter_source.next_seed() % jitter_bound };
+                base.saturating_add(jitter).min(self.max_delay_ms)
+            }
+            JitterPolicy::Equal => {
+                let half = base / 2;
+                let jitter_bound = if half == 0 { 1 } else { half };
+                let offset = jitter_source.next_seed() % jitter_bound;
+                let sign = (jitter_source.next_seed() % 2) as i64;
+                if sign == 0 {
+                    (base + offset).min(self.max_delay_ms)
+                } else {
+                    base.saturating_sub(offset).max(self.base_delay_ms.min(base))
+                }
+            }
+            JitterPolicy::None => base,
+        }
     }
 }
 
@@ -654,5 +790,178 @@ mod retry_tests {
             assert_eq!(config.delay_for_attempt(attempt as u32, &mut js), exp,
                 "attempt {attempt}: expected {exp}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #623 — configurable retry strategy tests
+    // -----------------------------------------------------------------------
+
+    /// Linear backoff: base * (attempt + 1)
+    #[test]
+    fn test_linear_backoff_strategy() {
+        let config = RetryConfig::with_strategy(5, 100, 10_000, 2, BackoffStrategy::Linear, JitterPolicy::None);
+        let mut js = MockJitterSource::new(vec![0]);
+        assert_eq!(config.delay_for_attempt(0, &mut js), 100);
+        assert_eq!(config.delay_for_attempt(1, &mut js), 200);
+        assert_eq!(config.delay_for_attempt(2, &mut js), 300);
+        assert_eq!(config.delay_for_attempt(3, &mut js), 400);
+    }
+
+    /// Constant backoff: always base_delay_ms.
+    #[test]
+    fn test_constant_backoff_strategy() {
+        let config = RetryConfig::with_strategy(5, 250, 10_000, 2, BackoffStrategy::Constant, JitterPolicy::None);
+        let mut js = MockJitterSource::new(vec![0]);
+        for i in 0..5 {
+            assert_eq!(config.delay_for_attempt(i, &mut js), 250);
+        }
+    }
+
+    /// NoRetry strategy always returns 0 delay.
+    #[test]
+    fn test_no_retry_strategy() {
+        let config = RetryConfig::with_strategy(5, 100, 10_000, 2, BackoffStrategy::NoRetry, JitterPolicy::None);
+        let mut js = MockJitterSource::new(vec![0]);
+        for i in 0..5 {
+            assert_eq!(config.delay_for_attempt(i, &mut js), 0);
+        }
+    }
+
+    /// Linear presets.
+    #[test]
+    fn test_linear_preset() {
+        let cfg = RetryConfig::linear();
+        assert_eq!(cfg.max_attempts, 6);
+        assert_eq!(cfg.base_delay_ms, 100);
+        assert_eq!(cfg.strategy, BackoffStrategy::Linear);
+    }
+
+    /// Constant preset.
+    #[test]
+    fn test_constant_preset() {
+        let cfg = RetryConfig::constant();
+        assert_eq!(cfg.max_attempts, 5);
+        assert_eq!(cfg.base_delay_ms, 500);
+        assert_eq!(cfg.max_delay_ms, 500);
+        assert_eq!(cfg.strategy, BackoffStrategy::Constant);
+        assert_eq!(cfg.jitter_policy, JitterPolicy::None);
+    }
+
+    /// with_backoff_strategy builder method.
+    #[test]
+    fn test_with_backoff_strategy_builder() {
+        let cfg = RetryConfig::default().with_backoff_strategy(BackoffStrategy::Linear);
+        assert_eq!(cfg.strategy, BackoffStrategy::Linear);
+    }
+
+    /// with_jitter_policy builder method.
+    #[test]
+    fn test_with_jitter_policy_builder() {
+        let cfg = RetryConfig::default().with_jitter_policy(JitterPolicy::None);
+        assert_eq!(cfg.jitter_policy, JitterPolicy::None);
+    }
+
+    /// NoJitter policy: delay is deterministic for a given attempt.
+    #[test]
+    fn test_no_jitter_policy() {
+        let config = RetryConfig::with_strategy(4, 100, 10_000, 2, BackoffStrategy::Exponential, JitterPolicy::None);
+        let mut js = MockJitterSource::new(vec![999]);
+        assert_eq!(config.delay_for_attempt(0, &mut js), 100);
+        assert_eq!(config.delay_for_attempt(1, &mut js), 200);
+        assert_eq!(config.delay_for_attempt(2, &mut js), 400);
+    }
+
+    /// FullJitter uses seed and base_delay_ms/2 bound.
+    #[test]
+    fn test_full_jitter_policy() {
+        let config = RetryConfig::with_strategy(3, 100, 10_000, 2, BackoffStrategy::Exponential, JitterPolicy::Full);
+        let mut js = MockJitterSource::new(vec![10]);
+        assert_eq!(config.delay_for_attempt(0, &mut js), 100 + 10);
+        let mut js = MockJitterSource::new(vec![20]);
+        assert_eq!(config.delay_for_attempt(1, &mut js), 200 + 20);
+    }
+
+    /// EqualJitter produces different results depending on sign bit.
+    #[test]
+    fn test_equal_jitter_policy() {
+        let config = RetryConfig::with_strategy(3, 100, 10_000, 2, BackoffStrategy::Exponential, JitterPolicy::Equal);
+        // seed 0 => offset = 0 % 50 = 0, sign seed 1 => 1 % 2 = 1 (subtract)
+        let mut js = MockJitterSource::new(vec![0, 1]);
+        let delay = config.delay_for_attempt(0, &mut js);
+        assert_eq!(delay, 100);
+
+        // seed 5 => offset = 5 % 50 = 5, sign seed 3 => 3 % 2 = 1 (subtract)
+        let mut js2 = MockJitterSource::new(vec![5, 3]);
+        let delay2 = config.delay_for_attempt(0, &mut js2);
+        assert_eq!(delay2, 100 - 5);
+    }
+
+    /// NoRetry in retry_with_backoff still produces exactly one attempt.
+    #[test]
+    fn test_no_retry_with_backoff() {
+        let config = RetryConfig::with_strategy(5, 100, 10_000, 2, BackoffStrategy::NoRetry, JitterPolicy::None);
+        let mut calls = 0u32;
+        let mut js = MockJitterSource::new(vec![0]);
+        let result = retry_with_backoff(
+            &config,
+            |_| { calls += 1; Err::<i32, _>(TestError::Transient) },
+            is_retryable_test,
+            |_| {},
+            &mut js,
+        );
+        assert_eq!(calls, 1);
+        assert!(result.is_err());
+    }
+
+    /// Strategy propagates through retry_with_backoff.
+    #[test]
+    fn test_linear_backoff_through_retry() {
+        let config = RetryConfig::with_strategy(4, 100, 10_000, 2, BackoffStrategy::Linear, JitterPolicy::None);
+        let mut recorded: Vec<u64> = Vec::new();
+        let mut js = MockJitterSource::new(vec![0]);
+
+        let _ = retry_with_backoff(
+            &config,
+            |_| Err::<i32, _>(TestError::Transient),
+            is_retryable_test,
+            |ms| recorded.push(ms),
+            &mut js,
+        );
+
+        assert_eq!(recorded.len(), 3);
+        assert_eq!(recorded[0], 100);
+        assert_eq!(recorded[1], 200);
+        assert_eq!(recorded[2], 300);
+    }
+
+    /// Linear cap at max_delay_ms.
+    #[test]
+    fn test_linear_backoff_capped_at_max() {
+        let config = RetryConfig::with_strategy(10, 1000, 3_000, 2, BackoffStrategy::Linear, JitterPolicy::None);
+        let mut js = MockJitterSource::new(vec![0]);
+        assert_eq!(config.delay_for_attempt(2, &mut js), 3_000);
+        assert_eq!(config.delay_for_attempt(5, &mut js), 3_000);
+    }
+
+    /// Constant backoff with jitter still applies jitter.
+    #[test]
+    fn test_constant_backoff_with_full_jitter() {
+        let config = RetryConfig::with_strategy(3, 500, 10_000, 2, BackoffStrategy::Constant, JitterPolicy::Full);
+        let mut js = MockJitterSource::new(vec![10, 20, 30]);
+        assert_eq!(config.delay_for_attempt(0, &mut js), 500 + 10);
+        assert_eq!(config.delay_for_attempt(1, &mut js), 500 + 20);
+        assert_eq!(config.delay_for_attempt(2, &mut js), 500 + 30);
+    }
+
+    /// BackoffStrategy default is Exponential.
+    #[test]
+    fn test_backoff_strategy_default() {
+        assert_eq!(BackoffStrategy::default(), BackoffStrategy::Exponential);
+    }
+
+    /// JitterPolicy default is Full.
+    #[test]
+    fn test_jitter_policy_default() {
+        assert_eq!(JitterPolicy::default(), JitterPolicy::Full);
     }
 }
