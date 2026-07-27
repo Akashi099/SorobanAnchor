@@ -530,6 +530,54 @@ impl AnchorFeeHistory {
     pub fn observation_count(&self, now: u64) -> usize {
         self.active(now).len()
     }
+
+    /// Population standard deviation of fee observations in the retention window.
+    ///
+    /// Returns `None` when fewer than two observations are present (stddev is
+    /// undefined for zero samples and trivially zero for one).
+    pub fn fee_volatility(&self, now: u64) -> Option<f64> {
+        let obs = self.active(now);
+        if obs.len() < 2 {
+            return None;
+        }
+        let n = obs.len();
+        let mean = obs.iter().map(|o| o.fee_bps as f64).sum::<f64>() / n as f64;
+        let variance = obs
+            .iter()
+            .map(|o| {
+                let diff = o.fee_bps as f64 - mean;
+                diff * diff
+            })
+            .sum::<f64>()
+            / n as f64;
+        Some(variance.sqrt())
+    }
+
+    /// Recency-weighted average fee in basis points.
+    ///
+    /// Applies exponential decay so that the most recent observation carries
+    /// the highest weight. The decay factor is `0.9^age_rank` where `age_rank`
+    /// is 0 for the newest observation and increases for older ones.
+    /// Returns `None` when there are no observations in the window.
+    pub fn recency_weighted_average_fee_bps(&self, now: u64) -> Option<f64> {
+        let mut obs = self.active(now);
+        if obs.is_empty() {
+            return None;
+        }
+        obs.sort_by_key(|o| o.observed_at);
+        const DECAY: f64 = 0.9;
+        let mut weighted_sum = 0.0_f64;
+        let mut weight_total = 0.0_f64;
+        for (rank, o) in obs.iter().rev().enumerate() {
+            let weight = DECAY.powi(rank as i32);
+            weighted_sum += o.fee_bps as f64 * weight;
+            weight_total += weight;
+        }
+        if weight_total == 0.0 {
+            return None;
+        }
+        Some(weighted_sum / weight_total)
+    }
 }
 
 // ── CrossAnchorFeeAggregator ──────────────────────────────────────────────────
@@ -544,6 +592,10 @@ pub struct FeeAnomalyReport {
     pub anomalous_anchors: AllocVec<(String, u64)>,
     /// Length of the observation window used for the 7-day average (seconds).
     pub observation_window_seconds: u64,
+    /// Per-anchor fee volatility (population stddev in bps) for anchors that
+    /// have at least two observations. Listed as `(anchor_id, volatility_bps_x100)`
+    /// where the value is `stddev * 100` rounded to the nearest integer.
+    pub anchor_volatilities: AllocVec<(String, u64)>,
 }
 
 /// Aggregates fee observations across multiple anchors and identifies anomalies.
@@ -582,13 +634,37 @@ impl CrossAnchorFeeAggregator {
     /// Compute the [`FeeAnomalyReport`] for the current cluster state.
     ///
     /// Anchors with no observations within the window are excluded from the
-    /// median computation and are never flagged as anomalous.
+    /// median computation and are never flagged as anomalous. The report also
+    /// includes per-anchor fee volatility (standard deviation) so callers can
+    /// distinguish consistently high-fee anchors from erratically priced ones.
     pub fn compute_report(&self, current_time: u64) -> FeeAnomalyReport {
-        // Collect per-anchor averages for anchors that have observations.
+        self.compute_report_impl(current_time, false)
+    }
+
+    /// Like [`compute_report`] but uses recency-weighted averages instead of
+    /// simple 7-day averages when ranking anchor fees.
+    ///
+    /// Recent observations receive exponentially higher weight (`0.9^age_rank`),
+    /// making the anomaly detection more sensitive to sudden fee spikes.
+    pub fn compute_extended_report(&self, current_time: u64) -> FeeAnomalyReport {
+        self.compute_report_impl(current_time, true)
+    }
+
+    fn compute_report_impl(&self, current_time: u64, use_recency_weight: bool) -> FeeAnomalyReport {
         let mut averages: AllocVec<(String, u64)> = AllocVec::new();
+        let mut anchor_volatilities: AllocVec<(String, u64)> = AllocVec::new();
+
         for (id, history) in &self.anchors {
-            if let Some(avg) = history.average_fee_bps(current_time) {
+            let avg_opt = if use_recency_weight {
+                history.recency_weighted_average_fee_bps(current_time)
+            } else {
+                history.average_fee_bps(current_time)
+            };
+            if let Some(avg) = avg_opt {
                 averages.push((id.clone(), avg as u64));
+            }
+            if let Some(vol) = history.fee_volatility(current_time) {
+                anchor_volatilities.push((id.clone(), (vol * 100.0).round() as u64));
             }
         }
 
@@ -597,6 +673,7 @@ impl CrossAnchorFeeAggregator {
                 median_fee_bps: 0,
                 anomalous_anchors: AllocVec::new(),
                 observation_window_seconds: Self::WINDOW_SECONDS,
+                anchor_volatilities,
             };
         }
 
@@ -608,7 +685,6 @@ impl CrossAnchorFeeAggregator {
             if n % 2 == 1 {
                 fees[n / 2]
             } else {
-                // Lower median for even-count arrays.
                 fees[n / 2 - 1]
             }
         };
@@ -623,6 +699,7 @@ impl CrossAnchorFeeAggregator {
             median_fee_bps: median,
             anomalous_anchors,
             observation_window_seconds: Self::WINDOW_SECONDS,
+            anchor_volatilities,
         }
     }
 }

@@ -121,6 +121,18 @@ pub enum ErrorCode {
     EndpointNotSet            = 56,
     /// Attestor has no webhook URL set (profile exists but field is empty).
     WebhookUrlNotSet          = 57,
+
+    // Precise failure-mode variants (58–62)
+    /// KYC record exists but the approval has passed its expiry timestamp.
+    KycExpired                = 58,
+    /// Attestor address is known but currently revoked; reactivation is required.
+    AttestorRevoked           = 59,
+    /// Quote record exists but `valid_until` has passed.
+    QuoteExpired              = 60,
+    /// EdDSA signature length or value is invalid for the given public key.
+    SignatureVerificationFailed = 61,
+    /// Batch submission contains more items than the per-call maximum.
+    BatchSizeExceeded         = 62,
 }
 
 impl ErrorCode {
@@ -186,6 +198,11 @@ impl ErrorCode {
             ErrorCode::TransactionNotFound       => "Transaction record not found",
             ErrorCode::EndpointNotSet            => "Attestor endpoint URL is not set",
             ErrorCode::WebhookUrlNotSet          => "Attestor webhook URL is not set",
+            ErrorCode::KycExpired                => "KYC approval has expired",
+            ErrorCode::AttestorRevoked           => "Attestor is revoked; reactivation required",
+            ErrorCode::QuoteExpired              => "Quote has passed its validity deadline",
+            ErrorCode::SignatureVerificationFailed => "Attestation signature verification failed",
+            ErrorCode::BatchSizeExceeded         => "Batch size exceeds the per-call maximum",
         }
     }
 }
@@ -362,6 +379,17 @@ impl AnchorKitError {
     pub fn quote_not_found() -> Self { Self::from_code(ErrorCode::QuoteNotFound) }
     pub fn endpoint_not_set() -> Self { Self::from_code(ErrorCode::EndpointNotSet) }
     pub fn webhook_url_not_set() -> Self { Self::from_code(ErrorCode::WebhookUrlNotSet) }
+    pub fn kyc_expired() -> Self { Self::from_code(ErrorCode::KycExpired) }
+    pub fn attestor_revoked() -> Self { Self::from_code(ErrorCode::AttestorRevoked) }
+    pub fn quote_expired() -> Self { Self::from_code(ErrorCode::QuoteExpired) }
+    pub fn signature_verification_failed() -> Self { Self::from_code(ErrorCode::SignatureVerificationFailed) }
+    pub fn batch_size_exceeded(limit: usize, given: usize) -> Self {
+        Self::with_context(
+            ErrorCode::BatchSizeExceeded,
+            ErrorCode::BatchSizeExceeded.default_message(),
+            &alloc::format!("limit={} given={}", limit, given),
+        )
+    }
     pub fn invalid_asset_code(code: &str) -> Self {
         Self::with_context(
             ErrorCode::InvalidAssetCode,
@@ -548,6 +576,13 @@ mod tests {
             ErrorCode::SessionNotFound,
             ErrorCode::QuoteNotFound,
             ErrorCode::Unauthorized,
+            ErrorCode::EndpointNotSet,
+            ErrorCode::WebhookUrlNotSet,
+            ErrorCode::KycExpired,
+            ErrorCode::AttestorRevoked,
+            ErrorCode::QuoteExpired,
+            ErrorCode::SignatureVerificationFailed,
+            ErrorCode::BatchSizeExceeded,
         ];
         for code in codes {
             assert!(!code.default_message().is_empty());
@@ -576,11 +611,37 @@ mod tests {
         assert_eq!(ErrorCode::InvalidRequestContext as u32, 51);
         assert_eq!(ErrorCode::InvalidSessionMetadata as u32, 52);
         assert_eq!(ErrorCode::InvalidAssetCode      as u32, 53);
+        assert_eq!(ErrorCode::AttestorCapacityExceeded as u32, 54);
+        assert_eq!(ErrorCode::CacheCapacityExceeded as u32, 55);
+        assert_eq!(ErrorCode::EndpointNotSet        as u32, 56);
+        assert_eq!(ErrorCode::WebhookUrlNotSet      as u32, 57);
+        assert_eq!(ErrorCode::KycExpired            as u32, 58);
+        assert_eq!(ErrorCode::AttestorRevoked       as u32, 59);
+        assert_eq!(ErrorCode::QuoteExpired          as u32, 60);
+        assert_eq!(ErrorCode::SignatureVerificationFailed as u32, 61);
+        assert_eq!(ErrorCode::BatchSizeExceeded     as u32, 62);
     }
 
     #[test]
-    fn test_type_alias_error_works() {
-        let err: Error = AnchorKitError::from_code(ErrorCode::InvalidEndpointFormat);
+    fn test_new_precise_error_variants_have_messages() {
+        assert!(!ErrorCode::KycExpired.default_message().is_empty());
+        assert!(!ErrorCode::AttestorRevoked.default_message().is_empty());
+        assert!(!ErrorCode::QuoteExpired.default_message().is_empty());
+        assert!(!ErrorCode::SignatureVerificationFailed.default_message().is_empty());
+        assert!(!ErrorCode::BatchSizeExceeded.default_message().is_empty());
+    }
+
+    #[test]
+    fn test_batch_size_exceeded_carries_context() {
+        let err = AnchorKitError::batch_size_exceeded(100, 150);
+        assert_eq!(err.code, ErrorCode::BatchSizeExceeded);
+        let ctx = err.context.expect("context must be present");
+        assert!(ctx.contains("limit=100"));
+        assert!(ctx.contains("given=150"));
+    }
+
+    #[test]
+    fn test_type_alias_error_works() {        let err: Error = AnchorKitError::from_code(ErrorCode::InvalidEndpointFormat);
         assert_eq!(err.code, ErrorCode::InvalidEndpointFormat);
     }
 

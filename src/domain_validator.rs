@@ -2,15 +2,106 @@
 //!
 //! Validates anchor domain URLs before making requests to ensure:
 //! - Proper URL format
-//! - HTTPS-only connections
+//! - HTTPS-only connections (TLS enforcement)
 //! - No embedded userinfo credentials
 //! - Rejection of IP addresses (IPv4 and IPv6)
 //! - Rejection of malformed or reserved hostnames
+//! - Policy-based allow/deny rules for anchor domains
 
 extern crate alloc;
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 
 use crate::errors::AnchorKitError;
+
+// ---------------------------------------------------------------------------
+// Domain policy rules
+// ---------------------------------------------------------------------------
+
+/// A single domain policy rule — either allow or deny a host pattern.
+///
+/// Pattern matching is suffix-based (e.g. `"example.com"` matches
+/// `"anchor.example.com"`, `"api.example.com"`, and `"example.com"` itself).
+/// An empty pattern matches nothing.
+///
+/// Rules are evaluated in declaration order; the first matching rule wins.
+/// If no rule matches, the default is **allow** (open policy).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DomainPolicyRule {
+    /// Whether this rule allows or denies the matched host.
+    pub action: PolicyAction,
+    /// Hostname suffix pattern to match (case-insensitive ASCII).
+    /// `"example.com"` matches `"example.com"` and `"sub.example.com"`.
+    pub host_pattern: String,
+}
+
+/// Policy action for a matched domain.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PolicyAction {
+    Allow,
+    Deny,
+}
+
+/// A set of ordered domain policy rules applied after baseline URL validation.
+///
+/// Rules are evaluated in declaration order; the first match wins.
+/// When no rule matches, the default action is **allow** (open policy),
+/// unless `default_deny` is `true`, in which case unmatched hosts are rejected.
+#[derive(Clone, Debug, Default)]
+pub struct DomainPolicy {
+    /// Ordered list of rules. First match wins.
+    pub rules: Vec<DomainPolicyRule>,
+    /// When `true`, unmatched hosts are denied. When `false` (default), unmatched hosts are allowed.
+    pub default_deny: bool,
+}
+
+impl DomainPolicy {
+    /// Create an empty policy that allows all hosts (open policy).
+    pub fn allow_all() -> Self {
+        DomainPolicy { rules: Vec::new(), default_deny: false }
+    }
+
+    /// Create a policy that denies all hosts not explicitly allowed.
+    pub fn deny_all() -> Self {
+        DomainPolicy { rules: Vec::new(), default_deny: true }
+    }
+
+    /// Add an allow rule for `host_pattern` and return `self` for chaining.
+    pub fn with_allow(mut self, host_pattern: impl Into<String>) -> Self {
+        self.rules.push(DomainPolicyRule {
+            action: PolicyAction::Allow,
+            host_pattern: host_pattern.into(),
+        });
+        self
+    }
+
+    /// Add a deny rule for `host_pattern` and return `self` for chaining.
+    pub fn with_deny(mut self, host_pattern: impl Into<String>) -> Self {
+        self.rules.push(DomainPolicyRule {
+            action: PolicyAction::Deny,
+            host_pattern: host_pattern.into(),
+        });
+        self
+    }
+
+    /// Evaluate the policy for `host` (the bare hostname, no port, no scheme).
+    ///
+    /// Returns `true` when the host is permitted, `false` when denied.
+    pub fn permits(&self, host: &str) -> bool {
+        let host_lower = host.to_ascii_lowercase();
+        for rule in &self.rules {
+            let pattern = rule.host_pattern.to_ascii_lowercase();
+            if pattern.is_empty() {
+                continue;
+            }
+            // Suffix match: host == pattern OR host ends with ".<pattern>"
+            if host_lower == pattern || host_lower.ends_with(&alloc::format!(".{}", pattern)) {
+                return rule.action == PolicyAction::Allow;
+            }
+        }
+        // No rule matched — apply default
+        !self.default_deny
+    }
+}
 
 /// Validates an anchor domain URL.
 ///
@@ -217,6 +308,112 @@ fn validate_host(host: &str) -> Result<(), AnchorKitError> {
             if !c.is_ascii_alphanumeric() && c != '-' {
                 return Err(AnchorKitError::invalid_endpoint_format());
             }
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Policy-aware validation
+// ---------------------------------------------------------------------------
+
+/// Extract the bare hostname (no port, no scheme, no path) from a URL that
+/// has already passed [`validate_anchor_domain`].
+///
+/// Returns an empty string when the URL cannot be parsed (should not happen
+/// after validation, but is safe).
+fn extract_host(domain: &str) -> &str {
+    // Strip "https://"
+    let after_scheme = match domain.strip_prefix("https://") {
+        Some(s) => s,
+        None => return "",
+    };
+    // Authority ends at first '/', '?', '#'
+    let authority = match after_scheme.find(|c: char| c == '/' || c == '?' || c == '#') {
+        Some(pos) => &after_scheme[..pos],
+        None => after_scheme,
+    };
+    // Strip port
+    match authority.rfind(':') {
+        Some(colon) => {
+            let port_part = &authority[colon + 1..];
+            // Only strip if it looks like a port (all digits)
+            if !port_part.is_empty() && port_part.chars().all(|c| c.is_ascii_digit()) {
+                &authority[..colon]
+            } else {
+                authority
+            }
+        }
+        None => authority,
+    }
+}
+
+/// Validate an anchor domain URL against baseline security rules **and** an
+/// optional deployment [`DomainPolicy`].
+///
+/// This is the recommended entry-point for production deployments that need to
+/// enforce an explicit allow/deny list of anchor hosts in addition to the
+/// baseline checks performed by [`validate_anchor_domain`].
+///
+/// Validation order:
+/// 1. All checks from [`validate_anchor_domain`] (HTTPS scheme, URL characters,
+///    userinfo, host format, port range, IPv4/IPv6 rejection).
+/// 2. Policy evaluation: the bare hostname is extracted and tested against
+///    `policy.permits(host)`. A denied host produces
+///    [`ErrorCode::InvalidEndpointFormat`] with a descriptive context string so
+///    callers can log the specific reason.
+///
+/// When `policy` is `None` (or is the default open policy), this function
+/// behaves identically to [`validate_anchor_domain`].
+///
+/// # Arguments
+///
+/// * `domain` — The full HTTPS URL to validate.
+/// * `policy` — Optional [`DomainPolicy`] to enforce.
+///
+/// # Errors
+///
+/// Returns [`AnchorKitError`] with code [`ErrorCode::InvalidEndpointFormat`]
+/// when any baseline or policy check fails.
+///
+/// # Examples
+///
+/// ```rust
+/// use anchorkit::domain_validator::{validate_anchor_domain_with_policy, DomainPolicy, PolicyAction};
+///
+/// // Open policy — behaves like validate_anchor_domain.
+/// assert!(validate_anchor_domain_with_policy(
+///     "https://anchor.example.com",
+///     Some(&DomainPolicy::allow_all()),
+/// ).is_ok());
+///
+/// // Deny list — specific host blocked.
+/// let policy = DomainPolicy::allow_all().with_deny("evil.com");
+/// assert!(validate_anchor_domain_with_policy("https://evil.com/sep6", Some(&policy)).is_err());
+/// assert!(validate_anchor_domain_with_policy("https://good.example.com", Some(&policy)).is_ok());
+///
+/// // Allow list — only the named anchor is permitted.
+/// let policy = DomainPolicy::deny_all().with_allow("anchor.example.com");
+/// assert!(validate_anchor_domain_with_policy("https://anchor.example.com", Some(&policy)).is_ok());
+/// assert!(validate_anchor_domain_with_policy("https://other.example.com", Some(&policy)).is_err());
+/// ```
+pub fn validate_anchor_domain_with_policy(
+    domain: &str,
+    policy: Option<&DomainPolicy>,
+) -> Result<(), AnchorKitError> {
+    // Step 1: all baseline security checks.
+    validate_anchor_domain(domain)?;
+
+    // Step 2: policy check (skip if no policy is provided).
+    if let Some(pol) = policy {
+        let host = extract_host(domain);
+        if !pol.permits(host) {
+            return Err(AnchorKitError::with_context(
+                crate::errors::ErrorCode::InvalidEndpointFormat,
+                "Anchor domain is blocked by deployment policy",
+                host,
+            ));
         }
     }
 
@@ -594,5 +791,111 @@ mod tests {
         assert!(validate_anchor_domain("https://a--b.example.com").is_ok());
         assert!(validate_anchor_domain("https://.example.com").is_err());
         assert!(validate_anchor_domain("https://example..com").is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // Policy validation tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_policy_open_allows_all_valid_domains() {
+        let policy = DomainPolicy::allow_all();
+        assert!(validate_anchor_domain_with_policy("https://anchor.example.com", Some(&policy)).is_ok());
+        assert!(validate_anchor_domain_with_policy("https://api.other.org", Some(&policy)).is_ok());
+        assert!(validate_anchor_domain_with_policy("https://anywhere.net", Some(&policy)).is_ok());
+    }
+
+    #[test]
+    fn test_policy_open_still_rejects_unsafe_domains() {
+        let policy = DomainPolicy::allow_all();
+        // Baseline rules still apply even with an open policy
+        assert!(validate_anchor_domain_with_policy("http://example.com", Some(&policy)).is_err());
+        assert!(validate_anchor_domain_with_policy("https://192.168.1.1", Some(&policy)).is_err());
+        assert!(validate_anchor_domain_with_policy("https://user:pass@example.com", Some(&policy)).is_err());
+    }
+
+    #[test]
+    fn test_policy_deny_list_blocks_specific_host() {
+        let policy = DomainPolicy::allow_all().with_deny("evil.com");
+        assert!(validate_anchor_domain_with_policy("https://evil.com/sep6", Some(&policy)).is_err());
+        assert!(validate_anchor_domain_with_policy("https://sub.evil.com", Some(&policy)).is_err());
+        assert!(validate_anchor_domain_with_policy("https://good.example.com", Some(&policy)).is_ok());
+        assert!(validate_anchor_domain_with_policy("https://notevil.com", Some(&policy)).is_ok());
+    }
+
+    #[test]
+    fn test_policy_deny_list_with_port_and_path() {
+        let policy = DomainPolicy::allow_all().with_deny("blocked.com");
+        assert!(validate_anchor_domain_with_policy("https://blocked.com:8443/api", Some(&policy)).is_err());
+        assert!(validate_anchor_domain_with_policy("https://blocked.com?q=1", Some(&policy)).is_err());
+        assert!(validate_anchor_domain_with_policy("https://notblocked.com:8443", Some(&policy)).is_ok());
+    }
+
+    #[test]
+    fn test_policy_allow_list_permits_only_named_anchor() {
+        let policy = DomainPolicy::deny_all().with_allow("anchor.example.com");
+        assert!(validate_anchor_domain_with_policy("https://anchor.example.com", Some(&policy)).is_ok());
+        assert!(validate_anchor_domain_with_policy("https://sub.anchor.example.com", Some(&policy)).is_ok());
+        assert!(validate_anchor_domain_with_policy("https://other.example.com", Some(&policy)).is_err());
+        assert!(validate_anchor_domain_with_policy("https://example.com", Some(&policy)).is_err());
+    }
+
+    #[test]
+    fn test_policy_deny_all_rejects_unmatched() {
+        let policy = DomainPolicy::deny_all();
+        assert!(validate_anchor_domain_with_policy("https://any.example.com", Some(&policy)).is_err());
+    }
+
+    #[test]
+    fn test_policy_first_rule_wins() {
+        // Allow rule before deny rule — allow wins for the matched host
+        let policy = DomainPolicy::allow_all()
+            .with_allow("good.example.com")
+            .with_deny("example.com");
+        // "good.example.com" matches the allow rule first
+        assert!(validate_anchor_domain_with_policy("https://good.example.com", Some(&policy)).is_ok());
+        // "other.example.com" hits the deny rule
+        assert!(validate_anchor_domain_with_policy("https://other.example.com", Some(&policy)).is_err());
+    }
+
+    #[test]
+    fn test_policy_none_behaves_like_validate_anchor_domain() {
+        assert!(validate_anchor_domain_with_policy("https://anchor.example.com", None).is_ok());
+        assert!(validate_anchor_domain_with_policy("http://anchor.example.com", None).is_err());
+    }
+
+    #[test]
+    fn test_policy_case_insensitive_matching() {
+        let policy = DomainPolicy::allow_all().with_deny("Evil.COM");
+        assert!(validate_anchor_domain_with_policy("https://evil.com", Some(&policy)).is_err());
+        assert!(validate_anchor_domain_with_policy("https://EVIL.COM", Some(&policy)).is_err());
+    }
+
+    #[test]
+    fn test_policy_blocked_error_has_host_in_context() {
+        let policy = DomainPolicy::allow_all().with_deny("blocked.com");
+        let err = validate_anchor_domain_with_policy("https://blocked.com", Some(&policy)).unwrap_err();
+        assert_eq!(err.code, crate::errors::ErrorCode::InvalidEndpointFormat);
+        assert!(err.context.as_deref().unwrap_or("").contains("blocked.com"),
+            "context should contain the blocked host");
+        assert!(err.message.contains("policy"),
+            "message should mention policy");
+    }
+
+    #[test]
+    fn test_policy_suffix_match_does_not_match_partial_label() {
+        // "evil.com" must not match "notevil.com" (suffix match requires a dot boundary)
+        let policy = DomainPolicy::allow_all().with_deny("evil.com");
+        assert!(validate_anchor_domain_with_policy("https://notevil.com", Some(&policy)).is_ok());
+        assert!(validate_anchor_domain_with_policy("https://evilcorp.com", Some(&policy)).is_ok());
+    }
+
+    #[test]
+    fn test_extract_host_strips_scheme_port_path() {
+        assert_eq!(extract_host("https://example.com"), "example.com");
+        assert_eq!(extract_host("https://example.com:8080"), "example.com");
+        assert_eq!(extract_host("https://example.com:443/sep6"), "example.com");
+        assert_eq!(extract_host("https://api.example.com?q=1"), "api.example.com");
+        assert_eq!(extract_host("https://sub.example.com:9000/path?x=1#frag"), "sub.example.com");
     }
 }

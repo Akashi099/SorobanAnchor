@@ -123,7 +123,7 @@ extern crate alloc;
 
 // ── Core modules (all build variants) ────────────────────────────────────────
 pub mod deterministic_hash;
-mod domain_validator;
+pub mod domain_validator;
 pub mod errors;
 pub mod sep10_jwt;
 pub mod rate_limiter;
@@ -136,7 +136,8 @@ pub mod anchor_health;
 pub mod service_management;
 pub mod admin_audit_log;
 pub mod cache_governance;
-pub mod url_normalizer;
+pub mod session_state_machine;
+pub mod migration;
 
 // ── std-only modules (filesystem, runtime config) ─────────────────────────────
 #[cfg(feature = "std")]
@@ -169,6 +170,7 @@ pub mod mock;
 
 // ── Core re-exports ───────────────────────────────────────────────────────────
 pub use domain_validator::validate_anchor_domain;
+pub use domain_validator::{validate_anchor_domain_with_policy, DomainPolicy, DomainPolicyRule, PolicyAction};
 pub use errors::{AnchorKitError, ErrorCode};
 pub use errors::normalize_asset_code;
 /// Backward-compatible alias. Prefer [`AnchorKitError`] for new code.
@@ -177,6 +179,12 @@ pub use rate_limiter::{RateLimiter, RateLimitConfig, RateLimitState};
 pub use retry::{retry_with_backoff, is_retryable, RetryConfig, JitterSource, LedgerJitterSource, MockJitterSource};
 pub use deterministic_hash::{compute_payload_hash, verify_payload_hash};
 pub use contract::{AnchorKitContract, AnchorTomlProvenance, EndpointUpdated, CacheConfig};
+pub use contract::{AttestorRevocationRecord};
+pub use contract::{
+    ContractInitializedEvent, AttestorRegisteredEvent, AttestorRevokedEvent,
+    AttestorReactivatedEvent, RateLimitHitEvent, QuoteExpiredEvent,
+    WebhookRegisteredEvent, ServicesConfiguredEvent,
+};
 pub use transaction_state_tracker::{TransactionState, TransactionStateRecord, RecoveryMetadata, OptRecovery};
 pub use transaction_state_tracker::{StorageBudgetMonitor, TransactionStateTracker};
 pub use transaction_state_tracker::TransactionSummary;
@@ -189,7 +197,11 @@ pub use config::{load_runtime_config_file, parse_runtime_config_str, ConfigForma
 
 // ── Host-only re-exports ──────────────────────────────────────────────────────
 #[cfg(not(feature = "wasm"))]
-pub use http_client::{ProxyConfig, build_client, fetch_stellar_toml_with_proxy, deliver_webhook_with_proxy};
+pub use http_client::{ProxyConfig, build_client, build_client_with_policy, fetch_stellar_toml_with_proxy, deliver_webhook_with_proxy};
+#[cfg(not(feature = "wasm"))]
+pub use http_client::{ConnectionPolicy, TransportErrorKind, classify_transport_error, is_transport_error_retryable};
+#[cfg(not(feature = "wasm"))]
+pub use http_client::{OutboundRequestOptions, post_with_options, verify_outbound_signature};
 #[cfg(not(feature = "wasm"))]
 pub use response_validator::{
     validate_anchor_info_response, validate_deposit_response, validate_quote_response,
@@ -223,6 +235,7 @@ pub use sep24::{
     RawInteractiveDepositResponse, RawInteractiveWithdrawalResponse, RawSep24TransactionResponse,
 };
 pub use contract::{ServiceRetirementInfo, AnchorServices};
+pub use contract::{AttestationFilter, AttestationPage};
 pub use service_management::{ServiceManager, ServiceToggleState, ServiceConfigSnapshot};
 pub use admin_audit_log::{AdminAuditLog, AdminConfigChangeEvent, AdminAuditLogConfig};
 pub use contract::{HealthStatus, MetadataFreshnessReport, RateLimiterHealth};
