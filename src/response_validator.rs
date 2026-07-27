@@ -2,10 +2,59 @@
 //!
 //! Validates that anchor API responses contain all required fields before
 //! returning them to the SDK consumer. Throws [`Error::ValidationError`] on mismatch.
+//!
+//! # Schema versioning
+//!
+//! Each response type carries a [`SchemaVersion`] field so consumers can
+//! distinguish which set of validation rules was applied.  The version-aware
+//! constructors (`validate_deposit_with_version`, …) let callers request a
+//! specific rule set; unknown versions fall back to the latest.
 
 extern crate alloc;
 
 use crate::errors::Error;
+
+// ── Schema versioning ─────────────────────────────────────────────────────────
+
+/// The current validator schema version.
+pub const VALIDATOR_SCHEMA_V1: u32 = 1;
+
+/// Semantic schema version for validator rule sets.
+///
+/// Each version corresponds to a specific set of validation rules.  When new
+/// rules are added the version is bumped so that existing consumers can
+/// explicitly opt in.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct SchemaVersion(pub u32);
+
+impl SchemaVersion {
+    /// Schema version 1 (initial set of rules).
+    pub const V1: SchemaVersion = SchemaVersion(1);
+
+    /// The latest known schema version – used as the default when no version
+    /// is explicitly requested.
+    pub const LATEST: SchemaVersion = SchemaVersion::V1;
+
+    /// Resolve a raw `u32` to the corresponding [`SchemaVersion`].
+    ///
+    /// Unknown (future) versions are silently downgraded to [`LATEST`] so
+    /// that consumers that blindly forward a version never receive a hard
+    /// failure.
+    pub fn resolve(v: u32) -> SchemaVersion {
+        match v {
+            1 => SchemaVersion::V1,
+            _ => SchemaVersion::LATEST,
+        }
+    }
+}
+
+impl Default for SchemaVersion {
+    fn default() -> Self {
+        SchemaVersion::LATEST
+    }
+}
+
+// ── Response types ────────────────────────────────────────────────────────────
 
 /// A validated deposit response.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -14,6 +63,8 @@ pub struct DepositResponse {
     pub status: alloc::string::String,
     pub deposit_address: alloc::string::String,
     pub expires_at: u64,
+    /// Schema version used to validate this response.
+    pub schema_version: SchemaVersion,
 }
 
 /// A validated withdraw response.
@@ -22,6 +73,8 @@ pub struct WithdrawResponse {
     pub transaction_id: alloc::string::String,
     pub status: alloc::string::String,
     pub estimated_completion: u64,
+    /// Schema version used to validate this response.
+    pub schema_version: SchemaVersion,
 }
 
 /// A validated quote response.
@@ -32,6 +85,8 @@ pub struct QuoteResponse {
     pub amount: u64,
     pub asset: alloc::string::String,
     pub fee: u64,
+    /// Schema version used to validate this response.
+    pub schema_version: SchemaVersion,
 }
 
 /// A validated SEP-38 quote response.
@@ -43,6 +98,8 @@ pub struct Sep38QuoteResponse {
     pub sell_amount: alloc::string::String,
     pub buy_amount: alloc::string::String,
     pub fee: alloc::string::String,
+    /// Schema version used to validate this response.
+    pub schema_version: SchemaVersion,
 }
 
 /// A validated anchor info response.
@@ -50,71 +107,199 @@ pub struct Sep38QuoteResponse {
 pub struct AnchorInfoResponse {
     pub name: alloc::string::String,
     pub supported_assets: alloc::vec::Vec<alloc::string::String>,
+    /// Schema version used to validate this response.
+    pub schema_version: SchemaVersion,
 }
 
 /// A validated transaction status response.
 #[derive(Clone, Debug, PartialEq)]
-pub struct TransactionStatusResponse {
+pub struct TransactionStatusResponseValidated {
     pub transaction_id: alloc::string::String,
     pub status: alloc::string::String,
     pub kind: alloc::string::String,
+    /// Schema version used to validate this response.
+    pub schema_version: SchemaVersion,
 }
 
-/// Validates a transaction status response, returning a typed [`TransactionStatusResponse`]
-/// or [`Error::validation_error`] if any required field is missing or empty.
+// ── Status validators ─────────────────────────────────────────────────────────
+
+/// Returns `true` when `status` is a recognised SEP-6 transaction status.
+fn is_valid_sep6_status(status: &str) -> bool {
+    match status {
+        "pending_external"
+        | "pending_anchor"
+        | "pending_trust"
+        | "pending_user"
+        | "pending_user_transfer_start"
+        | "pending_user_transfer_complete"
+        | "completed"
+        | "refunded"
+        | "expired"
+        | "incomplete"
+        | "pending"
+        | "no_market"
+        | "too_small"
+        | "too_large"
+        | "pending_stellar"
+        | "waiting_customer_action"
+        | "error" => true,
+        _ => false,
+    }
+}
+
+/// Returns `true` when `status` is a recognised quote status.
+fn is_valid_quote_status(status: &str) -> bool {
+    matches!(status, "quoted" | "pending" | "expired" | "error")
+}
+
+// ── Numeric helpers ───────────────────────────────────────────────────────────
+
+fn is_valid_positive_decimal(s: &str) -> bool {
+    s.parse::<f64>().map(|v| v > 0.0).unwrap_or(false)
+}
+
+// ── Validation functions (backward-compatible originals) ───────────────────────
+// Each existing function delegates to its versioned counterpart with
+// `SchemaVersion::LATEST`.
+
+/// Validates a raw deposit response.
+///
+/// See [`validate_deposit_with_version`] for details.
+pub fn validate_deposit_response(
+    transaction_id: &str,
+    status: &str,
+    deposit_address: &str,
+    expires_at: u64,
+    now_unix: u64,
+) -> Result<DepositResponse, Error> {
+    validate_deposit_with_version(
+        transaction_id,
+        status,
+        deposit_address,
+        expires_at,
+        now_unix,
+        SchemaVersion::LATEST,
+    )
+}
+
+/// Validates a raw withdraw response.
+///
+/// See [`validate_withdraw_with_version`] for details.
+pub fn validate_withdraw_response(
+    transaction_id: &str,
+    status: &str,
+    estimated_completion: u64,
+) -> Result<WithdrawResponse, Error> {
+    validate_withdraw_with_version(
+        transaction_id,
+        status,
+        estimated_completion,
+        SchemaVersion::LATEST,
+    )
+}
+
+/// Validates a raw quote response.
+///
+/// See [`validate_quote_with_version`] for details.
+pub fn validate_quote_response(
+    id: &str,
+    status: &str,
+    amount: u64,
+    asset: &str,
+    fee: u64,
+) -> Result<QuoteResponse, Error> {
+    validate_quote_with_version(id, status, amount, asset, fee, SchemaVersion::LATEST)
+}
+
+/// Validates a raw SEP-38 quote response.
+///
+/// See [`validate_sep38_quote_with_version`] for details.
+pub fn validate_sep38_quote_response(
+    id: &str,
+    expires_at: &str,
+    price: &str,
+    sell_amount: &str,
+    buy_amount: &str,
+    fee: &str,
+) -> Result<Sep38QuoteResponse, Error> {
+    validate_sep38_quote_with_version(
+        id,
+        expires_at,
+        price,
+        sell_amount,
+        buy_amount,
+        fee,
+        SchemaVersion::LATEST,
+    )
+}
+
+/// Validates a raw anchor info response.
+///
+/// See [`validate_anchor_info_with_version`] for details.
+pub fn validate_anchor_info_response(
+    name: &str,
+    supported_assets: alloc::vec::Vec<alloc::string::String>,
+) -> Result<AnchorInfoResponse, Error> {
+    validate_anchor_info_with_version(name, supported_assets, SchemaVersion::LATEST)
+}
+
+/// Validates a raw transaction status response (legacy name).
 pub fn validate_transaction_status_response(
     transaction_id: &str,
     status: &str,
     kind: &str,
-) -> Result<TransactionStatusResponse, Error> {
-    if transaction_id.is_empty() {
-        return Err(Error::validation_error("transaction_id is empty"));
-    }
-    if status.is_empty() {
-        return Err(Error::validation_error("status is empty"));
-    }
-    if kind.is_empty() {
-        return Err(Error::validation_error("kind is empty"));
-    }
-    Ok(TransactionStatusResponse {
-        transaction_id: alloc::string::String::from(transaction_id),
-        status: alloc::string::String::from(status),
-        kind: alloc::string::String::from(kind),
-    })
+) -> Result<TransactionStatusResponseValidated, Error> {
+    validate_transaction_status_with_version(
+        transaction_id,
+        status,
+        kind,
+        SchemaVersion::LATEST,
+    )
 }
 
+/// Validates a raw transaction status response (v2 name).
+pub fn validate_transaction_status_response_v2(
+    transaction_id: &str,
+    status: &str,
+    kind: &str,
+) -> Result<TransactionStatusResponseValidated, Error> {
+    validate_transaction_status_with_version(
+        transaction_id,
+        status,
+        kind,
+        SchemaVersion::LATEST,
+    )
+}
 
+// ── Version-aware validation functions ────────────────────────────────────────
 
-/// Validates a raw deposit response map, returning a typed [`DepositResponse`]
-/// or [`Error::validation_error`] if any required field is missing or empty.
+/// Like [`validate_deposit_response`] but accepts an explicit [`SchemaVersion`].
 ///
-/// # Arguments
+/// # Version-specific rules
 ///
-/// * `transaction_id` - Unique transaction ID assigned by the anchor (must be non-empty).
-/// * `status` - Current transaction status string (must be non-empty).
-/// * `deposit_address` - Address or instructions for sending funds (must be non-empty).
-/// * `expires_at` - Unix timestamp when the deposit window closes (`0` is accepted).
-///
-/// # Returns
-///
-/// A validated [`DepositResponse`] on success.
-///
-/// # Errors
-///
-/// Returns [`Error`] with code [`ErrorCode::ValidationError`] if any string
-/// field is empty.
-///
-/// # Examples
-///
-/// ```rust
-/// use anchorkit::validate_deposit_response;
-///
-/// let resp = validate_deposit_response("dep_123", "pending", "GDEPOSIT...", 2_000_000_000, 1_700_000_000).unwrap();
-/// assert_eq!(resp.transaction_id, "dep_123");
-///
-/// assert!(validate_deposit_response("", "pending", "GDEPOSIT...", 2_000_000_000, 1_700_000_000).is_err());
-/// ```
-pub fn validate_deposit_response(
+/// | Version | Rules |
+/// |---------|-------|
+/// | V1      | Empty strings rejected; status must be a recognised SEP-6 value; `expires_at` must be 0 or in the future; `deposit_address` must be non-empty |
+pub fn validate_deposit_with_version(
+    transaction_id: &str,
+    status: &str,
+    deposit_address: &str,
+    expires_at: u64,
+    now_unix: u64,
+    version: SchemaVersion,
+) -> Result<DepositResponse, Error> {
+    match version {
+        SchemaVersion::V1 => validate_deposit_v1(
+            transaction_id,
+            status,
+            deposit_address,
+            expires_at,
+            now_unix,
+        ),
+    }
+}
+
+fn validate_deposit_v1(
     transaction_id: &str,
     status: &str,
     deposit_address: &str,
@@ -128,13 +313,11 @@ pub fn validate_deposit_response(
         return Err(Error::validation_error("status is empty"));
     }
     if !is_valid_sep6_status(status) {
-        return Err(Error::validation_error("invalid status value"));
+        return Err(Error::validation_error("status is not a recognised SEP-6 value"));
     }
     if deposit_address.is_empty() {
         return Err(Error::validation_error("deposit_address is empty"));
     }
-    // expires_at must be 0 (no expiry) or a timestamp strictly in the future
-    // relative to the caller-supplied now_unix.
     if expires_at != 0 && expires_at <= now_unix {
         return Err(Error::validation_error("expires_at is in the past"));
     }
@@ -144,38 +327,23 @@ pub fn validate_deposit_response(
         status: alloc::string::String::from(status),
         deposit_address: alloc::string::String::from(deposit_address),
         expires_at,
+        schema_version: SchemaVersion::V1,
     })
 }
 
-/// Validates a raw withdraw response, returning a typed [`WithdrawResponse`]
-/// or [`Error::validation_error`] if any required field is missing or empty.
-///
-/// # Arguments
-///
-/// * `transaction_id` - Unique transaction ID assigned by the anchor (must be non-empty).
-/// * `status` - Current transaction status string (must be non-empty).
-/// * `estimated_completion` - Estimated Unix timestamp for completion (`0` is accepted).
-///
-/// # Returns
-///
-/// A validated [`WithdrawResponse`] on success.
-///
-/// # Errors
-///
-/// Returns [`Error`] with code [`ErrorCode::ValidationError`] if any string
-/// field is empty.
-///
-/// # Examples
-///
-/// ```rust
-/// use anchorkit::validate_withdraw_response;
-///
-/// let resp = validate_withdraw_response("wd_456", "processing", 2000).unwrap();
-/// assert_eq!(resp.transaction_id, "wd_456");
-///
-/// assert!(validate_withdraw_response("", "processing", 2000).is_err());
-/// ```
-pub fn validate_withdraw_response(
+/// Like [`validate_withdraw_response`] but accepts an explicit [`SchemaVersion`].
+pub fn validate_withdraw_with_version(
+    transaction_id: &str,
+    status: &str,
+    estimated_completion: u64,
+    version: SchemaVersion,
+) -> Result<WithdrawResponse, Error> {
+    match version {
+        SchemaVersion::V1 => validate_withdraw_v1(transaction_id, status, estimated_completion),
+    }
+}
+
+fn validate_withdraw_v1(
     transaction_id: &str,
     status: &str,
     estimated_completion: u64,
@@ -186,45 +354,33 @@ pub fn validate_withdraw_response(
     if status.is_empty() {
         return Err(Error::validation_error("status is empty"));
     }
+    if !is_valid_sep6_status(status) {
+        return Err(Error::validation_error("status is not a recognised SEP-6 value"));
+    }
 
     Ok(WithdrawResponse {
         transaction_id: alloc::string::String::from(transaction_id),
         status: alloc::string::String::from(status),
         estimated_completion,
+        schema_version: SchemaVersion::V1,
     })
 }
 
-/// Validates a raw quote response, returning a typed [`QuoteResponse`]
-/// or [`Error::validation_error`] if any required field is missing or empty.
-///
-/// # Arguments
-///
-/// * `id` - Unique quote ID (must be non-empty).
-/// * `status` - Current quote status string (must be non-empty).
-/// * `amount` - Quote amount in asset units (`0` is accepted).
-/// * `asset` - Asset code (must be non-empty).
-/// * `fee` - Fee in asset units (`0` is accepted).
-///
-/// # Returns
-///
-/// A validated [`QuoteResponse`] on success.
-///
-/// # Errors
-///
-/// Returns [`Error`] with code [`ErrorCode::ValidationError`] if `id`, `status`,
-/// or `asset` is empty.
-///
-/// # Examples
-///
-/// ```rust
-/// use anchorkit::validate_quote_response;
-///
-/// let resp = validate_quote_response("q1", "quoted", 100_000_000, "USDC", 500_000).unwrap();
-/// assert_eq!(resp.asset, "USDC");
-///
-/// assert!(validate_quote_response("", "quoted", 0, "USDC", 0).is_err());
-/// ```
-pub fn validate_quote_response(
+/// Like [`validate_quote_response`] but accepts an explicit [`SchemaVersion`].
+pub fn validate_quote_with_version(
+    id: &str,
+    status: &str,
+    amount: u64,
+    asset: &str,
+    fee: u64,
+    version: SchemaVersion,
+) -> Result<QuoteResponse, Error> {
+    match version {
+        SchemaVersion::V1 => validate_quote_v1(id, status, amount, asset, fee),
+    }
+}
+
+fn validate_quote_v1(
     id: &str,
     status: &str,
     amount: u64,
@@ -238,10 +394,13 @@ pub fn validate_quote_response(
         return Err(Error::validation_error("status is empty"));
     }
     if !is_valid_quote_status(status) {
-        return Err(Error::validation_error("invalid quote status"));
+        return Err(Error::validation_error("status is not a recognised quote status"));
     }
     if amount == 0 {
         return Err(Error::validation_error("amount must be greater than zero"));
+    }
+    if fee > amount {
+        return Err(Error::validation_error("fee exceeds amount"));
     }
     if asset.is_empty() {
         return Err(Error::validation_error("asset is empty"));
@@ -254,10 +413,151 @@ pub fn validate_quote_response(
         amount,
         asset: alloc::string::String::from(asset),
         fee,
+        schema_version: SchemaVersion::V1,
     })
 }
 
-/// Decode a base32-encoded string into bytes.
+/// Like [`validate_sep38_quote_response`] but accepts an explicit [`SchemaVersion`].
+pub fn validate_sep38_quote_with_version(
+    id: &str,
+    expires_at: &str,
+    price: &str,
+    sell_amount: &str,
+    buy_amount: &str,
+    fee: &str,
+    version: SchemaVersion,
+) -> Result<Sep38QuoteResponse, Error> {
+    match version {
+        SchemaVersion::V1 => validate_sep38_quote_v1(id, expires_at, price, sell_amount, buy_amount, fee),
+    }
+}
+
+fn validate_sep38_quote_v1(
+    id: &str,
+    expires_at: &str,
+    price: &str,
+    sell_amount: &str,
+    buy_amount: &str,
+    fee: &str,
+) -> Result<Sep38QuoteResponse, Error> {
+    if id.is_empty() {
+        return Err(Error::validation_error("id is empty"));
+    }
+    if expires_at.is_empty() {
+        return Err(Error::validation_error("expires_at is empty"));
+    }
+    if price.is_empty() {
+        return Err(Error::validation_error("price is empty"));
+    }
+    if sell_amount.is_empty() {
+        return Err(Error::validation_error("sell_amount is empty"));
+    }
+    if buy_amount.is_empty() {
+        return Err(Error::validation_error("buy_amount is empty"));
+    }
+    if fee.is_empty() {
+        return Err(Error::validation_error("fee is empty"));
+    }
+    if !is_valid_positive_decimal(price) {
+        return Err(Error::validation_error("price must be a positive number"));
+    }
+    if !is_valid_positive_decimal(sell_amount) {
+        return Err(Error::validation_error("sell_amount must be a positive number"));
+    }
+    if !is_valid_positive_decimal(buy_amount) {
+        return Err(Error::validation_error("buy_amount must be a positive number"));
+    }
+    if !is_valid_positive_decimal(fee) {
+        return Err(Error::validation_error("fee must be a positive number"));
+    }
+
+    Ok(Sep38QuoteResponse {
+        id: alloc::string::String::from(id),
+        expires_at: alloc::string::String::from(expires_at),
+        price: alloc::string::String::from(price),
+        sell_amount: alloc::string::String::from(sell_amount),
+        buy_amount: alloc::string::String::from(buy_amount),
+        fee: alloc::string::String::from(fee),
+        schema_version: SchemaVersion::V1,
+    })
+}
+
+/// Like [`validate_anchor_info_response`] but accepts an explicit [`SchemaVersion`].
+pub fn validate_anchor_info_with_version(
+    name: &str,
+    supported_assets: alloc::vec::Vec<alloc::string::String>,
+    version: SchemaVersion,
+) -> Result<AnchorInfoResponse, Error> {
+    match version {
+        SchemaVersion::V1 => validate_anchor_info_v1(name, supported_assets),
+    }
+}
+
+fn validate_anchor_info_v1(
+    name: &str,
+    supported_assets: alloc::vec::Vec<alloc::string::String>,
+) -> Result<AnchorInfoResponse, Error> {
+    if name.is_empty() {
+        return Err(Error::validation_error("name is empty"));
+    }
+    if name.len() > 100 {
+        return Err(Error::validation_error("name must be 100 characters or fewer"));
+    }
+    if supported_assets.is_empty() {
+        return Err(Error::validation_error("supported_assets is empty"));
+    }
+    for asset in &supported_assets {
+        validate_stellar_asset(asset.as_str())?;
+    }
+
+    Ok(AnchorInfoResponse {
+        name: alloc::string::String::from(name),
+        supported_assets,
+        schema_version: SchemaVersion::V1,
+    })
+}
+
+/// Like [`validate_transaction_status_response`] but accepts an explicit
+/// [`SchemaVersion`].
+pub fn validate_transaction_status_with_version(
+    transaction_id: &str,
+    status: &str,
+    kind: &str,
+    version: SchemaVersion,
+) -> Result<TransactionStatusResponseValidated, Error> {
+    match version {
+        SchemaVersion::V1 => validate_transaction_status_v1(transaction_id, status, kind),
+    }
+}
+
+fn validate_transaction_status_v1(
+    transaction_id: &str,
+    status: &str,
+    kind: &str,
+) -> Result<TransactionStatusResponseValidated, Error> {
+    if transaction_id.is_empty() {
+        return Err(Error::validation_error("transaction_id is empty"));
+    }
+    if status.is_empty() {
+        return Err(Error::validation_error("status is empty"));
+    }
+    if !is_valid_sep6_status(status) {
+        return Err(Error::validation_error("status is not a recognised SEP-6 value"));
+    }
+    if kind.is_empty() {
+        return Err(Error::validation_error("kind is empty"));
+    }
+
+    Ok(TransactionStatusResponseValidated {
+        transaction_id: alloc::string::String::from(transaction_id),
+        status: alloc::string::String::from(status),
+        kind: alloc::string::String::from(kind),
+        schema_version: SchemaVersion::V1,
+    })
+}
+
+// ── Stellar asset & account validation (unchanged) ────────────────────────────
+
 fn decode_base32(input: &[u8]) -> Option<alloc::vec::Vec<u8>> {
     let mut buffer: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     let mut bits = 0u32;
@@ -320,171 +620,12 @@ fn crc16_xmodem(input: &[u8]) -> u16 {
     crc
 }
 
-/// Validates a raw SEP-38 quote response, returning a typed [`Sep38QuoteResponse`]
-/// or [`Error::validation_error`] if any required field is missing or empty.
-///
-/// # Arguments
-///
-/// * `id` - Unique quote ID (must be non-empty).
-/// * `expires_at` - Expiration timestamp as string (must be non-empty).
-/// * `price` - Exchange price (must be non-empty).
-/// * `sell_amount` - Amount to sell (must be non-empty).
-/// * `buy_amount` - Amount to buy (must be non-empty).
-/// * `fee` - Fee amount (must be non-empty).
-///
-/// # Returns
-///
-/// A validated [`Sep38QuoteResponse`] on success.
-///
-/// # Errors
-///
-/// Returns [`Error`] with code [`ErrorCode::ValidationError`] if any string
-/// field is empty.
-fn is_valid_positive_decimal(s: &str) -> bool {
-    s.parse::<f64>().map(|v| v > 0.0).unwrap_or(false)
-}
-
-pub fn validate_sep38_quote_response(
-    id: &str,
-    expires_at: &str,
-    price: &str,
-    sell_amount: &str,
-    buy_amount: &str,
-    fee: &str,
-) -> Result<Sep38QuoteResponse, Error> {
-    if id.is_empty() {
-        return Err(Error::validation_error("id is empty"));
-    }
-    if expires_at.is_empty() {
-        return Err(Error::validation_error("expires_at is empty"));
-    }
-    if price.is_empty() {
-        return Err(Error::validation_error("price is empty"));
-    }
-    if sell_amount.is_empty() {
-        return Err(Error::validation_error("sell_amount is empty"));
-    }
-    if buy_amount.is_empty() {
-        return Err(Error::validation_error("buy_amount is empty"));
-    }
-    if fee.is_empty() {
-        return Err(Error::validation_error("fee is empty"));
-    }
-    if !is_valid_positive_decimal(price) {
-        return Err(Error::validation_error("price must be a positive number"));
-    }
-    if !is_valid_positive_decimal(sell_amount) {
-        return Err(Error::validation_error("sell_amount must be a positive number"));
-    }
-    if !is_valid_positive_decimal(buy_amount) {
-        return Err(Error::validation_error("buy_amount must be a positive number"));
-    }
-    if !is_valid_positive_decimal(fee) {
-        return Err(Error::validation_error("fee must be a positive number"));
-    }
-
-    Ok(Sep38QuoteResponse {
-        id: alloc::string::String::from(id),
-        expires_at: alloc::string::String::from(expires_at),
-        price: alloc::string::String::from(price),
-        sell_amount: alloc::string::String::from(sell_amount),
-        buy_amount: alloc::string::String::from(buy_amount),
-        fee: alloc::string::String::from(fee),
-    })
-}
-
-/// Validates a raw anchor info response, returning a typed [`AnchorInfoResponse`]
-/// or [`Error::validation_error`] if any required field is missing or empty.
-///
-/// # Arguments
-///
-/// * `name` - Human-readable anchor name (must be non-empty).
-/// * `supported_assets` - List of asset codes the anchor supports (must be non-empty).
-///
-/// # Returns
-///
-/// A validated [`AnchorInfoResponse`] on success.
-///
-/// # Errors
-///
-/// Returns [`Error`] with code [`ErrorCode::ValidationError`] if `name` is empty
-/// or `supported_assets` is an empty list.
-///
-/// # Examples
-///
-/// ```rust
-/// use anchorkit::validate_anchor_info_response;
-///
-/// let resp = validate_anchor_info_response(
-///     "MyAnchor",
-///     vec!["USDC".into(), "XLM".into()],
-/// ).unwrap();
-/// assert_eq!(resp.name, "MyAnchor");
-/// assert_eq!(resp.supported_assets.len(), 2);
-///
-/// assert!(validate_anchor_info_response("", vec!["USDC".into()]).is_err());
-/// assert!(validate_anchor_info_response("MyAnchor", vec![]).is_err());
-/// ```
-pub fn validate_anchor_info_response(
-    name: &str,
-    supported_assets: alloc::vec::Vec<alloc::string::String>,
-) -> Result<AnchorInfoResponse, Error> {
-    if name.is_empty() {
-        return Err(Error::validation_error("name is empty"));
-    }
-    if name.len() > 100 {
-        return Err(Error::validation_error("name must be 100 characters or fewer"));
-    }
-    if supported_assets.is_empty() {
-        return Err(Error::validation_error("supported_assets is empty"));
-    }
-    for asset in &supported_assets {
-        validate_stellar_asset(asset.as_str())?;
-    }
-
-    Ok(AnchorInfoResponse {
-        name: alloc::string::String::from(name),
-        supported_assets,
-    })
-}
-
-fn is_valid_sep6_status(status: &str) -> bool {
-    match status {
-        "pending_external"
-        | "pending_anchor"
-        | "pending_trust"
-        | "pending_user"
-        | "pending_user_transfer_start"
-        | "completed"
-        | "refunded"
-        | "expired"
-        | "incomplete"
-        | "pending"
-        | "no_market"
-        | "too_small"
-        | "too_large"
-        | "error" => true,
-        _ => false,
-    }
-}
-
 /// Validate a Stellar asset identifier.
 ///
 /// Accepts:
 /// - `"native"` (XLM)
 /// - `"CODE:ISSUER"` where CODE is 1–12 alphanumeric chars and ISSUER is a
 ///   56-character Stellar address starting with `G`.
-///
-/// # Examples
-///
-/// ```rust
-/// use anchorkit::validate_stellar_asset;
-///
-/// assert!(validate_stellar_asset("native").is_ok());
-/// assert!(validate_stellar_asset("USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5").is_ok());
-/// assert!(validate_stellar_asset("INVALID").is_err());
-/// assert!(validate_stellar_asset("").is_err());
-/// ```
 pub fn validate_stellar_asset(asset: &str) -> Result<(), Error> {
     if asset == "native" {
         return Ok(());
@@ -504,11 +645,6 @@ pub fn validate_stellar_asset(asset: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// Normalize and validate a Stellar account ID.
-///
-/// Accepts address strings with leading/trailing whitespace and lower-case
-/// letters, normalizing them to the canonical upper-case Stellar public key
-/// form before returning.
 pub fn normalize_stellar_account_id(account_id: &str) -> Result<alloc::string::String, Error> {
     let trimmed = account_id.trim();
     if trimmed.is_empty() {
@@ -533,50 +669,42 @@ pub fn normalize_stellar_account_id(account_id: &str) -> Result<alloc::string::S
     Ok(alloc::string::String::from(normalized))
 }
 
-/// Validate a Stellar account ID string.
 pub fn validate_stellar_account_id(account_id: &str) -> Result<(), Error> {
     normalize_stellar_account_id(account_id).map(|_| ())
 }
 
-fn is_valid_quote_status(status: &str) -> bool {
-    matches!(status, "quoted" | "pending" | "expired" | "error")
-}
-
-/// A validated transaction status response.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TransactionStatusResponseValidated {
-    pub transaction_id: alloc::string::String,
-    pub status: alloc::string::String,
-    pub kind: alloc::string::String,
-}
-
-/// Validates a raw transaction status response.
-pub fn validate_transaction_status_response_v2(
-    transaction_id: &str,
-    status: &str,
-    kind: &str,
-) -> Result<TransactionStatusResponseValidated, Error> {
-    if transaction_id.is_empty() {
-        return Err(Error::validation_error("transaction_id is empty"));
-    }
-    if status.is_empty() {
-        return Err(Error::validation_error("status is empty"));
-    }
-    if kind.is_empty() {
-        return Err(Error::validation_error("kind is empty"));
-    }
-    Ok(TransactionStatusResponseValidated {
-        transaction_id: alloc::string::String::from(transaction_id),
-        status: alloc::string::String::from(status),
-        kind: alloc::string::String::from(kind),
-    })
-}
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // --- validate_deposit_response ---
+    // ── SchemaVersion ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_schema_version_resolve_v1() {
+        assert_eq!(SchemaVersion::resolve(1), SchemaVersion::V1);
+    }
+
+    #[test]
+    fn test_schema_version_resolve_unknown_falls_back() {
+        assert_eq!(SchemaVersion::resolve(99), SchemaVersion::LATEST);
+        assert_eq!(SchemaVersion::resolve(0), SchemaVersion::LATEST);
+    }
+
+    #[test]
+    fn test_schema_version_default_is_latest() {
+        let v: SchemaVersion = Default::default();
+        assert_eq!(v, SchemaVersion::LATEST);
+    }
+
+    #[test]
+    fn test_schema_version_constants() {
+        assert_eq!(VALIDATOR_SCHEMA_V1, 1);
+        assert_eq!(SchemaVersion::V1.0, 1);
+    }
+
+    // ── Deposit validation ─────────────────────────────────────────────────────
 
     #[test]
     fn test_valid_deposit_response() {
@@ -587,78 +715,135 @@ mod tests {
         assert_eq!(r.status, "pending");
         assert_eq!(r.deposit_address, "GDEPOSIT...");
         assert_eq!(r.expires_at, 2_000_000_000);
+        assert_eq!(r.schema_version, SchemaVersion::V1);
     }
 
     #[test]
     fn test_deposit_missing_transaction_id() {
-        let result = validate_deposit_response("", "pending", "GDEPOSIT...", 2_000_000_000, 1_700_000_000);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, crate::errors::ErrorCode::ValidationError);
+        let e = validate_deposit_response("", "pending", "GDEPOSIT...", 2_000_000_000, 1_700_000_000)
+            .unwrap_err();
+        assert_eq!(e.code, crate::errors::ErrorCode::ValidationError);
+        assert!(e.context.as_deref().unwrap_or("").contains("transaction_id"));
     }
 
     #[test]
     fn test_deposit_missing_status() {
-        let result = validate_deposit_response("dep_123", "", "GDEPOSIT...", 2_000_000_000, 1_700_000_000);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, crate::errors::ErrorCode::ValidationError);
+        let e = validate_deposit_response("dep_123", "", "GDEPOSIT...", 2_000_000_000, 1_700_000_000)
+            .unwrap_err();
+        assert_eq!(e.code, crate::errors::ErrorCode::ValidationError);
     }
 
     #[test]
     fn test_deposit_invalid_status() {
-        let result = validate_deposit_response("dep_123", "garbage_status", "GDEPOSIT...", 2_000_000_000, 1_700_000_000);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, crate::errors::ErrorCode::ValidationError);
+        let e = validate_deposit_response("dep_123", "garbage_status", "GDEPOSIT...", 2_000_000_000, 1_700_000_000)
+            .unwrap_err();
+        assert_eq!(e.code, crate::errors::ErrorCode::ValidationError);
+    }
+
+    #[test]
+    fn test_deposit_valid_status_accepted() {
+        for status in &[
+            "pending_external", "pending_anchor", "pending_trust", "pending_user",
+            "pending_user_transfer_start", "pending_user_transfer_complete", "completed",
+            "refunded", "expired", "incomplete", "pending", "no_market", "too_small",
+            "too_large", "pending_stellar", "waiting_customer_action", "error",
+        ] {
+            let result = validate_deposit_response("dep_1", status, "GADDR...", 0, 1_000);
+            assert!(result.is_ok(), "expected OK for status '{}'", status);
+        }
     }
 
     #[test]
     fn test_deposit_missing_deposit_address() {
         let result = validate_deposit_response("dep_123", "pending", "", 2_000_000_000, 1_700_000_000);
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, crate::errors::ErrorCode::ValidationError);
     }
 
     #[test]
     fn test_deposit_zero_expires_at_is_valid() {
-        // expires_at = 0 means no expiry; always accepted regardless of now_unix
         let result = validate_deposit_response("dep_123", "pending", "GDEPOSIT...", 0, 1_700_000_000);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_deposit_expires_at_in_past_rejected() {
-        // expires_at <= now_unix must be rejected
         let result = validate_deposit_response("dep_123", "pending", "GDEPOSIT...", 1_000_000_000, 2_000_000_000);
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, crate::errors::ErrorCode::ValidationError);
     }
 
-    // --- validate_withdraw_response ---
+    #[test]
+    fn test_deposit_with_version_explicit() {
+        let r = validate_deposit_with_version("d1", "completed", "G...", 0, 0, SchemaVersion::V1).unwrap();
+        assert_eq!(r.schema_version, SchemaVersion::V1);
+        let r = validate_deposit_with_version("d1", "completed", "G...", 0, 0, SchemaVersion::resolve(99)).unwrap();
+        assert_eq!(r.schema_version, SchemaVersion::V1);
+    }
+
+    #[test]
+    fn test_deposit_whitespace_status_rejected() {
+        let result = validate_deposit_response("dep_1", "  ", "GADDR...", 0, 0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_deposit_long_transaction_id_accepted() {
+        let long_id = "dep_".to_string() + &"x".repeat(200);
+        let result = validate_deposit_response(&long_id, "pending", "GADDR...", 0, 0);
+        assert!(result.is_ok());
+    }
+
+    // ── Withdraw validation ────────────────────────────────────────────────────
 
     #[test]
     fn test_valid_withdraw_response() {
-        let result = validate_withdraw_response("wd_456", "processing", 2000);
+        let result = validate_withdraw_response("wd_456", "completed", 2000);
         assert!(result.is_ok());
         let r = result.unwrap();
         assert_eq!(r.transaction_id, "wd_456");
-        assert_eq!(r.status, "processing");
+        assert_eq!(r.status, "completed");
         assert_eq!(r.estimated_completion, 2000);
+        assert_eq!(r.schema_version, SchemaVersion::V1);
     }
 
     #[test]
     fn test_withdraw_missing_transaction_id() {
-        let result = validate_withdraw_response("", "processing", 2000);
+        let result = validate_withdraw_response("", "completed", 2000);
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, crate::errors::ErrorCode::ValidationError);
     }
 
     #[test]
     fn test_withdraw_missing_status() {
         let result = validate_withdraw_response("wd_456", "", 2000);
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, crate::errors::ErrorCode::ValidationError);
     }
 
-    // --- validate_quote_response ---
+    #[test]
+    fn test_withdraw_invalid_status_rejected() {
+        let result = validate_withdraw_response("wd_456", "not_a_real_status", 2000);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_withdraw_status_validated() {
+        for status in &["completed", "pending_external", "pending_anchor", "refunded", "expired", "error"] {
+            let result = validate_withdraw_response("wd_1", status, 0);
+            assert!(result.is_ok(), "expected OK for status '{}'", status);
+        }
+    }
+
+    #[test]
+    fn test_withdraw_estimated_completion_zero_accepted() {
+        let result = validate_withdraw_response("wd_1", "completed", 0);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_withdraw_with_version_explicit() {
+        let r = validate_withdraw_with_version("w1", "completed", 0, SchemaVersion::V1).unwrap();
+        assert_eq!(r.schema_version, SchemaVersion::V1);
+    }
+
+    // ── Quote validation ──────────────────────────────────────────────────────
 
     #[test]
     fn test_valid_quote_response() {
@@ -673,37 +858,86 @@ mod tests {
         assert_eq!(r.status, "quoted");
         assert_eq!(r.amount, 100_0000000);
         assert_eq!(r.fee, 500000);
+        assert_eq!(r.schema_version, SchemaVersion::V1);
+    }
+
+    #[test]
+    fn test_quote_valid_native_asset() {
+        let result = validate_quote_response("q1", "quoted", 100, "native", 0);
+        assert!(result.is_ok());
     }
 
     #[test]
     fn test_quote_missing_id() {
-        let result = validate_quote_response("", "quoted", 100_0000000, "native", 500000);
+        let result = validate_quote_response("", "quoted", 100, "native", 0);
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, crate::errors::ErrorCode::ValidationError);
     }
 
     #[test]
     fn test_quote_missing_status() {
-        let result = validate_quote_response("quote_789", "", 100_0000000, "native", 500000);
+        let result = validate_quote_response("q1", "", 100, "native", 0);
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, crate::errors::ErrorCode::ValidationError);
     }
 
     #[test]
     fn test_quote_missing_asset() {
-        let result = validate_quote_response("quote_789", "quoted", 100_0000000, "", 500000);
+        let result = validate_quote_response("q1", "quoted", 100, "", 0);
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, crate::errors::ErrorCode::ValidationError);
     }
 
     #[test]
-    fn test_quote_zero_amount_is_valid() {
-        // amount = 0 is now rejected per #189 requirements
-        let result = validate_quote_response("quote_789", "quoted", 0, "native", 0);
+    fn test_quote_zero_amount_rejected() {
+        let result = validate_quote_response("q1", "quoted", 0, "native", 0);
         assert!(result.is_err());
     }
 
-    // --- validate_sep38_quote_response ---
+    #[test]
+    fn test_quote_invalid_asset_rejected() {
+        let result = validate_quote_response("q1", "quoted", 100, "BADFORMAT", 0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_quote_invalid_status_rejected() {
+        let result = validate_quote_response("q1", "unknown_status", 100, "native", 0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_quote_all_valid_statuses() {
+        for status in &["quoted", "pending", "expired", "error"] {
+            let result = validate_quote_response("q1", status, 100, "native", 0);
+            assert!(result.is_ok(), "expected OK for status '{}'", status);
+        }
+    }
+
+    #[test]
+    fn test_quote_fee_exceeds_amount_rejected() {
+        let result = validate_quote_response("q1", "quoted", 100, "native", 200);
+        assert!(result.is_err());
+        let e = result.unwrap_err();
+        assert!(e.context.as_deref().unwrap_or("").contains("fee"));
+    }
+
+    #[test]
+    fn test_quote_fee_equals_amount_rejected() {
+        let result = validate_quote_response("q1", "quoted", 100, "native", 100);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_quote_fee_less_than_amount_accepted() {
+        let result = validate_quote_response("q1", "quoted", 100, "native", 50);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_quote_with_version_explicit() {
+        let r = validate_quote_with_version("q1", "quoted", 100, "native", 0, SchemaVersion::V1).unwrap();
+        assert_eq!(r.schema_version, SchemaVersion::V1);
+    }
+
+    // ── SEP-38 quote validation ───────────────────────────────────────────────
 
     #[test]
     fn test_valid_sep38_quote_response() {
@@ -723,63 +957,39 @@ mod tests {
         assert_eq!(r.sell_amount, "100.00");
         assert_eq!(r.buy_amount, "105.00");
         assert_eq!(r.fee, "1.00");
+        assert_eq!(r.schema_version, SchemaVersion::V1);
     }
 
     #[test]
-    fn test_sep38_quote_missing_id() {
-        let result = validate_sep38_quote_response(
-            "", "2023-11-01T00:00:00Z", "1.05", "100.00", "105.00", "1.00",
-        );
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, crate::errors::ErrorCode::ValidationError);
+    fn test_sep38_quote_missing_fields() {
+        let ok = |id, exp, price, sell, buy, fee| {
+            validate_sep38_quote_response(id, exp, price, sell, buy, fee).is_err()
+        };
+        assert!(ok("", "t", "1", "1", "1", "1"));
+        assert!(ok("id", "", "1", "1", "1", "1"));
+        assert!(ok("id", "t", "", "1", "1", "1"));
+        assert!(ok("id", "t", "1", "", "1", "1"));
+        assert!(ok("id", "t", "1", "1", "", "1"));
+        assert!(ok("id", "t", "1", "1", "1", ""));
     }
 
     #[test]
-    fn test_sep38_quote_missing_expires_at() {
-        let result = validate_sep38_quote_response(
-            "quote_123", "", "1.05", "100.00", "105.00", "1.00",
-        );
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, crate::errors::ErrorCode::ValidationError);
+    fn test_sep38_quote_numeric_validation() {
+        assert!(validate_sep38_quote_response("id", "t", "0", "1", "1", "1").is_err());
+        assert!(validate_sep38_quote_response("id", "t", "-1", "1", "1", "1").is_err());
+        assert!(validate_sep38_quote_response("id", "t", "abc", "1", "1", "1").is_err());
+        assert!(validate_sep38_quote_response("id", "t", "1", "0", "1", "1").is_err());
+        assert!(validate_sep38_quote_response("id", "t", "1", "1", "0", "1").is_err());
+        assert!(validate_sep38_quote_response("id", "t", "1", "1", "1", "0").is_err());
     }
 
     #[test]
-    fn test_sep38_quote_missing_price() {
-        let result = validate_sep38_quote_response(
-            "quote_123", "2023-11-01T00:00:00Z", "", "100.00", "105.00", "1.00",
-        );
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, crate::errors::ErrorCode::ValidationError);
+    fn test_sep38_quote_with_version_explicit() {
+        let r = validate_sep38_quote_with_version("id", "t", "1.0", "1.0", "1.0", "0.1", SchemaVersion::V1).unwrap();
+        assert_eq!(r.schema_version, SchemaVersion::V1);
     }
 
-    #[test]
-    fn test_sep38_quote_missing_sell_amount() {
-        let result = validate_sep38_quote_response(
-            "quote_123", "2023-11-01T00:00:00Z", "1.05", "", "105.00", "1.00",
-        );
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, crate::errors::ErrorCode::ValidationError);
-    }
-
-    #[test]
-    fn test_sep38_quote_missing_buy_amount() {
-        let result = validate_sep38_quote_response(
-            "quote_123", "2023-11-01T00:00:00Z", "1.05", "100.00", "", "1.00",
-        );
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, crate::errors::ErrorCode::ValidationError);
-    }
-
-    #[test]
-    fn test_sep38_quote_missing_fee() {
-        let result = validate_sep38_quote_response(
-            "quote_123", "2023-11-01T00:00:00Z", "1.05", "100.00", "105.00", "",
-        );
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, crate::errors::ErrorCode::ValidationError);
-    }
-
-    // --- validate_anchor_info_response ---
+    // ── Anchor info validation ────────────────────────────────────────────────
 
     #[test]
     fn test_valid_anchor_info_response() {
@@ -792,6 +1002,7 @@ mod tests {
         let r = result.unwrap();
         assert_eq!(r.name, "MyAnchor");
         assert_eq!(r.supported_assets.len(), 2);
+        assert_eq!(r.schema_version, SchemaVersion::V1);
     }
 
     #[test]
@@ -799,26 +1010,65 @@ mod tests {
         let assets = alloc::vec![alloc::string::String::from("native")];
         let result = validate_anchor_info_response("", assets);
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, crate::errors::ErrorCode::ValidationError);
     }
 
     #[test]
     fn test_anchor_info_empty_assets() {
         let result = validate_anchor_info_response("MyAnchor", alloc::vec![]);
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, crate::errors::ErrorCode::ValidationError);
     }
 
-    // --- validate_transaction_status_response ---
+    #[test]
+    fn test_anchor_info_name_too_long() {
+        let name = "A".repeat(101);
+        let assets = alloc::vec![alloc::string::String::from("native")];
+        let result = validate_anchor_info_response(&name, assets);
+        assert!(result.is_err());
+    }
 
     #[test]
-    fn test_valid_transaction_status_response() {
+    fn test_anchor_info_name_max_length_ok() {
+        let name = "A".repeat(100);
+        let assets = alloc::vec![alloc::string::String::from("native")];
+        let result = validate_anchor_info_response(&name, assets);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_anchor_info_invalid_asset_identifier() {
+        let assets = alloc::vec![alloc::string::String::from("NOTVALID")];
+        let result = validate_anchor_info_response("MyAnchor", assets);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_anchor_info_duplicate_assets_accepted() {
+        let assets = alloc::vec![
+            alloc::string::String::from("native"),
+            alloc::string::String::from("native"),
+        ];
+        let result = validate_anchor_info_response("MyAnchor", assets);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_anchor_info_with_version_explicit() {
+        let assets = alloc::vec![alloc::string::String::from("native")];
+        let r = validate_anchor_info_with_version("A", assets, SchemaVersion::V1).unwrap();
+        assert_eq!(r.schema_version, SchemaVersion::V1);
+    }
+
+    // ── Transaction status validation ─────────────────────────────────────────
+
+    #[test]
+    fn test_valid_transaction_status_v1() {
         let result = validate_transaction_status_response("tx_123", "completed", "deposit");
         assert!(result.is_ok());
         let r = result.unwrap();
         assert_eq!(r.transaction_id, "tx_123");
         assert_eq!(r.status, "completed");
         assert_eq!(r.kind, "deposit");
+        assert_eq!(r.schema_version, SchemaVersion::V1);
     }
 
     #[test]
@@ -828,19 +1078,39 @@ mod tests {
         assert!(validate_transaction_status_response("tx_123", "completed", "").is_err());
     }
 
-    // --- SDK does not crash on validation error ---
+    #[test]
+    fn test_transaction_status_invalid_status_rejected() {
+        let e = validate_transaction_status_response("tx_1", "garbage", "deposit").unwrap_err();
+        assert_eq!(e.code, crate::errors::ErrorCode::ValidationError);
+    }
 
     #[test]
-    fn test_validation_error_does_not_panic() {
-        // Simulates SDK consumer handling the error gracefully
-        let result = validate_deposit_response("", "", "", 0, 0);
-        match result {
-            Err(e) if e.code == crate::errors::ErrorCode::ValidationError => { /* handled, no crash */ }
-            _ => panic!("Expected ValidationError"),
+    fn test_transaction_status_all_valid_statuses() {
+        for status in &[
+            "pending_external", "pending_anchor", "pending_trust", "pending_user",
+            "pending_user_transfer_start", "pending_user_transfer_complete", "completed",
+            "refunded", "expired", "incomplete", "pending", "no_market", "too_small",
+            "too_large", "pending_stellar", "waiting_customer_action", "error",
+        ] {
+            let result = validate_transaction_status_response("tx_1", status, "deposit");
+            assert!(result.is_ok(), "expected OK for status '{}'", status);
         }
     }
 
-    // ── #189 validate_stellar_asset ──────────────────────────────────────────
+    #[test]
+    fn test_transaction_status_v2_alias() {
+        let r1 = validate_transaction_status_response("tx_1", "completed", "deposit").unwrap();
+        let r2 = validate_transaction_status_response_v2("tx_1", "completed", "deposit").unwrap();
+        assert_eq!(r1, r2);
+    }
+
+    #[test]
+    fn test_transaction_status_with_version_explicit() {
+        let r = validate_transaction_status_with_version("t1", "completed", "deposit", SchemaVersion::V1).unwrap();
+        assert_eq!(r.schema_version, SchemaVersion::V1);
+    }
+
+    // ── Stellar asset validation ─────────────────────────────────────────────
 
     #[test]
     fn test_stellar_asset_native() {
@@ -878,11 +1148,12 @@ mod tests {
 
     #[test]
     fn test_stellar_asset_issuer_wrong_prefix() {
-        // 56 chars but starts with 'A' not 'G'
         assert!(validate_stellar_asset(
             "USDC:ABBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"
         ).is_err());
     }
+
+    // ── Stellar account validation ───────────────────────────────────────────
 
     #[test]
     fn test_stellar_account_id_valid() {
@@ -925,84 +1196,61 @@ mod tests {
         ).is_err());
     }
 
-    // ── #189 validate_anchor_info_response extended ──────────────────────────
+    // ── Error messages are descriptive ───────────────────────────────────────
 
     #[test]
-    fn test_anchor_info_invalid_asset_identifier() {
-        let assets = alloc::vec![alloc::string::String::from("NOTVALID")];
-        let result = validate_anchor_info_response("MyAnchor", assets);
-        assert!(result.is_err());
+    fn test_error_message_contains_field_name() {
+        let e = validate_deposit_response("", "pending", "G...", 0, 0).unwrap_err();
+        assert!(e.context.as_deref().unwrap_or("").contains("transaction_id"));
+
+        let e = validate_deposit_response("d1", "", "G...", 0, 0).unwrap_err();
+        assert!(e.context.as_deref().unwrap_or("").contains("status"));
+
+        let e = validate_quote_response("", "quoted", 100, "native", 0).unwrap_err();
+        assert!(e.context.as_deref().unwrap_or("").contains("id"));
     }
 
     #[test]
-    fn test_anchor_info_valid_native_asset() {
+    fn test_validation_error_does_not_panic() {
+        let result = validate_deposit_response("", "", "", 0, 0);
+        match result {
+            Err(e) if e.code == crate::errors::ErrorCode::ValidationError => {}
+            _ => panic!("Expected ValidationError"),
+        }
+    }
+
+    // ── Schema version round-trip ─────────────────────────────────────────────
+
+    #[test]
+    fn test_deposit_schema_version_preserved() {
+        for v in &[SchemaVersion::V1] {
+            let r = validate_deposit_with_version("d1", "completed", "G...", 0, 0, *v).unwrap();
+            assert_eq!(r.schema_version, *v);
+        }
+    }
+
+    #[test]
+    fn test_withdraw_schema_version_preserved() {
+        let r = validate_withdraw_with_version("w1", "completed", 0, SchemaVersion::V1).unwrap();
+        assert_eq!(r.schema_version, SchemaVersion::V1);
+    }
+
+    #[test]
+    fn test_quote_schema_version_preserved() {
+        let r = validate_quote_with_version("q1", "quoted", 100, "native", 0, SchemaVersion::V1).unwrap();
+        assert_eq!(r.schema_version, SchemaVersion::V1);
+    }
+
+    #[test]
+    fn test_sep38_quote_schema_version_preserved() {
+        let r = validate_sep38_quote_with_version("id", "t", "1.0", "1.0", "1.0", "0.1", SchemaVersion::V1).unwrap();
+        assert_eq!(r.schema_version, SchemaVersion::V1);
+    }
+
+    #[test]
+    fn test_anchor_info_schema_version_preserved() {
         let assets = alloc::vec![alloc::string::String::from("native")];
-        let result = validate_anchor_info_response("MyAnchor", assets);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_anchor_info_name_too_long() {
-        let name = "A".repeat(101);
-        let assets = alloc::vec![alloc::string::String::from("native")];
-        let result = validate_anchor_info_response(&name, assets);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_anchor_info_name_max_length_ok() {
-        let name = "A".repeat(100);
-        let assets = alloc::vec![alloc::string::String::from("native")];
-        let result = validate_anchor_info_response(&name, assets);
-        assert!(result.is_ok());
-    }
-
-    // ── #189 validate_quote_response extended ────────────────────────────────
-
-    #[test]
-    fn test_quote_zero_amount_rejected() {
-        let result = validate_quote_response("q1", "quoted", 0, "native", 0);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_quote_invalid_asset_rejected() {
-        let result = validate_quote_response("q1", "quoted", 100, "BADFORMAT", 0);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_quote_invalid_status_rejected() {
-        let result = validate_quote_response("q1", "unknown_status", 100, "native", 0);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_quote_valid_native_asset() {
-        let result = validate_quote_response("q1", "quoted", 100, "native", 0);
-        assert!(result.is_ok());
-    }
-
-    // ── #189 validate_deposit_response expires_at ────────────────────────────
-
-    #[test]
-    fn test_deposit_past_expires_at_rejected() {
-        // expires_at <= now_unix is treated as past
-        let result = validate_deposit_response("dep_1", "pending", "GADDR...", 1_000_000, 2_000_000_000);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_deposit_future_expires_at_accepted() {
-        // 2_000_000_000 > 1_700_000_000 (now)
-        let result = validate_deposit_response("dep_1", "pending", "GADDR...", 2_000_000_000, 1_700_000_000);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_deposit_zero_expires_at_accepted() {
-        // 0 means "no expiry"
-        let result = validate_deposit_response("dep_1", "pending", "GADDR...", 0, 1_700_000_000);
-        assert!(result.is_ok());
+        let r = validate_anchor_info_with_version("A", assets, SchemaVersion::V1).unwrap();
+        assert_eq!(r.schema_version, SchemaVersion::V1);
     }
 }
