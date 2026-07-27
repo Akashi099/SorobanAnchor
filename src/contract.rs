@@ -20,6 +20,9 @@ use crate::sep38;
 use crate::session_state_machine::{self, SessionState, SessionTransitionError};
 use crate::migration;
 
+// Maximum number of health windows stored per anchor on-chain.
+const MAX_HEALTH_WINDOWS: u32 = 24;
+
 /// Score penalty (in [0,1] units) applied to anomalous anchors in `score_anchor_with_anomaly`.
 /// Default: 0.20 (equivalent to 20 out of 100 score points).
 const ANOMALY_SCORE_PENALTY: f32 = 0.20_f32;
@@ -1047,6 +1050,75 @@ pub struct AnchorHealthMetrics {
     pub uptime_bps: u32,
     /// Ledger timestamp of the most recent recorded event (0 if none).
     pub last_event_at: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Anchor health scoring types (#health-scoring)
+// ---------------------------------------------------------------------------
+
+/// Trend direction for an anchor's health score between the latest and
+/// previous observation window.
+#[contracttype]
+#[derive(Copy, Clone, Debug, PartialEq)]
+#[repr(u32)]
+pub enum HealthTrendDirection {
+    /// Score improved by more than the trend threshold.
+    Improving = 0,
+    /// Score changed by less than the trend threshold.
+    Stable = 1,
+    /// Score degraded by more than the trend threshold.
+    Degrading = 2,
+}
+
+/// A single windowed health counter bucket stored persistently on-chain.
+/// Off-chain monitors POST one of these per observation window so the
+/// contract can compute multi-signal scores and trend data.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnchorHealthWindow {
+    /// Ledger timestamp when the window started.
+    pub started_at: u64,
+    /// Ledger timestamp when the window ended.
+    pub ended_at: u64,
+    /// Successful endpoint calls in this window.
+    pub success_count: u64,
+    /// Failed endpoint calls in this window.
+    pub failure_count: u64,
+    /// p50 latency for successful calls in milliseconds (0 = no data).
+    /// Stored scaled ×10 to keep it as u64 (e.g. 1234 = 123.4 ms).
+    pub p50_latency_ms_x10: u64,
+    /// Routing attempts in this window.
+    pub routing_attempt_count: u64,
+    /// Routing failures in this window.
+    pub routing_failure_count: u64,
+    /// Seconds the anchor was down before recovery (0 = no outage this window).
+    pub recovery_time_seconds: u64,
+}
+
+/// Composite health score derived from one [`AnchorHealthWindow`].
+/// All sub-scores are in basis points (0–10 000) to avoid floats on-chain.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnchorHealthScore {
+    pub anchor: Address,
+    /// Composite weighted score in basis points (0–10 000).
+    pub composite_bps: u32,
+    /// Sub-score from success rate, in basis points.
+    pub success_rate_bps: u32,
+    /// Sub-score from latency, in basis points.
+    pub latency_bps: u32,
+    /// Sub-score from routing success rate, in basis points.
+    pub routing_bps: u32,
+    /// Sub-score from recovery behaviour, in basis points.
+    pub recovery_bps: u32,
+    /// Trend vs. the previous window.
+    pub trend: HealthTrendDirection,
+    /// Composite score from the previous window (0 when unavailable).
+    pub previous_composite_bps: u32,
+    /// Ledger timestamp when this score was computed.
+    pub scored_at: u64,
+    /// Number of windows that were used to compute the trend.
+    pub window_count: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -8748,6 +8820,221 @@ impl AnchorKitContract {
     }
 
     // -----------------------------------------------------------------------
+    // Anchor health windows (windowed multi-signal scoring)
+    // -----------------------------------------------------------------------
+
+    /// Storage key for the ordered list of health windows for an anchor.
+    fn health_windows_key(env: &Env, anchor: &Address) -> BytesN<32> {
+        let xdr = anchor.clone().to_xdr(env);
+        let raw = xdr_to_vec(&xdr);
+        make_storage_key(env, &[b"HLTHWIN", &raw])
+    }
+
+    /// Submit a windowed health observation for `anchor`.
+    ///
+    /// Stores the window in a rolling ring buffer of up to
+    /// [`MAX_HEALTH_WINDOWS`] entries (oldest dropped when full). Also updates
+    /// the flat [`AnchorHealthMetrics`] counters for backward compatibility.
+    ///
+    /// Admin-only. Off-chain monitors call this once per observation window.
+    pub fn record_health_window(env: Env, anchor: Address, window: AnchorHealthWindow) {
+        Self::require_admin(&env);
+
+        let wkey = Self::health_windows_key(&env, &anchor);
+        let mut windows: Vec<AnchorHealthWindow> = env
+            .storage()
+            .persistent()
+            .get(&wkey)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Drop oldest entry when at capacity
+        if windows.len() >= MAX_HEALTH_WINDOWS {
+            let mut shifted: Vec<AnchorHealthWindow> = Vec::new(&env);
+            for i in 1..windows.len() {
+                shifted.push_back(windows.get(i).unwrap());
+            }
+            windows = shifted;
+        }
+        windows.push_back(window.clone());
+        env.storage().persistent().set(&wkey, &windows);
+        env.storage()
+            .persistent()
+            .extend_ttl(&wkey, PERSISTENT_TTL, PERSISTENT_TTL);
+
+        // Keep the flat counters in sync for backward compat
+        let mkey = Self::health_metrics_key(&env, &anchor);
+        let now = env.ledger().timestamp();
+        let mut metrics: AnchorHealthMetrics = env
+            .storage()
+            .persistent()
+            .get(&mkey)
+            .unwrap_or(AnchorHealthMetrics {
+                anchor: anchor.clone(),
+                success_count: 0,
+                failure_count: 0,
+                total_calls: 0,
+                uptime_bps: 0,
+                last_event_at: 0,
+            });
+        metrics.success_count += window.success_count;
+        metrics.failure_count += window.failure_count;
+        metrics.total_calls = metrics.success_count + metrics.failure_count;
+        metrics.uptime_bps = if metrics.total_calls == 0 {
+            0
+        } else {
+            (metrics.success_count.saturating_mul(10_000) / metrics.total_calls) as u32
+        };
+        metrics.last_event_at = now;
+        env.storage().persistent().set(&mkey, &metrics);
+        env.storage()
+            .persistent()
+            .extend_ttl(&mkey, PERSISTENT_TTL, PERSISTENT_TTL);
+
+        env.events().publish(
+            (symbol_short!("health"), symbol_short!("window"), anchor),
+            (window.success_count, window.failure_count),
+        );
+    }
+
+    /// Compute and return the current composite [`AnchorHealthScore`] for
+    /// `anchor` using the stored observation windows.
+    ///
+    /// Scoring weights (matching off-chain model in `anchor_health.rs`):
+    ///   success-rate 40 %, latency 25 %, routing 20 %, recovery 15 %.
+    ///
+    /// All arithmetic is integer-based (basis points) to avoid floating-point
+    /// in the WASM environment. Scores are in range 0–10 000 bps.
+    pub fn get_anchor_health_score(env: Env, anchor: Address) -> AnchorHealthScore {
+        let wkey = Self::health_windows_key(&env, &anchor);
+        let windows: Vec<AnchorHealthWindow> = env
+            .storage()
+            .persistent()
+            .get(&wkey)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let window_count = windows.len();
+        let now = env.ledger().timestamp();
+
+        // Compute score for a single window, returning bps (0–10000) per signal
+        let score_one = |w: &AnchorHealthWindow| -> (u32, u32, u32, u32) {
+            let total = w.success_count + w.failure_count;
+            // success rate sub-score
+            let sr_bps: u32 = if total == 0 {
+                0
+            } else {
+                (w.success_count.saturating_mul(10_000) / total) as u32
+            };
+            // latency sub-score (target 500 ms × 10 = 5000, ceiling 10000 ms × 10 = 100000)
+            let lat_bps: u32 = if w.p50_latency_ms_x10 == 0 {
+                5_000 // no data → neutral
+            } else if w.p50_latency_ms_x10 <= 5_000 {
+                10_000 // at or below target
+            } else if w.p50_latency_ms_x10 >= 100_000 {
+                0 // at or above ceiling
+            } else {
+                let range = 100_000u64 - 5_000u64;
+                let above = w.p50_latency_ms_x10 - 5_000u64;
+                ((10_000u64.saturating_sub(above.saturating_mul(10_000) / range)) as u32)
+                    .min(10_000)
+            };
+            // routing sub-score
+            let rt_bps: u32 = if w.routing_attempt_count == 0 {
+                10_000
+            } else {
+                let failures = w.routing_failure_count.min(w.routing_attempt_count);
+                ((w.routing_attempt_count - failures)
+                    .saturating_mul(10_000)
+                    / w.routing_attempt_count) as u32
+            };
+            // recovery sub-score (fast ≤ 60 s = 10000, slow ≥ 3600 s = 0)
+            let rec_bps: u32 = if w.recovery_time_seconds == 0 {
+                10_000
+            } else if w.recovery_time_seconds <= 60 {
+                10_000
+            } else if w.recovery_time_seconds >= 3_600 {
+                0
+            } else {
+                let range = 3_600u64 - 60u64;
+                let above = w.recovery_time_seconds - 60u64;
+                ((10_000u64.saturating_sub(above.saturating_mul(10_000) / range)) as u32)
+                    .min(10_000)
+            };
+            (sr_bps, lat_bps, rt_bps, rec_bps)
+        };
+
+        let composite_from = |(sr, lat, rt, rec): (u32, u32, u32, u32)| -> u32 {
+            // weights: sr=40%, lat=25%, rt=20%, rec=15% (×10000 bps scale)
+            (sr as u64 * 40
+                + lat as u64 * 25
+                + rt as u64 * 20
+                + rec as u64 * 15) as u32 / 100
+        };
+
+        if window_count == 0 {
+            return AnchorHealthScore {
+                anchor,
+                composite_bps: 0,
+                success_rate_bps: 0,
+                latency_bps: 0,
+                routing_bps: 0,
+                recovery_bps: 0,
+                trend: HealthTrendDirection::Stable,
+                previous_composite_bps: 0,
+                scored_at: now,
+                window_count: 0,
+            };
+        }
+
+        let latest = windows.get(window_count - 1).unwrap();
+        let (sr, lat, rt, rec) = score_one(&latest);
+        let composite_bps = composite_from((sr, lat, rt, rec));
+
+        let (trend, prev_bps) = if window_count >= 2 {
+            let prev = windows.get(window_count - 2).unwrap();
+            let prev_composite = composite_from(score_one(&prev));
+            // trend threshold = 150 bps (≈ 1.5 score points on 0-100 scale)
+            const TREND_THRESH: u32 = 150;
+            let direction = if composite_bps > prev_composite
+                && composite_bps - prev_composite > TREND_THRESH
+            {
+                HealthTrendDirection::Improving
+            } else if prev_composite > composite_bps
+                && prev_composite - composite_bps > TREND_THRESH
+            {
+                HealthTrendDirection::Degrading
+            } else {
+                HealthTrendDirection::Stable
+            };
+            (direction, prev_composite)
+        } else {
+            (HealthTrendDirection::Stable, 0u32)
+        };
+
+        AnchorHealthScore {
+            anchor,
+            composite_bps,
+            success_rate_bps: sr,
+            latency_bps: lat,
+            routing_bps: rt,
+            recovery_bps: rec,
+            trend,
+            previous_composite_bps: prev_bps,
+            scored_at: now,
+            window_count,
+        }
+    }
+
+    /// Return the raw stored health windows for `anchor`, oldest first.
+    /// Returns an empty vec when no windows have been recorded.
+    pub fn get_anchor_health_windows(env: Env, anchor: Address) -> Vec<AnchorHealthWindow> {
+        let wkey = Self::health_windows_key(&env, &anchor);
+        env.storage()
+            .persistent()
+            .get(&wkey)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    // -----------------------------------------------------------------------
     // Proof-of-possession for anchor endpoints
     // -----------------------------------------------------------------------
 
@@ -8972,6 +9259,82 @@ impl AnchorKitContract {
             sep24: true,
             sep31: true,
             sep38: true,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Compliance policy engine integration
+    // -----------------------------------------------------------------------
+
+    /// Build a [`crate::compliance_policy::PolicyContext`] for `subject` by
+    /// reading on-chain KYC and compliance check state, then evaluate it
+    /// against the standard [`crate::compliance_policy::PolicyEngine`].
+    ///
+    /// Panics with the appropriate [`ErrorCode`] if the engine denies the
+    /// request, so callers can use this as a single-line gate:
+    ///
+    /// ```ignore
+    /// Self::enforce_policy(&env, &subject, require_kyc, require_compliance);
+    /// ```
+    fn enforce_policy(
+        env: &Env,
+        subject: &Address,
+        require_kyc: bool,
+        require_compliance: bool,
+    ) {
+        use crate::compliance_policy::{
+            KycState as PolicyKycState, PolicyContext, PolicyDecision, DenialReason,
+            PolicyEngine,
+        };
+
+        if !require_kyc && !require_compliance {
+            return;
+        }
+
+        // Map on-chain KycStatus → PolicyKycState
+        let kyc_state = match Self::get_kyc_status_internal(env, subject) {
+            KycStatus::Approved      => PolicyKycState::Approved,
+            KycStatus::Pending       => PolicyKycState::Pending,
+            KycStatus::Rejected      => PolicyKycState::Rejected,
+            KycStatus::Expired       => PolicyKycState::Expired,
+            KycStatus::Reopened      => PolicyKycState::Reopened,
+            KycStatus::NotSubmitted  => PolicyKycState::NotSubmitted,
+        };
+
+        // Read compliance check record for this subject
+        let comp_key = compliance_check_key(env, subject, &String::from_str(env, "kyc"));
+        let check: Option<ComplianceCheck> = env.storage().persistent().get(&comp_key);
+        let compliance_check_passed = check.as_ref().map(|r| r.result == 1u32).unwrap_or(false);
+        let subject_score = check.as_ref().and_then(|r| r.score);
+
+        // Read configured global minimum score
+        let global_policy: CompliancePolicy = env
+            .storage()
+            .instance()
+            .get::<_, CompliancePolicy>(&Self::compliance_policy_key(env))
+            .unwrap_or_else(CompliancePolicy::default_policy);
+        let minimum_score = global_policy.minimum_score;
+
+        let ctx = PolicyContext {
+            kyc_state,
+            compliance_check_passed,
+            minimum_score,
+            subject_score,
+            require_kyc,
+            require_compliance,
+        };
+
+        let engine = PolicyEngine::standard();
+        match engine.evaluate(&ctx) {
+            PolicyDecision::Allow => {}
+            PolicyDecision::Deny(reason) => match reason {
+                DenialReason::KycPending         => panic_with_error!(env, ErrorCode::KycPending),
+                DenialReason::KycRejected        => panic_with_error!(env, ErrorCode::KycRejected),
+                DenialReason::KycExpired         => panic_with_error!(env, ErrorCode::ComplianceNotMet),
+                DenialReason::KycNotSubmitted    => panic_with_error!(env, ErrorCode::KycNotFound),
+                DenialReason::ComplianceCheckFailed => panic_with_error!(env, ErrorCode::ComplianceNotMet),
+                DenialReason::ScoreBelowMinimum { .. } => panic_with_error!(env, ErrorCode::ComplianceNotMet),
+            },
         }
     }
 }
