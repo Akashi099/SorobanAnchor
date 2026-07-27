@@ -136,6 +136,8 @@ pub mod anchor_health;
 pub mod service_management;
 pub mod admin_audit_log;
 pub mod cache_governance;
+// compliance_policy is pure no_std logic, available in all build variants.
+pub mod compliance_policy;
 
 // ── std-only modules (filesystem, runtime config) ─────────────────────────────
 #[cfg(feature = "std")]
