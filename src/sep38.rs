@@ -131,18 +131,79 @@ fn is_valid_positive_decimal(s: &str) -> bool {
     v > 0.0
 }
 
-/// Validates all fields of a raw firm quote.
+/// Validates a timestamp string and returns the parsed value.
+/// Returns `Err(Error::invalid_quote())` if the timestamp is malformed,
+/// zero, or unreasonably far in the future (more than 10 years).
+fn parse_and_validate_timestamp(timestamp_str: &str) -> Result<u64, Error> {
+    if timestamp_str.is_empty() {
+        return Err(Error::invalid_quote());
+    }
+    
+    let timestamp: u64 = timestamp_str.parse().map_err(|_| Error::invalid_quote())?;
+    
+    // Reject zero timestamps
+    if timestamp == 0 {
+        return Err(Error::invalid_quote());
+    }
+    
+    // Reject timestamps that are unreasonably far in the future
+    // (more than 10 years from now in seconds: 10 * 365 * 24 * 60 * 60 = 315,360,000)
+    const MAX_REASONABLE_FUTURE: u64 = 315_360_000;
+    // We'll check this later against current timestamp in validate_quote_fields
+    
+    Ok(timestamp)
+}
+
+/// Classification of quote freshness based on expiry time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QuoteFreshness {
+    /// Quote is valid with sufficient remaining time (>= threshold)
+    Fresh,
+    /// Quote is still valid but close to expiry (< threshold)
+    NearStale,
+    /// Quote has expired
+    Stale,
+    /// Quote has invalid expiry timestamp
+    Invalid,
+}
+
+/// Validates all fields of a raw firm quote with configurable near-stale threshold.
 ///
 /// Returns `Err(Error::invalid_quote())` if any field is invalid.
 /// Returns `Err(Error::stale_quote())` if `expires_at` is not in the future.
-fn validate_quote_fields(raw: &RawFirmQuote, current_timestamp: u64) -> Result<u64, Error> {
+/// Returns `Ok((expires_at, freshness))` where freshness indicates if quote is fresh, near-stale, or stale.
+fn validate_quote_fields_with_threshold(
+    raw: &RawFirmQuote, 
+    current_timestamp: u64,
+    near_stale_threshold_seconds: u64,
+) -> Result<(u64, QuoteFreshness), Error> {
+    // Validate ID
     if raw.id.is_empty() {
         return Err(Error::invalid_quote());
     }
-    let expires_at: u64 = raw.expires_at.parse().map_err(|_| Error::invalid_quote())?;
-    if expires_at <= current_timestamp {
-        return Err(Error::stale_quote());
+    
+    // Validate and parse timestamp
+    let expires_at = parse_and_validate_timestamp(&raw.expires_at)?;
+    
+    // Check for unreasonably far future timestamps (more than 10 years)
+    const MAX_REASONABLE_FUTURE: u64 = 315_360_000; // 10 years in seconds
+    if expires_at > current_timestamp.saturating_add(MAX_REASONABLE_FUTURE) {
+        return Err(Error::invalid_quote());
     }
+    
+    // Determine freshness
+    let freshness = if expires_at <= current_timestamp {
+        QuoteFreshness::Stale
+    } else {
+        let time_remaining = expires_at - current_timestamp;
+        if time_remaining < near_stale_threshold_seconds {
+            QuoteFreshness::NearStale
+        } else {
+            QuoteFreshness::Fresh
+        }
+    };
+    
+    // Validate numeric fields
     if !is_valid_positive_decimal(&raw.price) {
         return Err(Error::invalid_quote());
     }
@@ -152,7 +213,32 @@ fn validate_quote_fields(raw: &RawFirmQuote, current_timestamp: u64) -> Result<u
     if !is_valid_positive_decimal(&raw.buy_amount) {
         return Err(Error::invalid_quote());
     }
-    Ok(expires_at)
+    
+    // Validate asset codes are not empty
+    if raw.sell_asset.is_empty() || raw.buy_asset.is_empty() {
+        return Err(Error::invalid_quote());
+    }
+    
+    Ok((expires_at, freshness))
+}
+
+/// Validates all fields of a raw firm quote using default near-stale threshold (60 seconds).
+///
+/// Returns `Err(Error::invalid_quote())` if any field is invalid.
+/// Returns `Err(Error::stale_quote())` if `expires_at` is not in the future.
+fn validate_quote_fields(raw: &RawFirmQuote, current_timestamp: u64) -> Result<u64, Error> {
+    const DEFAULT_NEAR_STALE_THRESHOLD: u64 = 60; // 60 seconds
+    let (expires_at, freshness) = validate_quote_fields_with_threshold(
+        raw, 
+        current_timestamp, 
+        DEFAULT_NEAR_STALE_THRESHOLD,
+    )?;
+    
+    match freshness {
+        QuoteFreshness::Stale => Err(Error::stale_quote()),
+        QuoteFreshness::NearStale | QuoteFreshness::Fresh => Ok(expires_at),
+        QuoteFreshness::Invalid => Err(Error::invalid_quote()),
+    }
 }
 
 // ── Service functions ────────────────────────────────────────────────────────
@@ -194,11 +280,77 @@ pub fn request_firm_quote(raw: RawFirmQuote, current_timestamp: u64) -> Result<F
     })
 }
 
+/// Normalizes a raw `/quote` response with freshness classification.
+///
+/// Similar to `request_firm_quote` but returns the quote's freshness classification
+/// along with the normalized quote. Allows configurable near-stale threshold.
+pub fn request_firm_quote_with_freshness(
+    raw: RawFirmQuote, 
+    current_timestamp: u64,
+    near_stale_threshold_seconds: u64,
+) -> Result<(FirmQuote, QuoteFreshness), Error> {
+    let (expires_at, freshness) = validate_quote_fields_with_threshold(
+        &raw, 
+        current_timestamp, 
+        near_stale_threshold_seconds,
+    )?;
+    
+    // Reject stale quotes
+    if freshness == QuoteFreshness::Stale {
+        return Err(Error::stale_quote());
+    }
+    
+    let quote = FirmQuote {
+        id: raw.id,
+        expires_at,
+        price: raw.price,
+        sell_amount: raw.sell_amount,
+        buy_amount: raw.buy_amount,
+        sell_asset: normalize_asset_code(&raw.sell_asset)?,
+        buy_asset: normalize_asset_code(&raw.buy_asset)?,
+        routing_reason: None,
+    };
+    
+    Ok((quote, freshness))
+}
+
 /// Checks if a quote has expired based on the provided timestamp.
 ///
 /// Returns `true` if `expires_at <= current_timestamp`.
 pub fn is_quote_expired(quote: &FirmQuote, current_timestamp: u64) -> bool {
     quote.expires_at <= current_timestamp
+}
+
+/// Checks if a quote is near-stale based on the provided timestamp and threshold.
+///
+/// Returns `true` if the quote is still valid but will expire within `threshold_seconds`.
+pub fn is_quote_near_stale(quote: &FirmQuote, current_timestamp: u64, threshold_seconds: u64) -> bool {
+    if is_quote_expired(quote, current_timestamp) {
+        return false; // Already stale, not near-stale
+    }
+    let time_remaining = quote.expires_at - current_timestamp;
+    time_remaining < threshold_seconds
+}
+
+/// Gets the freshness classification of a quote.
+///
+/// Returns `QuoteFreshness` based on the current timestamp and optional threshold.
+/// If `near_stale_threshold_seconds` is `None`, uses default threshold of 60 seconds.
+pub fn get_quote_freshness(
+    quote: &FirmQuote, 
+    current_timestamp: u64,
+    near_stale_threshold_seconds: Option<u64>,
+) -> QuoteFreshness {
+    if is_quote_expired(quote, current_timestamp) {
+        return QuoteFreshness::Stale;
+    }
+    
+    let threshold = near_stale_threshold_seconds.unwrap_or(60);
+    if is_quote_near_stale(quote, current_timestamp, threshold) {
+        QuoteFreshness::NearStale
+    } else {
+        QuoteFreshness::Fresh
+    }
 }
 
 // ── Issue #292: QuoteConstraints — firm quote price and volume validation ─────
@@ -451,6 +603,206 @@ pub fn select_best_quote<'a>(
     }
 
     best.map(|(_, q)| q)
+}
+
+/// Select the best quote with freshness consideration.
+///
+/// Similar to `select_best_quote` but applies a penalty to near-stale quotes.
+/// The penalty reduces the score of near-stale quotes by `near_stale_penalty_factor`
+/// (between 0.0 and 1.0, where 0.5 means 50% penalty).
+pub fn select_best_quote_with_freshness<'a>(
+    quotes: &'a [FirmQuote],
+    comparator: &QuoteComparator,
+    now: u64,
+    near_stale_threshold_seconds: u64,
+    near_stale_penalty_factor: f64,
+) -> Option<&'a FirmQuote> {
+    let active: AllocVec<&FirmQuote> = quotes
+        .iter()
+        .filter(|q| !is_quote_expired(q, now))
+        .collect();
+
+    if active.is_empty() {
+        return None;
+    }
+
+    let max_price = active
+        .iter()
+        .filter_map(|q| q.price.parse::<f64>().ok())
+        .fold(0.0_f64, f64::max);
+
+    let max_expiry = active
+        .iter()
+        .map(|q| q.expires_at.saturating_sub(now))
+        .max()
+        .unwrap_or(0);
+
+    let mut best: Option<(f64, &FirmQuote)> = None;
+    for q in active.iter() {
+        let mut score = comparator.score(q, now, max_price, max_expiry);
+        
+        // Apply penalty for near-stale quotes
+        if is_quote_near_stale(q, now, near_stale_threshold_seconds) {
+            score *= 1.0 - near_stale_penalty_factor;
+        }
+        
+        match best {
+            None => {
+                best = Some((score, q));
+            }
+            Some((best_score, _)) if score > best_score => {
+                best = Some((score, q));
+            }
+            _ => {}
+        }
+    }
+
+    best.map(|(_, q)| q)
+}
+
+// ── Issue #620: Quote Reconciliation and Refresh Support ───────────────────
+
+/// Result of quote reconciliation analysis.
+#[derive(Clone, Debug)]
+pub enum ReconciliationResult {
+    /// Quote is still suitable for use
+    Suitable,
+    /// Quote should be refreshed (near-stale or price drift detected)
+    ShouldRefresh,
+    /// Quote is no longer suitable (expired or significant drift)
+    NotSuitable,
+}
+
+/// Configuration for quote reconciliation.
+pub struct ReconciliationConfig {
+    /// Threshold in seconds for considering a quote near-stale
+    pub near_stale_threshold_seconds: u64,
+    /// Maximum allowed price drift percentage (0.01 = 1%)
+    pub max_price_drift_percent: f64,
+    /// Minimum time between refresh attempts in seconds
+    pub min_refresh_interval_seconds: u64,
+}
+
+impl Default for ReconciliationConfig {
+    fn default() -> Self {
+        ReconciliationConfig {
+            near_stale_threshold_seconds: 60,
+            max_price_drift_percent: 0.01, // 1%
+            min_refresh_interval_seconds: 30,
+        }
+    }
+}
+
+/// Analyzes whether a cached quote should be refreshed based on current context.
+///
+/// Compares the cached quote against current market conditions and timing
+/// to determine if it's still suitable or needs refresh.
+pub fn reconcile_quote(
+    cached_quote: &FirmQuote,
+    current_timestamp: u64,
+    current_market_price: Option<f64>,
+    last_refresh_timestamp: Option<u64>,
+    config: &ReconciliationConfig,
+) -> ReconciliationResult {
+    // Check if quote has expired
+    if is_quote_expired(cached_quote, current_timestamp) {
+        return ReconciliationResult::NotSuitable;
+    }
+    
+    // Check if quote is near-stale
+    if is_quote_near_stale(cached_quote, current_timestamp, config.near_stale_threshold_seconds) {
+        return ReconciliationResult::ShouldRefresh;
+    }
+    
+    // Check price drift if current market price is available
+    if let Some(current_price) = current_market_price {
+        if let Ok(cached_price) = cached_quote.price.parse::<f64>() {
+            if cached_price > 0.0 {
+                let price_drift = ((current_price - cached_price).abs() / cached_price).abs();
+                if price_drift > config.max_price_drift_percent {
+                    return ReconciliationResult::ShouldRefresh;
+                }
+            }
+        }
+    }
+    
+    // Check refresh interval
+    if let Some(last_refresh) = last_refresh_timestamp {
+        let time_since_refresh = current_timestamp.saturating_sub(last_refresh);
+        if time_since_refresh < config.min_refresh_interval_seconds {
+            // Too soon to refresh again
+            return ReconciliationResult::Suitable;
+        }
+    }
+    
+    ReconciliationResult::Suitable
+}
+
+/// Enhanced cache with reconciliation support.
+pub struct ReconcilingQuoteCache {
+    inner: QuoteCache,
+    last_refresh_timestamps: alloc::collections::BTreeMap<String, u64>,
+}
+
+impl ReconcilingQuoteCache {
+    pub fn new() -> Self {
+        ReconcilingQuoteCache {
+            inner: QuoteCache::new(),
+            last_refresh_timestamps: alloc::collections::BTreeMap::new(),
+        }
+    }
+    
+    /// Get a quote with reconciliation check.
+    ///
+    /// Returns `Some(quote)` if the quote exists, is not expired, and passes
+    /// reconciliation checks. Returns `None` otherwise.
+    pub fn get_with_reconciliation(
+        &self,
+        key: &str,
+        now: u64,
+        current_market_price: Option<f64>,
+        config: &ReconciliationConfig,
+    ) -> Option<&FirmQuote> {
+        let quote = self.inner.get(key, now)?;
+        let last_refresh = self.last_refresh_timestamps.get(key).copied();
+        
+        match reconcile_quote(quote, now, current_market_price, last_refresh, config) {
+            ReconciliationResult::Suitable => Some(quote),
+            ReconciliationResult::ShouldRefresh | ReconciliationResult::NotSuitable => None,
+        }
+    }
+    
+    /// Insert or replace a quote, recording the refresh timestamp.
+    pub fn insert_with_refresh(
+        &mut self,
+        key: String,
+        quote: FirmQuote,
+        now: u64,
+        ttl_seconds: u64,
+    ) {
+        self.inner.insert(key.clone(), quote, now, ttl_seconds);
+        self.last_refresh_timestamps.insert(key, now);
+    }
+    
+    /// Mark a quote as refreshed without replacing it.
+    pub fn mark_refreshed(&mut self, key: &str, now: u64) -> bool {
+        if self.inner.get(key, now).is_some() {
+            self.last_refresh_timestamps.insert(key.to_string(), now);
+            true
+        } else {
+            false
+        }
+    }
+    
+    /// Get the underlying cache for direct operations.
+    pub fn inner(&self) -> &QuoteCache {
+        &self.inner
+    }
+    
+    /// Get mutable access to the underlying cache.
+    pub fn inner_mut(&mut self) -> &mut QuoteCache {
+        &mut self.inner
+    }
 }
 
 // ── Issue #295: AnchorFeeHistory — historical fee and spread estimation ───────
@@ -1219,5 +1571,218 @@ mod tests {
         // now=2000, cutoff=1900; observation at 500 is stale, 1950 is active
         let avg = h.average_fee_bps(2000).unwrap();
         assert!((avg - 50.0).abs() < 1e-6, "expected 50.0, got {}", avg);
+    }
+
+    // ── New tests for improved quote handling (#619) ─────────────────────────
+
+    #[test]
+    fn test_parse_and_validate_timestamp_valid() {
+        assert_eq!(parse_and_validate_timestamp("1000").unwrap(), 1000);
+        assert_eq!(parse_and_validate_timestamp("1").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_parse_and_validate_timestamp_empty() {
+        assert!(parse_and_validate_timestamp("").is_err());
+    }
+
+    #[test]
+    fn test_parse_and_validate_timestamp_zero() {
+        assert!(parse_and_validate_timestamp("0").is_err());
+    }
+
+    #[test]
+    fn test_parse_and_validate_timestamp_invalid() {
+        assert!(parse_and_validate_timestamp("not-a-number").is_err());
+        assert!(parse_and_validate_timestamp("-100").is_err());
+    }
+
+    #[test]
+    fn test_validate_quote_fields_with_threshold_fresh() {
+        let raw = valid_raw("2000"); // expires at 2000
+        let now = 1000;
+        let (expires_at, freshness) = validate_quote_fields_with_threshold(&raw, now, 60).unwrap();
+        assert_eq!(expires_at, 2000);
+        assert_eq!(freshness, QuoteFreshness::Fresh);
+    }
+
+    #[test]
+    fn test_validate_quote_fields_with_threshold_near_stale() {
+        let raw = valid_raw("1060"); // expires in 60 seconds
+        let now = 1000;
+        let (expires_at, freshness) = validate_quote_fields_with_threshold(&raw, now, 60).unwrap();
+        assert_eq!(expires_at, 1060);
+        assert_eq!(freshness, QuoteFreshness::NearStale);
+    }
+
+    #[test]
+    fn test_validate_quote_fields_with_threshold_stale() {
+        let raw = valid_raw("900"); // already expired
+        let now = 1000;
+        let (expires_at, freshness) = validate_quote_fields_with_threshold(&raw, now, 60).unwrap();
+        assert_eq!(expires_at, 900);
+        assert_eq!(freshness, QuoteFreshness::Stale);
+    }
+
+    #[test]
+    fn test_validate_quote_fields_with_threshold_empty_fields() {
+        let mut raw = valid_raw("2000");
+        raw.id = "".to_string();
+        let now = 1000;
+        assert!(validate_quote_fields_with_threshold(&raw, now, 60).is_err());
+        
+        let mut raw = valid_raw("2000");
+        raw.sell_asset = "".to_string();
+        assert!(validate_quote_fields_with_threshold(&raw, now, 60).is_err());
+        
+        let mut raw = valid_raw("2000");
+        raw.buy_asset = "".to_string();
+        assert!(validate_quote_fields_with_threshold(&raw, now, 60).is_err());
+    }
+
+    #[test]
+    fn test_request_firm_quote_with_freshness() {
+        let raw = valid_raw("2000");
+        let now = 1000;
+        let (quote, freshness) = request_firm_quote_with_freshness(raw, now, 60).unwrap();
+        assert_eq!(quote.expires_at, 2000);
+        assert_eq!(freshness, QuoteFreshness::Fresh);
+    }
+
+    #[test]
+    fn test_is_quote_near_stale() {
+        let quote = make_quote("test", 1060); // expires in 60 seconds from now=1000
+        assert!(is_quote_near_stale(&quote, 1000, 60));
+        assert!(!is_quote_near_stale(&quote, 1000, 59)); // 61 seconds remaining
+        assert!(!is_quote_near_stale(&quote, 1060, 60)); // already expired
+    }
+
+    #[test]
+    fn test_get_quote_freshness() {
+        let quote = make_quote("test", 1060);
+        
+        assert_eq!(
+            get_quote_freshness(&quote, 1000, Some(60)),
+            QuoteFreshness::NearStale
+        );
+        
+        assert_eq!(
+            get_quote_freshness(&quote, 1000, Some(59)),
+            QuoteFreshness::Fresh
+        );
+        
+        assert_eq!(
+            get_quote_freshness(&quote, 1060, Some(60)),
+            QuoteFreshness::Stale
+        );
+    }
+
+    #[test]
+    fn test_select_best_quote_with_freshness() {
+        let fresh = make_quote_with_price("fresh", 5000, "0.10"); // expires far in future
+        let near_stale = make_quote_with_price("near_stale", 1060, "0.05"); // expires in 60 seconds, cheaper
+        let now = 1000;
+        let cmp = QuoteComparator::new(1.0, 0.0); // Only care about price
+        
+        // Without penalty, near-stale should win (cheaper)
+        let best = select_best_quote(&[fresh.clone(), near_stale.clone()], &cmp, now).unwrap();
+        assert_eq!(best.id, "near_stale");
+        
+        // With 50% penalty, fresh should win despite being more expensive
+        let best = select_best_quote_with_freshness(
+            &[fresh, near_stale], 
+            &cmp, 
+            now, 
+            60, // near-stale threshold
+            0.5, // 50% penalty
+        ).unwrap();
+        assert_eq!(best.id, "fresh");
+    }
+
+    // ── New tests for quote reconciliation (#620) ───────────────────────────
+
+    #[test]
+    fn test_reconcile_quote_suitable() {
+        let quote = make_quote_with_price("test", 5000, "1.0");
+        let config = ReconciliationConfig::default();
+        let result = reconcile_quote(&quote, 1000, Some(1.01), Some(900), &config);
+        assert!(matches!(result, ReconciliationResult::Suitable));
+    }
+
+    #[test]
+    fn test_reconcile_quote_expired() {
+        let quote = make_quote_with_price("test", 500, "1.0");
+        let config = ReconciliationConfig::default();
+        let result = reconcile_quote(&quote, 1000, Some(1.01), Some(900), &config);
+        assert!(matches!(result, ReconciliationResult::NotSuitable));
+    }
+
+    #[test]
+    fn test_reconcile_quote_near_stale() {
+        let quote = make_quote_with_price("test", 1060, "1.0"); // expires in 60 seconds
+        let config = ReconciliationConfig {
+            near_stale_threshold_seconds: 60,
+            ..ReconciliationConfig::default()
+        };
+        let result = reconcile_quote(&quote, 1000, Some(1.01), Some(900), &config);
+        assert!(matches!(result, ReconciliationResult::ShouldRefresh));
+    }
+
+    #[test]
+    fn test_reconcile_quote_price_drift() {
+        let quote = make_quote_with_price("test", 5000, "1.0");
+        let config = ReconciliationConfig {
+            max_price_drift_percent: 0.01, // 1%
+            ..ReconciliationConfig::default()
+        };
+        // Current price is 1.03, drift is 3% > 1%
+        let result = reconcile_quote(&quote, 1000, Some(1.03), Some(900), &config);
+        assert!(matches!(result, ReconciliationResult::ShouldRefresh));
+    }
+
+    #[test]
+    fn test_reconcile_quote_min_refresh_interval() {
+        let quote = make_quote_with_price("test", 5000, "1.0");
+        let config = ReconciliationConfig {
+            min_refresh_interval_seconds: 300, // 5 minutes
+            ..ReconciliationConfig::default()
+        };
+        // Last refresh was 30 seconds ago, too soon to refresh again
+        let result = reconcile_quote(&quote, 1030, Some(1.03), Some(1000), &config);
+        assert!(matches!(result, ReconciliationResult::Suitable));
+    }
+
+    #[test]
+    fn test_reconciling_quote_cache() {
+        let mut cache = ReconcilingQuoteCache::new();
+        let quote = make_quote_with_price("test", 5000, "1.0");
+        let config = ReconciliationConfig::default();
+        
+        // Insert quote
+        cache.insert_with_refresh("key1".to_string(), quote, 1000, 600);
+        
+        // Should get quote when conditions are suitable
+        assert!(cache.get_with_reconciliation("key1", 1500, Some(1.01), &config).is_some());
+        
+        // Mark as refreshed
+        cache.mark_refreshed("key1", 1500);
+        
+        // Should still get quote (not near-stale, no significant drift)
+        assert!(cache.get_with_reconciliation("key1", 2000, Some(1.01), &config).is_some());
+    }
+
+    #[test]
+    fn test_reconciling_quote_cache_near_stale_excluded() {
+        let mut cache = ReconcilingQuoteCache::new();
+        let quote = make_quote_with_price("test", 2060, "1.0"); // expires in 60 seconds from now=2000
+        let config = ReconciliationConfig {
+            near_stale_threshold_seconds: 60,
+            ..ReconciliationConfig::default()
+        };
+        
+        cache.insert_with_refresh("key1".to_string(), quote, 1000, 600);
+        
+        // At time 2000, quote expires at 2060 (60 seconds remaining) - should be excluded as near-stale
+        assert!(cache.get_with_reconciliation("key1", 2000, Some(1.01), &config).is_none());
     }
 }
