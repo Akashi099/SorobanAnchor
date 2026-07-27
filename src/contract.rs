@@ -4036,6 +4036,10 @@ impl AnchorKitContract {
             "disabled",
             "enabled",
         );
+        // Invalidation hook: service-state change may make cached capabilities stale.
+        if changed {
+            Self::invalidate_cache_internal(&env, &anchor);
+        }
         changed
     }
 
@@ -4053,6 +4057,10 @@ impl AnchorKitContract {
             "enabled",
             "disabled",
         );
+        // Invalidation hook: service-state change may make cached capabilities stale.
+        if changed {
+            Self::invalidate_cache_internal(&env, &anchor);
+        }
         changed
     }
 
@@ -4100,15 +4108,27 @@ impl AnchorKitContract {
     pub fn rollback_services(env: Env, caller: Address, snapshot_id: u64) -> bool {
         Self::require_admin_or_capability(&env, &caller, AdminCapability::ToggleServices);
         let restored = ServiceManager::rollback_to_snapshot(&env, snapshot_id);
+        if restored {
+            // Fire the cache-invalidation hook for the anchor whose state
+            // was just restored, so cached capabilities reflect the rolled-back set.
+            if let Some(snapshot) = ServiceManager::get_snapshot(&env, snapshot_id) {
+                Self::invalidate_cache_internal(&env, &snapshot.anchor);
+            }
+        }
         AdminAuditLog::log_action(
             &env,
             &caller,
             "rollback_services",
             String::from_str(&env, "service_snapshot"),
             "",
-            "rolled_back",
+            if restored { "rolled_back" } else { "rollback_failed" },
         );
         restored
+    }
+
+    /// Return the total number of service configuration snapshots ever created.
+    pub fn get_service_snapshot_count(env: Env) -> u64 {
+        ServiceManager::get_snapshot_count(&env)
     }
 
     /// Fetch a previously taken service snapshot by id, if it exists.
@@ -6458,6 +6478,165 @@ impl AnchorKitContract {
     }
 
     // -----------------------------------------------------------------------
+    // Cache compaction (#a)
+    //
+    // Scans the provided anchor list and removes any metadata or capabilities
+    // cache entries whose TTL has elapsed. The instance-level count is adjusted
+    // so capacity checks remain accurate after stale entries are purged.
+    // The routine is safe to call at any time — it never removes a fresh entry.
+    // -----------------------------------------------------------------------
+
+    /// Remove expired metadata and capabilities cache entries for the given
+    /// anchors, updating the cache count accordingly.
+    ///
+    /// Only entries whose `cached_at + ttl_seconds <= now` (metadata) or
+    /// `cached_at + ttl_seconds <= now` (capabilities) are removed. Fresh
+    /// entries are left untouched. Because Soroban temporary storage entries
+    /// are automatically evicted by the ledger once their TTL expires, this
+    /// routine provides an explicit, auditable sweep that also corrects the
+    /// instance-level count which does not decrement automatically.
+    ///
+    /// Returns the number of cache slots freed (each expired metadata entry and
+    /// each expired capabilities entry counts as one freed slot).
+    ///
+    /// Requires the primary admin or a [`AdminRole::CacheAdmin`] role holder.
+    pub fn compact_cache(env: Env, anchors: Vec<Address>) -> u64 {
+        Self::require_admin(&env);
+        let now = env.ledger().timestamp();
+        let mut freed: u64 = 0;
+
+        for i in 0..anchors.len() {
+            let anchor = anchors.get(i).unwrap();
+
+            // --- Metadata cache ---
+            let meta_key = (symbol_short!("METACACHE"), anchor.clone());
+            if let Some(entry) = env
+                .storage()
+                .temporary()
+                .get::<_, MetadataCache>(&meta_key)
+            {
+                let total_ttl = entry.ttl_seconds.saturating_add(entry.stale_ttl_seconds);
+                if entry.cached_at.saturating_add(total_ttl) <= now {
+                    env.storage().temporary().remove(&meta_key);
+                    freed += 1;
+                }
+            }
+
+            // --- Capabilities cache ---
+            let cap_key = (symbol_short!("CAPCACHE"), anchor.clone());
+            if let Some(entry) = env
+                .storage()
+                .temporary()
+                .get::<_, CapabilitiesCache>(&cap_key)
+            {
+                if entry.cached_at.saturating_add(entry.ttl_seconds) <= now {
+                    env.storage().temporary().remove(&cap_key);
+                    freed += 1;
+                }
+            }
+        }
+
+        // Adjust the instance-level count so capacity checks remain accurate.
+        if freed > 0 {
+            let current = Self::get_cache_count_internal(&env);
+            let new_count = if current >= freed { current - freed } else { 0 };
+            env.storage()
+                .instance()
+                .set(&Self::cache_count_key(&env), &new_count);
+            env.storage().instance().extend_ttl(INSTANCE_TTL, INSTANCE_TTL);
+
+            // Log the compaction for auditability.
+            AdminAuditLog::log_action(
+                &env,
+                &Self::get_admin_internal(&env),
+                "compact_cache",
+                String::from_str(&env, "cache"),
+                "",
+                "compacted",
+            );
+
+            // Emit an event so off-chain monitors can track compaction runs.
+            env.events().publish(
+                (symbol_short!("cache"), symbol_short!("compact")),
+                freed,
+            );
+        }
+
+        freed
+    }
+
+    // -----------------------------------------------------------------------
+    // Cache invalidation hooks (#b)
+    //
+    // These hooks are invoked whenever anchor metadata or service state changes
+    // in a way that could render cached data stale. Each hook removes the
+    // affected cache entries and emits an `invalidated` event so that off-chain
+    // consumers (monitoring systems, SWR refresh loops) can react.
+    //
+    // Hook points:
+    //   • invalidate_cache_for_anchor   — explicit admin-triggered invalidation
+    //   • After set_anchor_metadata     — called internally on every metadata write
+    //   • After enable_service /
+    //     disable_service               — called internally on every toggle
+    // -----------------------------------------------------------------------
+
+    /// Explicitly invalidate both the metadata and capabilities cache entries
+    /// for `anchor`. Can be triggered by an admin, a monitoring system, or
+    /// the execute_cache_invalidation governance path.
+    ///
+    /// Returns `true` when at least one cache slot was cleared.
+    pub fn invalidate_cache_for_anchor(env: Env, anchor: Address) -> bool {
+        Self::require_admin(&env);
+        let cleared = Self::invalidate_cache_internal(&env, &anchor);
+        if cleared {
+            AdminAuditLog::log_action(
+                &env,
+                &Self::get_admin_internal(&env),
+                "invalidate_cache",
+                anchor.to_string(),
+                "cached",
+                "invalidated",
+            );
+        }
+        cleared
+    }
+
+    /// Internal helper: remove both cache slots for `anchor` and emit the
+    /// `invalidated` event. Returns `true` when at least one entry was present.
+    fn invalidate_cache_internal(env: &Env, anchor: &Address) -> bool {
+        let mut slots_freed: u64 = 0;
+
+        let meta_key = (symbol_short!("METACACHE"), anchor.clone());
+        if env.storage().temporary().has(&meta_key) {
+            env.storage().temporary().remove(&meta_key);
+            slots_freed += 1;
+        }
+
+        let cap_key = (symbol_short!("CAPCACHE"), anchor.clone());
+        if env.storage().temporary().has(&cap_key) {
+            env.storage().temporary().remove(&cap_key);
+            slots_freed += 1;
+        }
+
+        if slots_freed > 0 {
+            // Decrement the instance-level count to keep capacity checks accurate.
+            let current = Self::get_cache_count_internal(env);
+            let new_count = if current >= slots_freed { current - slots_freed } else { 0 };
+            env.storage()
+                .instance()
+                .set(&Self::cache_count_key(env), &new_count);
+            env.storage().instance().extend_ttl(INSTANCE_TTL, INSTANCE_TTL);
+
+            env.events().publish(
+                (symbol_short!("cache"), symbol_short!("invalidate"), anchor.clone()),
+                env.ledger().timestamp(),
+            );
+        }
+
+        slots_freed > 0
+    }
+
+    // -----------------------------------------------------------------------
     // Routing
     // -----------------------------------------------------------------------
 
@@ -6526,10 +6705,14 @@ impl AnchorKitContract {
             .get::<_, Vec<Address>>(&list_key)
             .unwrap_or_else(|| Vec::new(&env));
         if !list.contains(&anchor) {
-            list.push_back(anchor);
+            list.push_back(anchor.clone());
             env.storage().persistent().set(&list_key, &list);
             env.storage().persistent().extend_ttl(&list_key, PERSISTENT_TTL, PERSISTENT_TTL);
         }
+
+        // Invalidation hook: external anchor metadata change should trigger
+        // cache refresh so stale METACACHE entries are removed immediately.
+        Self::invalidate_cache_internal(&env, &anchor);
     }
 
     // -----------------------------------------------------------------------
