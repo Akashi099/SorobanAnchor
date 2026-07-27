@@ -22,6 +22,9 @@ fn raw_payment() -> RawSep31PaymentResponse {
         stellar_account_id: VALID_ACCOUNT.into(),
         stellar_memo: None,
         stellar_memo_type: None,
+        amount: None,
+        asset_code: None,
+        idempotency_key: None,
     }
 }
 

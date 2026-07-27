@@ -7,7 +7,7 @@
 
 mod sep_fixtures_tests {
     use anchorkit::mock::*;
-    use anchorkit::{initiate_deposit, initiate_withdrawal, sep24, sep38};
+    use anchorkit::{initiate_deposit, initiate_withdrawal, sep24, sep38, TransactionStatus};
 
     // ── SEP-6 Fixtures ────────────────────────────────────────────────────
 
@@ -107,24 +107,24 @@ mod sep_fixtures_tests {
     #[test]
     fn test_sep24_transaction_pending() {
         let raw = mock_sep24_transaction_pending();
-        let tx = sep24::get_sep24_transaction_status(raw).expect("pending sep24 tx must parse");
+        let tx = sep24::fetch_sep24_transaction_status(raw).expect("pending sep24 tx must parse");
         assert_eq!(tx.id, MOCK_TXN_ID_24);
-        assert_eq!(tx.status, "pending_user_transfer_start");
+        assert_eq!(tx.status, TransactionStatus::PendingUser);
     }
 
     #[test]
     fn test_sep24_transaction_completed() {
         let raw = mock_sep24_transaction_completed();
-        let tx = sep24::get_sep24_transaction_status(raw).expect("completed sep24 tx must parse");
+        let tx = sep24::fetch_sep24_transaction_status(raw).expect("completed sep24 tx must parse");
         assert_eq!(tx.id, MOCK_TXN_ID_24);
-        assert_eq!(tx.status, "completed");
+        assert_eq!(tx.status, TransactionStatus::Completed);
         assert!(tx.stellar_transaction_id.is_some());
     }
 
     #[test]
     fn test_sep24_transaction_minimal() {
         let raw = mock_sep24_transaction_minimal();
-        let tx = sep24::get_sep24_transaction_status(raw).expect("minimal sep24 tx must parse");
+        let tx = sep24::fetch_sep24_transaction_status(raw).expect("minimal sep24 tx must parse");
         assert_eq!(tx.id, "sep24-min-001");
         assert!(tx.more_info_url.is_none());
     }
@@ -132,7 +132,7 @@ mod sep_fixtures_tests {
     #[test]
     fn test_sep24_transaction_full() {
         let raw = mock_sep24_transaction_full();
-        let tx = sep24::get_sep24_transaction_status(raw).expect("full sep24 tx must parse");
+        let tx = sep24::fetch_sep24_transaction_status(raw).expect("full sep24 tx must parse");
         assert_eq!(tx.id, "sep24-full-001");
         assert!(tx.more_info_url.is_some());
         assert!(tx.stellar_transaction_id.is_some());
