@@ -2420,6 +2420,27 @@ impl AnchorKitContract {
             .unwrap_or_else(CacheConfig::default_config)
     }
 
+    /// Set the governance policy set for all cache entry types.
+    ///
+    /// Admin-only. Validates all three contained policies before storing.
+    ///
+    /// # Errors
+    ///
+    /// Panics with [`ErrorCode::ValidationError`] when any policy is internally
+    /// inconsistent (e.g. `min_ttl >= max_ttl` or `refresh_threshold_pct` out of
+    /// `[1, 99]`).
+    pub fn set_cache_policy_set(env: Env, policies: crate::cache_governance::CachePolicySet) {
+        Self::require_admin(&env);
+        crate::cache_governance::set_policy_set(&env, policies)
+            .unwrap_or_else(|_| panic_with_error!(&env, ErrorCode::ValidationError));
+    }
+
+    /// Return the currently active [`CachePolicySet`] (or defaults when not yet
+    /// explicitly configured).
+    pub fn get_cache_policy_set(env: Env) -> crate::cache_governance::CachePolicySet {
+        crate::cache_governance::get_policy_set(&env)
+    }
+
     /// Resolve the effective TTL: use `override_ttl` when non-zero, otherwise
     /// fall back to `configured`.
     fn effective_ttl(override_ttl: u64, configured: u64) -> u64 {
@@ -5980,7 +6001,17 @@ impl AnchorKitContract {
 
         let now = env.ledger().timestamp();
         let cfg = Self::get_cache_config_internal(&env);
-        let ttl = Self::effective_ttl(ttl_seconds, cfg.metadata_ttl_seconds);
+        // ── Policy enforcement ──────────────────────────────────────────────
+        // Clamp the caller-supplied TTL to the bounds defined by the active
+        // metadata policy. A zero TTL falls back to the configured default
+        // before clamping.
+        let base_ttl = Self::effective_ttl(ttl_seconds, cfg.metadata_ttl_seconds);
+        let (ttl, _) = crate::cache_governance::enforce_write_policy(
+            &env,
+            crate::cache_governance::CacheEntryType::Metadata,
+            base_ttl,
+            0, // brand-new write: no existing age
+        );
         let stale = cfg.swr_ttl_seconds;
         let entry = MetadataCache {
             metadata,
@@ -6050,8 +6081,16 @@ impl AnchorKitContract {
 
         let now = env.ledger().timestamp();
         let cfg = Self::get_cache_config_internal(&env);
-        let ttl = Self::effective_ttl(ttl_seconds, cfg.metadata_ttl_seconds);
-        let stale = Self::effective_ttl(stale_ttl_seconds, cfg.swr_ttl_seconds);
+        let base_ttl = Self::effective_ttl(ttl_seconds, cfg.metadata_ttl_seconds);
+        let base_stale = Self::effective_ttl(stale_ttl_seconds, cfg.swr_ttl_seconds);
+        // ── Policy enforcement ──────────────────────────────────────────────
+        let (ttl, _) = crate::cache_governance::enforce_write_policy(
+            &env,
+            crate::cache_governance::CacheEntryType::Metadata,
+            base_ttl,
+            0,
+        );
+        let stale = base_stale;
         let entry = MetadataCache {
             metadata,
             cached_at: now,
@@ -6108,10 +6147,27 @@ impl AnchorKitContract {
         stale_ttl_seconds: u64,
     ) {
         Self::require_admin(&env);
+        // ── Policy enforcement — invalidation guard ─────────────────────────
+        // Verify that forced invalidation is permitted for metadata entries
+        // under the active governance policy.
+        crate::cache_governance::enforce_invalidation_policy(
+            &env,
+            crate::cache_governance::CacheEntryType::Metadata,
+        )
+        .unwrap_or_else(|_| panic_with_error!(&env, ErrorCode::ValidationError));
+
         let now = env.ledger().timestamp();
         let cfg = Self::get_cache_config_internal(&env);
-        let ttl = Self::effective_ttl(ttl_seconds, cfg.metadata_ttl_seconds);
-        let stale = Self::effective_ttl(stale_ttl_seconds, cfg.swr_ttl_seconds);
+        let base_ttl   = Self::effective_ttl(ttl_seconds, cfg.metadata_ttl_seconds);
+        let base_stale = Self::effective_ttl(stale_ttl_seconds, cfg.swr_ttl_seconds);
+        // Clamp to policy bounds.
+        let (ttl, _) = crate::cache_governance::enforce_write_policy(
+            &env,
+            crate::cache_governance::CacheEntryType::Metadata,
+            base_ttl,
+            0,
+        );
+        let stale = base_stale;
         let entry = MetadataCache {
             metadata,
             cached_at: now,
@@ -6284,7 +6340,14 @@ impl AnchorKitContract {
 
         let now = env.ledger().timestamp();
         let cfg = Self::get_cache_config_internal(&env);
-        let ttl = Self::effective_ttl(ttl_seconds, cfg.capabilities_ttl_seconds);
+        let base_ttl = Self::effective_ttl(ttl_seconds, cfg.capabilities_ttl_seconds);
+        // ── Policy enforcement ──────────────────────────────────────────────
+        let (ttl, _) = crate::cache_governance::enforce_write_policy(
+            &env,
+            crate::cache_governance::CacheEntryType::Capabilities,
+            base_ttl,
+            0,
+        );
         let entry = CapabilitiesCache { toml_url, capabilities, cached_at: now, ttl_seconds: ttl };
         let ledger_ttl = if ttl as u32 > MIN_TEMP_TTL { ttl as u32 } else { MIN_TEMP_TTL };
         env.storage().temporary().set(&key, &entry);
@@ -7240,7 +7303,14 @@ impl AnchorKitContract {
         }
         let now = env.ledger().timestamp();
         let cfg = Self::get_cache_config_internal(&env);
-        let ttl = Self::effective_ttl(ttl_seconds, cfg.capabilities_ttl_seconds);
+        let base_ttl = Self::effective_ttl(ttl_seconds, cfg.capabilities_ttl_seconds);
+        // ── Policy enforcement ──────────────────────────────────────────────
+        let (ttl, _) = crate::cache_governance::enforce_write_policy(
+            &env,
+            crate::cache_governance::CacheEntryType::Capabilities,
+            base_ttl,
+            0,
+        );
         let cached = CachedToml {
             toml: toml_data,
             cached_at: now,

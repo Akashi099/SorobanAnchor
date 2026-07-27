@@ -188,6 +188,8 @@ pub use contract::{
 pub use transaction_state_tracker::{TransactionState, TransactionStateRecord, RecoveryMetadata, OptRecovery};
 pub use transaction_state_tracker::{StorageBudgetMonitor, TransactionStateTracker};
 pub use transaction_state_tracker::TransactionSummary;
+pub use url_normalizer::{normalize_url, normalize_and_validate, extract_hostname, UrlFilterPolicy, UrlFilterEntry};
+pub use cache_governance::{CachePolicy, CachePolicySet, CacheEntryType, CacheGovernanceConfig};
 
 // ── std-only re-exports ───────────────────────────────────────────────────────
 #[cfg(feature = "std")]
