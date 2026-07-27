@@ -2,11 +2,52 @@
 
 This document provides comprehensive documentation for all exported contract functions, including arguments, return values, and failure scenarios.
 
+---
+
+## Authorization Model
+
+AnchorKit uses a **three-tier authorization model**:
+
+| Tier | Who | Access |
+|------|-----|--------|
+| **Primary admin** | Set by `initialize` | All operations unconditionally |
+| **Role holders** | Granted via `grant_role` | Scoped set of operations (`KycAdmin`, `AttestorAdmin`, `CacheAdmin`) |
+| **Capability holders** | Granted via `grant_capability` | Individual fine-grained operations |
+
+The primary admin implicitly holds every role and capability. Roles and capabilities are additive — an address that holds either the matching role **or** the matching capability may invoke the operation.
+
+### AdminRole → Operations
+
+| Role | Operations |
+|------|-----------|
+| `KycAdmin` (0) | `approve_kyc`, `reject_kyc` |
+| `AttestorAdmin` (1) | `register_attestor_with_session`, `revoke_attestor_with_session` |
+| `CacheAdmin` (2) | All `cache_*` and `refresh_*_cache*` methods |
+
+### AdminCapability → Operations
+
+| Capability | Operations |
+|-----------|-----------|
+| `UpgradeContract` (0) | `upgrade` |
+| `MigrateSchema` (1) | `migrate` |
+| `SetCacheConfig` (2) | `set_cache_config`, `set_governance_config` |
+| `ManageAttestors` (3) | `register_attestor`, `revoke_attestor`, `register_attestor_with_session`, `revoke_attestor_with_session` |
+| `ManageKyc` (4) | `approve_kyc`, `reject_kyc` |
+| `ManageCacheEntries` (5) | `cache_metadata`, `cache_metadata_swr`, `force_refresh_metadata`, `refresh_metadata_cache`, `cache_capabilities`, `refresh_capabilities_cache` |
+| `ToggleServices` (6) | `enable_service`, `disable_service`, `snapshot_services`, `rollback_services` |
+| `SetRateLimits` (7) | `set_rate_limit_config`, `set_role_rate_limit` |
+| `SetJwtConfig` (8) | `set_sep10_jwt_verifying_key`, `rotate_sep10_key`, `set_jwt_max_len`, `set_jwt_skew` |
+| `ManageAnchorMetadata` (9) | `set_anchor_metadata`, `reactivate_anchor`, `blacklist_anchor`, `unblacklist_anchor` |
+
+All authorization failures produce `Unauthorized` (code 28).
+
+---
+
 ## Initialization & Admin
 
 ### `initialize(env: Env, admin: Address)`
 
-Initialize the contract with an admin address. Must be called exactly once.
+Initialize the contract with an admin address. Must be called **exactly once** — the contract uses a dedicated persistent `INITIALIZED` flag to prevent re-initialization after upgrades.
 
 **Arguments:**
 - `env` - Soroban environment context
@@ -17,7 +58,7 @@ Initialize the contract with an admin address. Must be called exactly once.
 **Errors:**
 - `AlreadyInitialized` (code 1) - if contract is already initialized
 
-**Side effects:** Sets up persistent storage and instance storage
+**Side effects:** Writes `INITIALIZED` flag to persistent storage, stores admin address and initial schema version (`SCHEMAVER = 1`) to instance storage.
 
 ---
 
@@ -67,49 +108,98 @@ Get the current contract version and upgrade timestamp.
 
 Upgrade the contract WASM code to a new version.
 
+**Authorization:** Primary admin only (role/capability delegation not supported for this operation to prevent accidental privilege escalation).
+
 **Arguments:**
 - `env` - Soroban environment context
-- `new_wasm_hash` - SHA-256 hash of new WASM bytecode
+- `new_wasm_hash` - SHA-256 hash of new WASM bytecode. **Must be non-zero** — a zeroed hash is rejected early with `ValidationError`.
 
 **Returns:** None
 
 **Errors:**
 - `NotInitialized` (code 23) - if contract not initialized
-- `UnauthorizedAttestor` (code 4) - if caller is not admin
+- `Unauthorized` (code 28) - if caller is not the primary admin
+- `ValidationError` (code 15) - if `new_wasm_hash` is all-zero bytes
 
 **Side effects:**
-- Increments patch version
-- Records upgrade timestamp
-- Emits `UpgradeEvent`
+- Atomically replaces the contract bytecode
+- Increments the patch version component
+- Records the upgrade timestamp
+- Writes the new WASM hash to `OLDHASH` in instance storage
+- Emits `UpgradeEvent` with old/new hashes and updated version info
+- Writes an audit log entry
 
 ---
 
-### `migrate(env: Env)`
+### `migrate(env: Env, new_schema_version: u32, batch_size: u32)`
 
-Run post-upgrade migration logic (idempotent).
+Run post-upgrade schema migration and advance the on-chain schema version. Must be called after each WASM upgrade that changes the stored data layout.
+
+**Authorization:** Primary admin only.
+
+**Migration is separated from `upgrade`** to make state transitions explicit and auditable. Each call advances the schema version by exactly one step and returns early (without committing the version) if a batch migration is still in progress.
 
 **Arguments:**
 - `env` - Soroban environment context
+- `new_schema_version` - Schema version to advance to. Must be:
+  - Greater than 0
+  - Strictly greater than the currently stored version (`get_schema_version`)
+  - Not greater than `SCHEMA_V2` (highest version this binary understands — prevents migrating to a layout the current code cannot interpret)
+- `batch_size` - Max quote records to rewrite per call during the v1→v2 migration
 
 **Returns:** None
 
 **Errors:**
 - `NotInitialized` (code 23) - if contract not initialized
+- `Unauthorized` (code 28) - if caller is not the primary admin
+- `ValidationError` (code 15) - if `new_schema_version` is 0 or ≤ current version
+- `UnsupportedCapabilityVersion` (code 27) - if `new_schema_version` exceeds the highest known schema version
 
-**Side effects:** Performs any necessary data migrations
+**Side effects:**
+- When a batch migration is incomplete, returns early without writing the new version; caller must invoke again to continue
+- On full completion, writes `new_schema_version` to `SCHEMAVER` in instance storage
+- Writes audit log entries for batch migration progress and the final version advance
 
 ---
 
-### `get_schema_version(_env: Env) -> u32`
+### `get_schema_version(env: Env) -> u32`
 
 Get the current on-chain data schema version.
 
 **Arguments:**
 - `_env` - Soroban environment context
 
-**Returns:** Current schema version (currently 1)
+**Returns:** Current schema version (`1` after `initialize`, `2` after v1→v2 migration). Returns `0` if the contract has never been initialized.
 
 **Errors:** None
+
+---
+
+### `get_migration_count(env: Env) -> u32`
+
+Return the total number of migrations that have been recorded in the persistent history log.
+
+**Arguments:**
+- `env` - Soroban environment context
+
+**Returns:** `u32` count of recorded migration steps
+
+**Errors:** None
+
+---
+
+### `get_migration_record(env: Env, idx: u32) -> MigrationRecord`
+
+Return a single migration history record by zero-based index.
+
+**Arguments:**
+- `env` - Soroban environment context
+- `idx` - Zero-based index into the history log
+
+**Returns:** [`MigrationRecord`] with `from_version`, `to_version`, `applied_at`, `applied_at_ledger`, `label`
+
+**Errors:**
+- `ValidationError` (code 15) - if `idx` is out of range
 
 ---
 
@@ -119,6 +209,8 @@ Get the current on-chain data schema version.
 
 Set the global cache configuration for TTLs.
 
+**Authorization:** Primary admin only. All three TTL fields must be non-zero.
+
 **Arguments:**
 - `env` - Soroban environment context
 - `config` - [`CacheConfig`] with metadata_ttl_seconds, capabilities_ttl_seconds, swr_ttl_seconds
@@ -126,9 +218,10 @@ Set the global cache configuration for TTLs.
 **Returns:** None
 
 **Errors:**
-- `UnauthorizedAttestor` (code 4) - if caller is not admin
+- `Unauthorized` (code 28) - if caller is not admin
+- `ValidationError` (code 15) - if any TTL field is zero
 
-**Side effects:** Updates instance storage with new cache configuration
+**Side effects:** Updates instance storage with new cache configuration; writes audit log entry
 
 ---
 
@@ -569,6 +662,30 @@ Get the KYC status for an address.
 
 ## Sessions
 
+### Session Lifecycle State Machine
+
+Every session follows a formally defined lifecycle. Invalid transitions are rejected with `IllegalTransition` (code 24), `SessionClosed` (code 26), `SessionExpired` (code 25), or `SessionOperationLimitExceeded` (code 30).
+
+```
+[Created] ──(first operation)──► [Active] ──(limit reached)──► [Exhausted]
+    │                                │                               │
+    └──(close_session)──► [Closed] ◄─┘◄──────────────────────────── ┘
+    │
+    └──(ttl elapsed, any state)──► [Expired]
+```
+
+| State | Value | Description |
+|-------|-------|-------------|
+| `Created` | 0 | Session opened, no operations recorded yet |
+| `Active` | 1 | At least one operation recorded; more allowed |
+| `Exhausted` | 2 | Operation limit reached; no more operations permitted |
+| `Closed` | 3 | Explicitly closed by the initiator |
+| `Expired` | 4 | TTL elapsed before explicit closure |
+
+Terminal states (`Closed`, `Expired`, `Exhausted`) accept no further transitions. `Expired` is computed at read time — if the TTL has elapsed and the stored state is non-terminal, `get_session_state` returns `4` without writing to storage.
+
+---
+
 ### `create_session(env: Env, initiator: Address) -> u64`
 
 Create a new session for multi-operation workflows.
@@ -590,18 +707,23 @@ Create a new session for multi-operation workflows.
 
 Close an active session.
 
+**Authorization:** Only the address that originally created the session (`initiator` must match the stored initiator).
+
 **Arguments:**
 - `env` - Soroban environment context
 - `session_id` - ID of session to close
-- `initiator` - Address that initiated the session
+- `initiator` - Address that initiated the session (must authorize and match stored initiator)
 
 **Returns:** None
 
 **Errors:**
-- `SessionClosed` (code 26) - if session already closed
-- `SessionExpired` (code 25) - if session has expired
+- `SessionNotFound` (code 32) - if no session with that ID exists
+- `UnauthorizedAttestor` (code 4) - if `initiator` does not match the session's stored initiator
+- `SessionExpired` (code 25) - if the session TTL has elapsed (records `Expired` state before panicking)
+- `SessionClosed` (code 26) - if the session is already in `Closed` state
+- `IllegalTransition` (code 24) - if the current state does not permit closing
 
-**Side effects:** Marks session as closed, emits SessionClosedEvent
+**Side effects:** Transitions session state to `Closed`; emits `SessionClosedEvent`
 
 ---
 
@@ -615,7 +737,27 @@ Retrieve session details.
 
 **Returns:** [`Session`] struct with metadata and status
 
-**Errors:** None (returns default if not found)
+**Errors:**
+- `SessionNotFound` (code 32) - if no session with that ID exists
+
+---
+
+### `get_session_state(env: Env, session_id: u64) -> u32`
+
+Return the current lifecycle state of a session as a `u32` discriminant.
+
+**State values:** `0`=Created, `1`=Active, `2`=Exhausted, `3`=Closed, `4`=Expired
+
+This is a lightweight read. If the session's TTL has elapsed and its state is still non-terminal, `4` (Expired) is returned without writing to storage.
+
+**Arguments:**
+- `env` - Soroban environment context
+- `session_id` - ID of session
+
+**Returns:** `u32` discriminant of `SessionState`
+
+**Errors:**
+- `SessionNotFound` (code 32) - if no session with that ID exists
 
 ---
 
@@ -918,20 +1060,200 @@ Get detailed info for a specific asset.
 
 ## Rate Limiting
 
-### `set_rate_limit_config(env: Env, max_submissions: u32, window_length: u32)`
+### `set_rate_limit_config(env: Env, caller: Address, max_submissions: u32, window_length: u32)`
 
-Configure rate limiting for KYC submissions.
+Configure the global rate limit for attestation submissions.
+
+**Authorization:** Primary admin or holder of `AdminCapability::SetRateLimits`.
 
 **Arguments:**
 - `env` - Soroban environment context
+- `caller` - Address authorizing the change (must be admin or have `SetRateLimits` capability)
 - `max_submissions` - Maximum submissions per window
-- `window_length` - Window length in seconds
+- `window_length` - Window length in ledgers
 
 **Returns:** None
 
-**Errors:** None
+**Errors:**
+- `Unauthorized` (code 28) - if caller lacks permission
+- `ValidationError` (code 15) - if config values are invalid
 
-**Side effects:** Updates rate limiter configuration
+**Side effects:** Updates rate limiter configuration; writes audit log entry
+
+---
+
+### `set_role_rate_limit(env: Env, caller: Address, role: Symbol, config: RateLimitConfig)`
+
+Set a per-role rate limit override.
+
+**Authorization:** Primary admin or holder of `AdminCapability::SetRateLimits`.
+
+**Arguments:**
+- `env` - Soroban environment context
+- `caller` - Authorizing address
+- `role` - Role symbol to apply the override to
+- `config` - `RateLimitConfig` with max_submissions and window_length
+
+**Returns:** None
+
+**Errors:**
+- `Unauthorized` (code 28) - if caller lacks permission
+- `ValidationError` (code 15) - if config is invalid
+
+---
+
+## Role-Based Access Control
+
+### `grant_role(env: Env, grantee: Address, role: AdminRole)`
+
+Grant a delegated admin role to an address. Only the primary admin may call this.
+
+**Arguments:**
+- `env` - Soroban environment context
+- `grantee` - Address to grant the role to
+- `role` - `AdminRole` variant (`KycAdmin`, `AttestorAdmin`, or `CacheAdmin`)
+
+**Returns:** None
+
+**Errors:**
+- `NotInitialized` (code 23) - if contract not initialized
+- `Unauthorized` (code 28) - if caller is not the primary admin
+
+**Side effects:** Writes role grant to persistent storage; writes audit log entry; emits `role.granted` event
+
+---
+
+### `revoke_role(env: Env, grantee: Address, role: AdminRole)`
+
+Revoke a delegated admin role. Only the primary admin may call this. Revoking a role never held is a no-op.
+
+**Arguments:**
+- `env` - Soroban environment context
+- `grantee` - Address to revoke the role from
+- `role` - `AdminRole` variant to revoke
+
+**Returns:** None
+
+**Errors:**
+- `Unauthorized` (code 28) - if caller is not the primary admin
+
+**Side effects:** Removes role grant from persistent storage; writes audit log entry; emits `role.revoked` event
+
+---
+
+### `has_role(env: Env, address: Address, role: AdminRole) -> bool`
+
+Check whether an address holds a role (or is the primary admin).
+
+**Arguments:**
+- `env` - Soroban environment context
+- `address` - Address to check
+- `role` - `AdminRole` to check for
+
+**Returns:** `true` if the address holds the role or is the primary admin
+
+---
+
+## Fine-Grained Capability Management
+
+### `grant_capability(env: Env, grantee: Address, capability: AdminCapability)`
+
+Grant a fine-grained capability to an address. Only the primary admin may call this. Granting a capability already held is idempotent.
+
+**Arguments:**
+- `env` - Soroban environment context
+- `grantee` - Address to grant the capability to
+- `capability` - `AdminCapability` variant to grant
+
+**Returns:** None
+
+**Errors:**
+- `NotInitialized` (code 23) - if contract not initialized
+- `Unauthorized` (code 28) - if caller is not the primary admin
+
+**Side effects:** Writes capability grant to persistent storage; writes audit log entry; emits `cap.granted` event
+
+---
+
+### `revoke_capability(env: Env, grantee: Address, capability: AdminCapability)`
+
+Revoke a fine-grained capability. Only the primary admin may call this. Revoking a capability never granted is a no-op.
+
+**Arguments:**
+- `env` - Soroban environment context
+- `grantee` - Address to revoke the capability from
+- `capability` - `AdminCapability` variant to revoke
+
+**Returns:** None
+
+**Errors:**
+- `Unauthorized` (code 28) - if caller is not the primary admin
+
+**Side effects:** Removes capability grant from persistent storage; writes audit log entry; emits `cap.revoked` event
+
+---
+
+### `has_capability(env: Env, address: Address, capability: AdminCapability) -> bool`
+
+Check whether an address holds a capability (or is the primary admin).
+
+**Arguments:**
+- `env` - Soroban environment context
+- `address` - Address to check
+- `capability` - `AdminCapability` variant to check for
+
+**Returns:** `true` if the address holds the capability or is the primary admin
+
+---
+
+## Service Toggle Management
+
+### `enable_service(env: Env, caller: Address, anchor: Address, service_code: u32) -> bool`
+
+Enable a single service for an anchor in the toggle store.
+
+**Authorization:** Primary admin or holder of `AdminCapability::ToggleServices`.
+
+**Arguments:**
+- `env` - Soroban environment context
+- `caller` - Authorizing address
+- `anchor` - Anchor address
+- `service_code` - Service type code (1=deposits, 2=withdrawals, 3=quotes, 4=kyc, 5=sep31)
+
+**Returns:** `true` if the service was changed from disabled to enabled; `false` if already enabled
+
+**Errors:**
+- `Unauthorized` (code 28) - if caller lacks permission
+
+---
+
+### `disable_service(env: Env, caller: Address, anchor: Address, service_code: u32) -> bool`
+
+Disable a single service for an anchor in the toggle store.
+
+**Authorization:** Primary admin or holder of `AdminCapability::ToggleServices`.
+
+**Returns:** `true` if changed; `false` if already disabled
+
+---
+
+### `snapshot_services(env: Env, caller: Address, anchor: Address, services: Vec<u32>, description: String) -> u64`
+
+Snapshot the current service configuration for `anchor` so it can be restored via `rollback_services`.
+
+**Authorization:** Primary admin or holder of `AdminCapability::ToggleServices`.
+
+**Returns:** Snapshot ID (u64)
+
+---
+
+### `rollback_services(env: Env, caller: Address, snapshot_id: u64) -> bool`
+
+Restore service configuration from a previously taken snapshot.
+
+**Authorization:** Primary admin or holder of `AdminCapability::ToggleServices`.
+
+**Returns:** `true` if the snapshot was found and applied; `false` otherwise
 
 ---
 
@@ -965,10 +1287,14 @@ Configure rate limiting for KYC submissions.
 | 24 | IllegalTransition | Illegal transaction state transition |
 | 25 | SessionExpired | Session has expired |
 | 26 | SessionClosed | Session is closed |
-| 27 | UnsupportedCapabilityVersion | Service capability version is unsupported |
-| 28 | Unauthorized | Caller is not authorized |
+| 27 | UnsupportedCapabilityVersion | Service capability version is unsupported; also returned when `migrate()` is called with a schema version the current binary does not know about |
+| 28 | **Unauthorized** | **Caller does not hold the required admin role or capability for this operation** |
 | 30 | SessionOperationLimitExceeded | Session operation limit exceeded |
 | 31 | InvalidWeights | Routing weights must sum to 1.0 |
+| 32 | SessionNotFound | Session not found |
+| 33 | QuoteNotFound | Quote not found |
+| 34 | AuditLogNotFound | Audit log not found |
+| 35 | TransactionNotFound | Transaction record not found |
 | 48 | CacheExpired | Cache entry has expired |
 | 49 | CacheNotFound | Cache entry not found |
 | 50 | AttestorProfileNotFound | Attestor profile not found |
@@ -977,3 +1303,7 @@ Configure rate limiting for KYC submissions.
 | 53 | InvalidAssetCode | Asset code is invalid |
 | 54 | AttestorCapacityExceeded | Attestor capacity has been exceeded |
 | 55 | CacheCapacityExceeded | Cache capacity has been exceeded |
+| 56 | EndpointNotSet | Attestor endpoint URL is not set |
+| 57 | WebhookUrlNotSet | Attestor webhook URL is not set |
+
+> **Note on authorization errors:** All privilege-check failures now consistently produce `Unauthorized` (code 28) regardless of whether the check was a role check, a capability check, or a raw admin check. The legacy `UnauthorizedAttestor` (code 4) is preserved for backwards compatibility but is only returned by attestation-submission paths, not by admin management operations.

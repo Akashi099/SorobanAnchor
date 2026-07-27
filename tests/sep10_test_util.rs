@@ -63,6 +63,56 @@ pub fn build_sep10_jwt_with_jti(
     let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_bytes());
     format!("{}.{}", signing_input, sig_b64)
 }
+/// Build a SEP-10 JWT whose `iss` claim is set to `issuer` instead of the
+/// default `"https://anchor.example.com"`. Used to test issuer mismatch
+/// rejection in `verify_sep10_jwt_with_issuer`.
+pub fn build_sep10_jwt_with_iss(
+    signing_key: &SigningKey,
+    sub: &str,
+    exp: u64,
+    issuer: &str,
+) -> std::string::String {
+    let header = r#"{"alg":"EdDSA","typ":"JWT"}"#;
+    let iat = exp.saturating_sub(anchorkit::sep10_jwt::MAX_JWT_LIFETIME);
+    let payload = format!(
+        r#"{{"sub":"{}","iat":{},"exp":{},"iss":"{}"}}"#,
+        sub, iat, exp, issuer
+    );
+    let header_b64 = URL_SAFE_NO_PAD.encode(header);
+    let payload_b64 = URL_SAFE_NO_PAD.encode(payload);
+    let signing_input = format!("{}.{}", header_b64, payload_b64);
+    let sig = signing_key.sign(signing_input.as_bytes());
+    let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_bytes());
+    format!("{}.{}", signing_input, sig_b64)
+}
+
+/// Build a SEP-10 JWT with a future `iat` (issued-at in the future).
+/// Used to test that `verify_sep10_jwt` rejects tokens with `iat > now`.
+pub fn build_sep10_jwt_with_future_iat(
+    signing_key: &SigningKey,
+    sub: &str,
+    now: u64,
+    seconds_ahead: u64,
+) -> std::string::String {
+    let future_iat = now + seconds_ahead;
+    let exp = future_iat + anchorkit::sep10_jwt::MAX_JWT_LIFETIME;
+    build_sep10_jwt_with_iat(signing_key, sub, future_iat, exp)
+}
+
+/// Build a SEP-10 JWT with an empty `sub` claim.
+pub fn build_sep10_jwt_empty_sub(signing_key: &SigningKey, exp: u64) -> std::string::String {
+    build_sep10_jwt(signing_key, "", exp)
+}
+
+/// Build a SEP-10 JWT with a whitespace-only `iss` claim.
+pub fn build_sep10_jwt_whitespace_iss(
+    signing_key: &SigningKey,
+    sub: &str,
+    exp: u64,
+) -> std::string::String {
+    build_sep10_jwt_with_iss(signing_key, sub, exp, "   ")
+}
+
 pub fn sign_payload(env: &Env, signing_key: &SigningKey, payload_hash: &Bytes) -> Bytes {
     let mut msg = std::vec::Vec::with_capacity(payload_hash.len() as usize);
     for i in 0..payload_hash.len() {
