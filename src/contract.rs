@@ -261,6 +261,37 @@ pub const SERVICE_KYC: u32 = 4;
 pub const SERVICE_SEP31: u32 = 5;
 
 // ---------------------------------------------------------------------------
+// Attestor revocation record — stored when an attestor is revoked so that
+// recovery can be performed without losing the original public key or audit
+// history.
+// ---------------------------------------------------------------------------
+
+/// Persisted metadata capturing the circumstances of an attestor revocation.
+///
+/// Written by `revoke_attestor` and read by `reactivate_attestor` and
+/// `get_attestor_revocation_info`.  The record is never deleted, which means
+/// the full revocation/reactivation history is always available for audit.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct AttestorRevocationRecord {
+    /// Address of the attestor that was revoked.
+    pub attestor: Address,
+    /// Ledger timestamp when the revocation was executed.
+    pub revoked_at: u64,
+    /// Address of the admin that performed the revocation.
+    pub revoked_by: Address,
+    /// Human-readable reason supplied at revocation time (may be empty).
+    pub reason: String,
+    /// Copy of the attestor's public key preserved so that re-registration is
+    /// not required after reactivation.
+    pub public_key: BytesN<32>,
+    /// Whether this attestor has been reactivated after this revocation.
+    pub reactivated: bool,
+    /// Ledger timestamp when the attestor was reactivated (0 = not yet reactivated).
+    pub reactivated_at: u64,
+}
+
+// ---------------------------------------------------------------------------
 // #344 — Admin permission model
 //
 // Every admin-gated method maps to one of the categories below. The primary
@@ -1179,6 +1210,77 @@ struct UpgradeEvent {
     upgraded_at: u64,
 }
 
+/// Event emitted when `initialize` completes successfully.
+#[contracttype]
+#[derive(Clone)]
+pub struct ContractInitializedEvent {
+    pub admin: Address,
+    pub timestamp: u64,
+}
+
+/// Rich event emitted when an attestor is registered.
+#[contracttype]
+#[derive(Clone)]
+pub struct AttestorRegisteredEvent {
+    pub attestor: Address,
+    pub timestamp: u64,
+}
+
+/// Rich event emitted when an attestor is revoked.
+#[contracttype]
+#[derive(Clone)]
+pub struct AttestorRevokedEvent {
+    pub attestor: Address,
+    pub revoked_by: Address,
+    pub timestamp: u64,
+}
+
+/// Rich event emitted when a previously revoked attestor is reactivated.
+#[contracttype]
+#[derive(Clone)]
+pub struct AttestorReactivatedEvent {
+    pub attestor: Address,
+    pub reactivated_by: Address,
+    pub timestamp: u64,
+}
+
+/// Event emitted when a rate limit is enforced (request dropped).
+#[contracttype]
+#[derive(Clone)]
+pub struct RateLimitHitEvent {
+    pub attestor: Address,
+    pub timestamp: u64,
+    pub ledger_sequence: u32,
+}
+
+/// Event emitted when a quote is rejected because its validity window has closed.
+#[contracttype]
+#[derive(Clone)]
+pub struct QuoteExpiredEvent {
+    pub quote_id: u64,
+    pub anchor: Address,
+    pub valid_until: u64,
+    pub expired_at: u64,
+}
+
+/// Event emitted when a webhook URL is registered for an attestor.
+#[contracttype]
+#[derive(Clone)]
+pub struct WebhookRegisteredEvent {
+    pub attestor: Address,
+    pub timestamp: u64,
+}
+
+/// Event emitted when an anchor's services are (re)configured.
+#[contracttype]
+#[derive(Clone)]
+pub struct ServicesConfiguredEvent {
+    pub anchor: Address,
+    pub service_count: u32,
+    pub capability_version: u32,
+    pub timestamp: u64,
+}
+
 // ---------------------------------------------------------------------------
 // TTLs (in ledgers)
 // ---------------------------------------------------------------------------
@@ -1202,6 +1304,13 @@ pub const MAX_OPS_PER_SESSION: u64 = 100;
 
 /// Minimum TTL for replay-protection entries (7 days in ledgers at ~5 s/ledger).
 pub const REPLAY_TTL: u32 = 120_960;
+
+/// Maximum number of attestations allowed in a single batch submission.
+pub const MAX_BATCH_SIZE: usize = 100;
+
+/// Rate-limit slot multiplier applied per attestation in a batch submission.
+/// Each attestation in a batch consumes this many slots from the rate-limit window.
+pub const BATCH_ATTESTATION_RATE_MULTIPLIER: u32 = 1;
 
 /// Inclusive lower bound for the configurable JWT max-length (set_jwt_max_len).
 const MIN_JWT_MAX_LEN: u32 = 2048;
@@ -1474,6 +1583,10 @@ impl AnchorKitContract {
         let schema_key = make_storage_key(&env, &[b"SCHEMAVER"]);
         env.storage().instance().set(&schema_key, &SCHEMA_V1);
         env.storage().instance().extend_ttl(INSTANCE_TTL, INSTANCE_TTL);
+        env.events().publish(
+            (symbol_short!("contract"), symbol_short!("init")),
+            ContractInitializedEvent { admin, timestamp: env.ledger().timestamp() },
+        );
     }
 
     /// Check if the contract has been initialized.
@@ -2597,8 +2710,8 @@ impl AnchorKitContract {
         );
 
         env.events().publish(
-            (symbol_short!("attestor"), symbol_short!("added"), attestor),
-            (),
+            (symbol_short!("attestor"), symbol_short!("added"), attestor.clone()),
+            AttestorRegisteredEvent { attestor, timestamp: env.ledger().timestamp() },
         );
     }
 
@@ -2645,27 +2758,56 @@ impl AnchorKitContract {
         if !env.storage().persistent().has(&key) {
             panic_with_error!(&env, ErrorCode::AttestorNotRegistered);
         }
-        env.storage().persistent().remove(&key);
+
+        // Read the public key before removing it so the revocation record can
+        // preserve it for a future reactivation.
         let pk_key = make_storage_key(&env, &[b"ATPUBKEY", &raw]);
+        let public_key: BytesN<32> = env
+            .storage()
+            .persistent()
+            .get(&pk_key)
+            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::AttestorNotRegistered));
+
+        // Remove the active registration keys so `check_attestor` / `is_attestor`
+        // start returning false immediately.
+        env.storage().persistent().remove(&key);
         env.storage().persistent().remove(&pk_key);
-        
+
+        // Persist a revocation record so the attestor can be safely reactivated
+        // later without needing to re-register from scratch.
+        let admin = Self::get_admin_internal(&env);
+        let revoc_record = AttestorRevocationRecord {
+            attestor: attestor.clone(),
+            revoked_at: env.ledger().timestamp(),
+            revoked_by: admin.clone(),
+            reason: String::from_str(&env, ""),
+            public_key,
+            reactivated: false,
+            reactivated_at: 0,
+        };
+        let revoc_key = (symbol_short!("ATREVOC"), attestor.clone());
+        env.storage().persistent().set(&revoc_key, &revoc_record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&revoc_key, PERSISTENT_TTL, PERSISTENT_TTL);
+
         // Decrement count
         let current_count = Self::get_attestor_count_internal(&env);
         if current_count > 0 {
             env.storage().instance().set(&Self::attestor_count_key(&env), &(current_count - 1));
-            
+
             let mut attestors_list = env.storage().instance().get::<_, soroban_sdk::Vec<Address>>(&Self::attestor_list_key(&env)).unwrap_or_else(|| soroban_sdk::Vec::new(&env));
             if let Some(idx) = attestors_list.first_index_of(&attestor) {
                 attestors_list.remove(idx);
                 env.storage().instance().set(&Self::attestor_list_key(&env), &attestors_list);
             }
-            
+
             env.storage().instance().extend_ttl(INSTANCE_TTL, INSTANCE_TTL);
         }
 
         AdminAuditLog::log_action(
             &env,
-            &Self::get_admin_internal(&env),
+            &admin,
             "revoke_attestor",
             attestor.to_string(),
             "registered",
@@ -2673,9 +2815,128 @@ impl AnchorKitContract {
         );
 
         env.events().publish(
-            (symbol_short!("attestor"), symbol_short!("removed"), attestor),
-            (),
+            (symbol_short!("attestor"), symbol_short!("removed"), attestor.clone()),
+            AttestorRevokedEvent { attestor, revoked_by: admin, timestamp: env.ledger().timestamp() },
         );
+    }
+
+    /// Reactivate an attestor that was previously revoked.
+    ///
+    /// Restores the attestor's registration and public key, allowing them to
+    /// submit attestations again. Audit history from the original revocation
+    /// is preserved. Only the primary admin or an [`AdminRole::AttestorAdmin`]
+    /// holder may call this function.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment context.
+    /// * `attestor` - Address of the attestor to reactivate.
+    ///
+    /// # Authorization
+    ///
+    /// Requires admin or `AttestorAdmin` role.
+    ///
+    /// # Errors
+    ///
+    /// Panics with:
+    /// - [`ErrorCode::AttestorNotRegistered`] if no revocation record exists for the attestor
+    /// - [`ErrorCode::AttestorAlreadyRegistered`] if the attestor is currently active
+    ///
+    /// # Side effects
+    ///
+    /// - Restores `ATTESTOR` and `ATPUBKEY` storage entries
+    /// - Marks the revocation record as reactivated with a timestamp
+    /// - Emits `attestor.restored` event
+    /// - Writes an admin audit log entry
+    pub fn reactivate_attestor(env: Env, attestor: Address) {
+        Self::require_admin(&env);
+
+        let xdr = attestor.clone().to_xdr(&env);
+        let raw = xdr_to_vec(&xdr);
+        let active_key = make_storage_key(&env, &[b"ATTESTOR", &raw]);
+
+        // Fail early if already active — nothing to recover.
+        if env.storage().persistent().has(&active_key) {
+            panic_with_error!(&env, ErrorCode::AttestorAlreadyRegistered);
+        }
+
+        // Load the revocation record — this is our proof of a prior valid registration.
+        let revoc_key = (symbol_short!("ATREVOC"), attestor.clone());
+        let mut revoc_record: AttestorRevocationRecord = env
+            .storage()
+            .persistent()
+            .get(&revoc_key)
+            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::AttestorNotRegistered));
+
+        // Restore the active registration flag and public key.
+        env.storage().persistent().set(&active_key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&active_key, PERSISTENT_TTL, PERSISTENT_TTL);
+
+        let pk_key = make_storage_key(&env, &[b"ATPUBKEY", &raw]);
+        env.storage().persistent().set(&pk_key, &revoc_record.public_key);
+        env.storage()
+            .persistent()
+            .extend_ttl(&pk_key, PERSISTENT_TTL, PERSISTENT_TTL);
+
+        // Update the revocation record to record reactivation timestamp.
+        revoc_record.reactivated = true;
+        revoc_record.reactivated_at = env.ledger().timestamp();
+        env.storage().persistent().set(&revoc_key, &revoc_record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&revoc_key, PERSISTENT_TTL, PERSISTENT_TTL);
+
+        // Add back to the active attestors list and increment count.
+        let current_count = Self::get_attestor_count_internal(&env);
+        env.storage().instance().set(&Self::attestor_count_key(&env), &(current_count + 1));
+
+        let mut attestors_list = env
+            .storage()
+            .instance()
+            .get::<_, soroban_sdk::Vec<Address>>(&Self::attestor_list_key(&env))
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+        if !attestors_list.contains(&attestor) {
+            attestors_list.push_back(attestor.clone());
+            env.storage().instance().set(&Self::attestor_list_key(&env), &attestors_list);
+        }
+        env.storage().instance().extend_ttl(INSTANCE_TTL, INSTANCE_TTL);
+
+        let admin = Self::get_admin_internal(&env);
+        AdminAuditLog::log_action(
+            &env,
+            &admin,
+            "reactivate_attestor",
+            attestor.to_string(),
+            "revoked",
+            "registered",
+        );
+
+        env.events().publish(
+            (symbol_short!("attestor"), symbol_short!("restored"), attestor.clone()),
+            AttestorReactivatedEvent { attestor, reactivated_by: admin, timestamp: env.ledger().timestamp() },
+        );
+    }
+
+    /// Return the revocation record for an attestor, if one exists.
+    ///
+    /// Returns `Some(AttestorRevocationRecord)` when the attestor has been
+    /// revoked at least once.  The record's `reactivated` field indicates
+    /// whether the attestor is currently active again.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment context.
+    /// * `attestor` - Address of the attestor to query.
+    ///
+    /// # Returns
+    ///
+    /// `Some(AttestorRevocationRecord)` if found, `None` if the attestor was
+    /// never revoked.
+    pub fn get_attestor_revocation_info(env: Env, attestor: Address) -> Option<AttestorRevocationRecord> {
+        let revoc_key = (symbol_short!("ATREVOC"), attestor);
+        env.storage().persistent().get(&revoc_key)
     }
 
     /// Check if an address is a registered attestor.
@@ -2924,10 +3185,7 @@ impl AnchorKitContract {
         Self::save_profile(&env, &profile);
         env.events().publish(
             (symbol_short!("webhook"), symbol_short!("reg")),
-            EndpointUpdated {
-                attestor,
-                endpoint: webhook_url,
-            },
+            WebhookRegisteredEvent { attestor, timestamp: env.ledger().timestamp() },
         );
     }
 
@@ -3133,11 +3391,19 @@ impl AnchorKitContract {
 
         // Also sync services into the unified AttestorProfile.
         let mut profile = Self::load_or_init_profile(&env, &anchor);
-        profile.services = normalized;
+        profile.services = normalized.clone();
         profile.updated_at = env.ledger().timestamp();
         Self::save_profile(&env, &profile);
 
-        env.events().publish((symbol_short!("services"), symbol_short!("config")), record);
+        env.events().publish(
+            (symbol_short!("services"), symbol_short!("config"), anchor.clone()),
+            ServicesConfiguredEvent {
+                anchor,
+                service_count: normalized.len() as u32,
+                capability_version: version,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
     }
 
     /// The service-capability schema version this contract understands.
@@ -3595,6 +3861,9 @@ impl AnchorKitContract {
             .persistent()
             .extend_ttl(&used_key, REPLAY_TTL, REPLAY_TTL);
 
+        // Record accepted event for observability metrics.
+        replay_detection::record_accepted_event(&env);
+
         env.events().publish(
             (symbol_short!("attest"), symbol_short!("recorded"), id, subject),
             AttestEvent {
@@ -3625,7 +3894,7 @@ impl AnchorKitContract {
 
         let batch_size = attestations.len() as usize;
         if batch_size > MAX_BATCH_SIZE {
-            panic_with_error!(&env, ErrorCode::ValidationError);
+            panic_with_error!(&env, ErrorCode::BatchSizeExceeded);
         }
 
         if batch_size == 0 {
@@ -3720,7 +3989,7 @@ impl AnchorKitContract {
                 match kyc_status {
                     KycStatus::Pending => panic_with_error!(&env, ErrorCode::KycPending),
                     KycStatus::Rejected => panic_with_error!(&env, ErrorCode::KycRejected),
-                    KycStatus::Expired => panic_with_error!(&env, ErrorCode::ComplianceNotMet),
+                    KycStatus::Expired => panic_with_error!(&env, ErrorCode::KycExpired),
                     KycStatus::NotSubmitted => panic_with_error!(&env, ErrorCode::KycNotFound),
                     _ => panic_with_error!(&env, ErrorCode::ComplianceNotMet),
                 }
@@ -3775,6 +4044,8 @@ impl AnchorKitContract {
                 payload_hash,
             },
         );
+        // Record accepted event for observability metrics.
+        replay_detection::record_accepted_event(&env);
         id
     }
 
@@ -3839,6 +4110,8 @@ impl AnchorKitContract {
                 transaction_id: id, timestamp, payload_hash,
             },
         );
+        // Record accepted event for observability metrics.
+        replay_detection::record_accepted_event(&env);
         id
     }
 
@@ -4920,6 +5193,16 @@ impl AnchorKitContract {
         let quote: Quote = env.storage().persistent().get(&q_key)
             .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::QuoteNotFound));
 
+        // Reject the quote if its validity window has closed.
+        let now = env.ledger().timestamp();
+        if quote.valid_until <= now {
+            env.events().publish(
+                (symbol_short!("quote"), symbol_short!("expired"), quote_id),
+                QuoteExpiredEvent { quote_id, anchor: anchor.clone(), valid_until: quote.valid_until, expired_at: now },
+            );
+            panic_with_error!(&env, ErrorCode::QuoteExpired);
+        }
+
         // #297: Enforce compliance gating if required
         if require_compliance {
             let comp_key = compliance_check_key(&env, &receiver, &String::from_str(&env, "kyc"));
@@ -5042,6 +5325,8 @@ impl AnchorKitContract {
                 result_data: 0,
             },
         );
+        // Record accepted event for observability metrics.
+        replay_detection::record_accepted_event(&env);
         id
     }
 
@@ -5097,7 +5382,10 @@ impl AnchorKitContract {
         env.storage().persistent().set(&slog_key, &log_id);
         env.storage().persistent().extend_ttl(&slog_key, PERSISTENT_TTL, PERSISTENT_TTL);
 
-        env.events().publish((symbol_short!("attestor"), symbol_short!("added"), attestor), ());
+        env.events().publish(
+            (symbol_short!("attestor"), symbol_short!("added"), attestor.clone()),
+            AttestorRegisteredEvent { attestor, timestamp: env.ledger().timestamp() },
+        );
         env.events().publish(
             (symbol_short!("audit"), symbol_short!("logged"), log_id),
             AuditLogEvent {
@@ -5159,7 +5447,14 @@ impl AnchorKitContract {
         env.storage().persistent().set(&slog_key, &log_id);
         env.storage().persistent().extend_ttl(&slog_key, PERSISTENT_TTL, PERSISTENT_TTL);
 
-        env.events().publish((symbol_short!("attestor"), symbol_short!("removed"), attestor), ());
+        env.events().publish(
+            (symbol_short!("attestor"), symbol_short!("removed"), attestor.clone()),
+            AttestorRevokedEvent {
+                attestor,
+                revoked_by: operator,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
         env.events().publish(
             (symbol_short!("audit"), symbol_short!("logged"), log_id),
             AuditLogEvent {
@@ -6332,7 +6627,7 @@ impl AnchorKitContract {
                 match kyc_status {
                     KycStatus::Pending      => panic_with_error!(&env, ErrorCode::KycPending),
                     KycStatus::Rejected     => panic_with_error!(&env, ErrorCode::KycRejected),
-                    KycStatus::Expired      => panic_with_error!(&env, ErrorCode::ComplianceNotMet),
+                    KycStatus::Expired      => panic_with_error!(&env, ErrorCode::KycExpired),
                     KycStatus::NotSubmitted => panic_with_error!(&env, ErrorCode::KycNotFound),
                     _ => panic_with_error!(&env, ErrorCode::ComplianceNotMet),
                 }
@@ -7109,6 +7404,14 @@ impl AnchorKitContract {
             .map(|r| Symbol::new(env, Self::role_name(*r)));
         let config = RateLimiter::resolve_config(env, attestor, role);
         if RateLimiter::check_and_increment(env, attestor, &config).is_err() {
+            env.events().publish(
+                (symbol_short!("ratelimit"), symbol_short!("hit"), attestor.clone()),
+                RateLimitHitEvent {
+                    attestor: attestor.clone(),
+                    timestamp: env.ledger().timestamp(),
+                    ledger_sequence: env.ledger().sequence(),
+                },
+            );
             panic_with_error!(env, ErrorCode::RateLimitExceeded);
         }
     }
@@ -7210,6 +7513,12 @@ impl AnchorKitContract {
             .persistent()
             .has(&make_storage_key(env, &[b"ATTESTOR", &raw]))
         {
+            // Distinguish revoked attestors (have a revocation record but no active
+            // registration key) from ones that were never registered at all.
+            let revoc_key = (symbol_short!("ATREVOC"), attestor.clone());
+            if env.storage().persistent().has(&revoc_key) {
+                panic_with_error!(env, ErrorCode::AttestorRevoked);
+            }
             panic_with_error!(env, ErrorCode::AttestorNotRegistered);
         }
     }
@@ -7345,10 +7654,10 @@ impl AnchorKitContract {
             .get(&make_storage_key(env, &[b"ATPUBKEY", &raw]))
             .unwrap_or_else(|| panic_with_error!(env, ErrorCode::UnauthorizedAttestor));
         if signature.len() != 64 {
-            panic_with_error!(env, ErrorCode::UnauthorizedAttestor);
+            panic_with_error!(env, ErrorCode::SignatureVerificationFailed);
         }
         let signature_bytes: BytesN<64> = signature.clone().try_into().unwrap_or_else(|_| {
-            panic_with_error!(env, ErrorCode::UnauthorizedAttestor)
+            panic_with_error!(env, ErrorCode::SignatureVerificationFailed)
         });
         env.crypto()
             .ed25519_verify(&pk, payload_hash, &signature_bytes);
