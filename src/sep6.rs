@@ -9,6 +9,58 @@ use alloc::string::String;
 use crate::errors::Error;
 use crate::errors::normalize_asset_code;
 
+// ── Status classification ─────────────────────────────────────────────────────
+
+/// High-level category that a [`TransactionStatus`] belongs to.
+///
+/// Clients can use this to make decisions without matching on every individual
+/// status variant.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StatusCategory {
+    /// The transaction is still being processed (pending, incomplete, waiting).
+    Active,
+    /// The transaction completed successfully.
+    Completed,
+    /// The transaction was refunded.
+    Refunded,
+    /// The transaction expired.
+    Expired,
+    /// The transaction failed or cannot proceed (error, no_market, too_small,
+    /// too_large).
+    Failed,
+    /// The status is not recognised.
+    Unknown,
+}
+
+/// Classify a raw status string into a [`StatusCategory`].
+///
+/// The input is trimmed and lowercased before matching, so minor formatting
+/// differences from anchors do not cause misclassification.
+///
+/// Anchors that return unexpected status strings receive
+/// [`StatusCategory::Unknown`] rather than being silently treated as
+/// successful.
+pub fn classify_status_str(s: &str) -> StatusCategory {
+    let normalized = s.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "pending_external"
+        | "pending_anchor"
+        | "pending_trust"
+        | "pending_user"
+        | "pending_user_transfer_start"
+        | "pending_user_transfer_complete"
+        | "pending_stellar"
+        | "waiting_customer_action"
+        | "incomplete"
+        | "pending" => StatusCategory::Active,
+        "completed" => StatusCategory::Completed,
+        "refunded" => StatusCategory::Refunded,
+        "expired" => StatusCategory::Expired,
+        "no_market" | "too_small" | "too_large" | "error" => StatusCategory::Failed,
+        _ => StatusCategory::Unknown,
+    }
+}
+
 // ── Normalized response types ────────────────────────────────────────────────
 
 /// Normalized status values across all SEP-6 anchors.
@@ -52,6 +104,9 @@ pub enum TransactionStatus {
 impl TransactionStatus {
     /// Parse a raw anchor status string into a [`TransactionStatus`] variant.
     ///
+    /// The input is trimmed and lowercased first to tolerate minor formatting
+    /// differences across anchor implementations.
+    ///
     /// Unrecognised strings map to [`TransactionStatus::Error`].
     ///
     /// # Arguments
@@ -68,10 +123,12 @@ impl TransactionStatus {
     /// use anchorkit::TransactionStatus;
     ///
     /// assert_eq!(TransactionStatus::from_str("pending_external"), TransactionStatus::PendingExternal);
+    /// assert_eq!(TransactionStatus::from_str("  PENDING_EXTERNAL  "), TransactionStatus::PendingExternal);
     /// assert_eq!(TransactionStatus::from_str("garbage"), TransactionStatus::Error);
     /// ```
     pub fn from_str(s: &str) -> Self {
-        match s {
+        let s = s.trim().to_ascii_lowercase();
+        match s.as_str() {
             "pending_external" => Self::PendingExternal,
             "pending_anchor" => Self::PendingAnchor,
             "pending_trust" => Self::PendingTrust,
@@ -122,6 +179,34 @@ impl TransactionStatus {
             Self::PendingStellar => "pending_stellar",
             Self::WaitingCustomerAction => "waiting_customer_action",
             Self::Error => "error",
+        }
+    }
+
+    /// Classify this status into a [`StatusCategory`].
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use anchorkit::{TransactionStatus, StatusCategory};
+    ///
+    /// assert_eq!(TransactionStatus::Completed.classify(), StatusCategory::Completed);
+    /// assert_eq!(TransactionStatus::Error.classify(), StatusCategory::Failed);
+    /// assert_eq!(TransactionStatus::Pending.classify(), StatusCategory::Active);
+    /// ```
+    pub fn classify(&self) -> StatusCategory {
+        match self {
+            Self::Pending
+            | Self::Incomplete
+            | Self::PendingExternal
+            | Self::PendingAnchor
+            | Self::PendingTrust
+            | Self::PendingUser
+            | Self::PendingStellar
+            | Self::WaitingCustomerAction => StatusCategory::Active,
+            Self::Completed => StatusCategory::Completed,
+            Self::Refunded => StatusCategory::Refunded,
+            Self::Expired => StatusCategory::Expired,
+            Self::NoMarket | Self::TooSmall | Self::TooLarge | Self::Error => StatusCategory::Failed,
         }
     }
 }
@@ -315,6 +400,14 @@ fn validate_memo_pair(memo: Option<&str>, memo_type: Option<&str>) -> Result<(),
 /// Validates that the required fields `transaction_id` and `how` are non-empty,
 /// then maps optional fields and normalises the status string.
 ///
+/// # Edge-case handling
+///
+/// - Empty or whitespace-only status string defaults to [`TransactionStatus::Pending`].
+/// - Status is trimmed and lowercased before matching.
+/// - If both `min_amount` and `max_amount` are present, `min_amount <= max_amount`
+///   is enforced; violation returns [`Error::InvalidTransactionIntent`].
+/// - Asset codes are normalized to uppercase.
+///
 /// # Arguments
 ///
 /// * `raw` - A [`RawDepositResponse`] populated from the anchor's `/deposit` endpoint.
@@ -325,7 +418,8 @@ fn validate_memo_pair(memo: Option<&str>, memo_type: Option<&str>) -> Result<(),
 ///
 /// # Errors
 ///
-/// Returns [`Error::InvalidTransactionIntent`] if `transaction_id` or `how` is empty.
+/// Returns [`Error::InvalidTransactionIntent`] if `transaction_id` or `how` is empty,
+/// or if `min_amount > max_amount` when both are present.
 ///
 /// # Examples
 ///
@@ -354,6 +448,11 @@ pub fn initiate_deposit(raw: RawDepositResponse) -> Result<DepositResponse, Erro
     if raw.transaction_id.is_empty() || raw.how.is_empty() {
         return Err(Error::invalid_transaction_intent());
     }
+    if let (Some(min), Some(max)) = (raw.min_amount, raw.max_amount) {
+        if min > max {
+            return Err(Error::invalid_transaction_intent());
+        }
+    }
     validate_memo_pair(raw.stellar_memo.as_deref(), raw.stellar_memo_type.as_deref())?;
     let asset_code = raw.asset_code.as_deref()
         .map(normalize_asset_code)
@@ -369,6 +468,7 @@ pub fn initiate_deposit(raw: RawDepositResponse) -> Result<DepositResponse, Erro
         status: raw
             .status
             .as_deref()
+            .filter(|s| !s.trim().is_empty())
             .map(TransactionStatus::from_str)
             .unwrap_or(TransactionStatus::Pending),
         clawback_enabled: raw.clawback_enabled,
@@ -383,6 +483,14 @@ pub fn initiate_deposit(raw: RawDepositResponse) -> Result<DepositResponse, Erro
 /// Validates that `transaction_id` and `account_id` are non-empty, then maps
 /// optional fields and normalises the status string.
 ///
+/// # Edge-case handling
+///
+/// - Empty or whitespace-only status string defaults to [`TransactionStatus::Pending`].
+/// - Status is trimmed and lowercased before matching.
+/// - If both `min_amount` and `max_amount` are present, `min_amount <= max_amount`
+///   is enforced; violation returns [`Error::InvalidTransactionIntent`].
+/// - Asset codes are normalized to uppercase.
+///
 /// # Arguments
 ///
 /// * `raw` - A [`RawWithdrawalResponse`] populated from the anchor's `/withdraw` endpoint.
@@ -393,7 +501,8 @@ pub fn initiate_deposit(raw: RawDepositResponse) -> Result<DepositResponse, Erro
 ///
 /// # Errors
 ///
-/// Returns [`Error::InvalidTransactionIntent`] if `transaction_id` or `account_id` is empty.
+/// Returns [`Error::InvalidTransactionIntent`] if `transaction_id` or `account_id` is empty,
+/// or if `min_amount > max_amount` when both are present.
 ///
 /// # Examples
 ///
@@ -418,6 +527,11 @@ pub fn initiate_withdrawal(raw: RawWithdrawalResponse) -> Result<WithdrawalRespo
     if raw.transaction_id.is_empty() || raw.account_id.is_empty() {
         return Err(Error::invalid_transaction_intent());
     }
+    if let (Some(min), Some(max)) = (raw.min_amount, raw.max_amount) {
+        if min > max {
+            return Err(Error::invalid_transaction_intent());
+        }
+    }
     validate_memo_pair(raw.memo.as_deref(), raw.memo_type.as_deref())?;
     let asset_code = raw.asset_code.as_deref()
         .map(normalize_asset_code)
@@ -434,6 +548,7 @@ pub fn initiate_withdrawal(raw: RawWithdrawalResponse) -> Result<WithdrawalRespo
         status: raw
             .status
             .as_deref()
+            .filter(|s| !s.trim().is_empty())
             .map(TransactionStatus::from_str)
             .unwrap_or(TransactionStatus::Pending),
         asset_code,
@@ -442,6 +557,13 @@ pub fn initiate_withdrawal(raw: RawWithdrawalResponse) -> Result<WithdrawalRespo
 
 /// Normalize a raw anchor transaction-status response into a canonical
 /// [`TransactionStatusResponse`].
+///
+/// # Edge-case handling
+///
+/// - Empty or whitespace-only status is treated as [`TransactionStatus::Error`].
+/// - Status string is trimmed and lowercased before matching.
+/// - Missing `kind` defaults to [`TransactionKind::Deposit`].
+/// - Non-retryable missing `transaction_id` returns an error.
 ///
 /// # Arguments
 ///
@@ -486,7 +608,11 @@ pub fn fetch_transaction_status(
             .as_deref()
             .map(TransactionKind::from_str)
             .unwrap_or(TransactionKind::Deposit),
-        status: TransactionStatus::from_str(&raw.status),
+        status: if raw.status.trim().is_empty() {
+            TransactionStatus::Error
+        } else {
+            TransactionStatus::from_str(&raw.status)
+        },
         amount_in: raw.amount_in,
         amount_out: raw.amount_out,
         amount_fee: raw.amount_fee,
@@ -1036,6 +1162,170 @@ mod tests {
                 |_| {},
             );
             assert!(matches!(result, PollResult::Completed(_)), "expected Completed for {:?}", status);
+        }
+    }
+
+    // ── #614 Status classification ─────────────────────────────────────────
+
+    #[test]
+    fn test_transaction_status_classify_active() {
+        for status in &[
+            TransactionStatus::Pending,
+            TransactionStatus::Incomplete,
+            TransactionStatus::PendingExternal,
+            TransactionStatus::PendingAnchor,
+            TransactionStatus::PendingTrust,
+            TransactionStatus::PendingUser,
+            TransactionStatus::PendingStellar,
+            TransactionStatus::WaitingCustomerAction,
+        ] {
+            assert_eq!(status.classify(), StatusCategory::Active, "expected Active for {:?}", status);
+        }
+    }
+
+    #[test]
+    fn test_transaction_status_classify_completed() {
+        assert_eq!(TransactionStatus::Completed.classify(), StatusCategory::Completed);
+    }
+
+    #[test]
+    fn test_transaction_status_classify_refunded() {
+        assert_eq!(TransactionStatus::Refunded.classify(), StatusCategory::Refunded);
+    }
+
+    #[test]
+    fn test_transaction_status_classify_expired() {
+        assert_eq!(TransactionStatus::Expired.classify(), StatusCategory::Expired);
+    }
+
+    #[test]
+    fn test_transaction_status_classify_failed() {
+        for status in &[
+            TransactionStatus::NoMarket,
+            TransactionStatus::TooSmall,
+            TransactionStatus::TooLarge,
+            TransactionStatus::Error,
+        ] {
+            assert_eq!(status.classify(), StatusCategory::Failed, "expected Failed for {:?}", status);
+        }
+    }
+
+    #[test]
+    fn test_classify_status_str_all_categories() {
+        assert_eq!(classify_status_str("pending"), StatusCategory::Active);
+        assert_eq!(classify_status_str("completed"), StatusCategory::Completed);
+        assert_eq!(classify_status_str("refunded"), StatusCategory::Refunded);
+        assert_eq!(classify_status_str("expired"), StatusCategory::Expired);
+        assert_eq!(classify_status_str("error"), StatusCategory::Failed);
+        assert_eq!(classify_status_str("no_market"), StatusCategory::Failed);
+        assert_eq!(classify_status_str("too_small"), StatusCategory::Failed);
+        assert_eq!(classify_status_str("too_large"), StatusCategory::Failed);
+        assert_eq!(classify_status_str("garbage_status"), StatusCategory::Unknown);
+        assert_eq!(classify_status_str(""), StatusCategory::Unknown);
+    }
+
+    #[test]
+    fn test_classify_status_str_normalizes_input() {
+        assert_eq!(classify_status_str("  COMPLETED  "), StatusCategory::Completed);
+        assert_eq!(classify_status_str("PENDING_EXTERNAL"), StatusCategory::Active);
+        assert_eq!(classify_status_str("  pending_user  "), StatusCategory::Active);
+    }
+
+    // ── #613 Edge-case normalization ─────────────────────────────────────────
+
+    #[test]
+    fn test_status_from_str_case_insensitive() {
+        assert_eq!(TransactionStatus::from_str("COMPLETED"), TransactionStatus::Completed);
+        assert_eq!(TransactionStatus::from_str("Pending_External"), TransactionStatus::PendingExternal);
+        assert_eq!(TransactionStatus::from_str("  PENDING  "), TransactionStatus::Pending);
+    }
+
+    #[test]
+    fn test_initiate_deposit_empty_status_defaults_to_pending() {
+        let mut raw = raw_deposit();
+        raw.status = Some("".to_string());
+        let resp = initiate_deposit(raw).unwrap();
+        assert_eq!(resp.status, TransactionStatus::Pending);
+    }
+
+    #[test]
+    fn test_initiate_deposit_whitespace_status_defaults_to_pending() {
+        let mut raw = raw_deposit();
+        raw.status = Some("   ".to_string());
+        let resp = initiate_deposit(raw).unwrap();
+        assert_eq!(resp.status, TransactionStatus::Pending);
+    }
+
+    #[test]
+    fn test_initiate_withdrawal_empty_status_defaults_to_pending() {
+        let mut raw = raw_withdrawal();
+        raw.status = Some("".to_string());
+        let resp = initiate_withdrawal(raw).unwrap();
+        assert_eq!(resp.status, TransactionStatus::Pending);
+    }
+
+    #[test]
+    fn test_fetch_transaction_status_empty_status_maps_to_error() {
+        let mut raw = raw_tx_status();
+        raw.status = "".to_string();
+        let resp = fetch_transaction_status(raw).unwrap();
+        assert_eq!(resp.status, TransactionStatus::Error);
+    }
+
+    #[test]
+    fn test_fetch_transaction_status_whitespace_status_maps_to_error() {
+        let mut raw = raw_tx_status();
+        raw.status = "   ".to_string();
+        let resp = fetch_transaction_status(raw).unwrap();
+        assert_eq!(resp.status, TransactionStatus::Error);
+    }
+
+    #[test]
+    fn test_initiate_deposit_min_amount_gt_max_amount_rejected() {
+        let mut raw = raw_deposit();
+        raw.min_amount = Some(100);
+        raw.max_amount = Some(10);
+        assert_eq!(initiate_deposit(raw), Err(Error::invalid_transaction_intent()));
+    }
+
+    #[test]
+    fn test_initiate_deposit_min_amount_eq_max_amount_accepted() {
+        let mut raw = raw_deposit();
+        raw.min_amount = Some(100);
+        raw.max_amount = Some(100);
+        assert!(initiate_deposit(raw).is_ok());
+    }
+
+    #[test]
+    fn test_initiate_withdrawal_min_amount_gt_max_amount_rejected() {
+        let mut raw = raw_withdrawal();
+        raw.min_amount = Some(100);
+        raw.max_amount = Some(10);
+        assert_eq!(initiate_withdrawal(raw), Err(Error::invalid_transaction_intent()));
+    }
+
+    #[test]
+    fn test_initiate_withdrawal_min_amount_eq_max_amount_accepted() {
+        let mut raw = raw_withdrawal();
+        raw.min_amount = Some(50);
+        raw.max_amount = Some(50);
+        assert!(initiate_withdrawal(raw).is_ok());
+    }
+
+    #[test]
+    fn test_status_case_variants_mapped_correctly() {
+        for (input, expected) in &[
+            ("pending_external", TransactionStatus::PendingExternal),
+            ("PENDING_EXTERNAL", TransactionStatus::PendingExternal),
+            ("Pending_Anchor", TransactionStatus::PendingAnchor),
+            ("  PENDING_TRUST  ", TransactionStatus::PendingTrust),
+            ("PENDING_USER_TRANSFER_START", TransactionStatus::PendingUser),
+            ("Pending_User_Transfer_Complete", TransactionStatus::PendingUser),
+            ("NO_MARKET", TransactionStatus::NoMarket),
+            ("TOO_SMALL", TransactionStatus::TooSmall),
+            ("TOO_LARGE", TransactionStatus::TooLarge),
+        ] {
+            assert_eq!(TransactionStatus::from_str(input), *expected, "mismatch for '{}'", input);
         }
     }
 }

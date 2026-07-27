@@ -208,8 +208,13 @@ pub use response_validator::{
     validate_anchor_info_response, validate_deposit_response, validate_quote_response,
     validate_sep38_quote_response, validate_withdraw_response, validate_stellar_asset,
     validate_stellar_account_id, normalize_stellar_account_id,
+    validate_transaction_status_response, validate_transaction_status_response_v2,
+    validate_deposit_with_version, validate_withdraw_with_version, validate_quote_with_version,
+    validate_sep38_quote_with_version, validate_anchor_info_with_version,
+    validate_transaction_status_with_version,
     AnchorInfoResponse, DepositResponse as ValidatorDepositResponse, QuoteResponse,
-    Sep38QuoteResponse, WithdrawResponse,
+    Sep38QuoteResponse, WithdrawResponse, TransactionStatusResponseValidated,
+    SchemaVersion, VALIDATOR_SCHEMA_V1,
 };
 #[cfg(not(feature = "wasm"))]
 pub use webhook::{deliver_webhook, get_dead_letter_webhooks, query_dlq, verify_webhook_signature, WebhookDeliveryConfig, DlqEntry};
@@ -221,6 +226,7 @@ pub use sep6::{
     RawDepositResponse, RawTransactionResponse, RawWithdrawalResponse, TransactionKind,
     TransactionStatus, TransactionStatusResponse, WithdrawalResponse,
     poll_transaction_status, PollConfig, PollResult,
+    StatusCategory, classify_status_str,
 };
 #[cfg(not(feature = "wasm"))]
 pub use sep31::{
