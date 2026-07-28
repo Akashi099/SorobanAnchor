@@ -108,6 +108,12 @@ All Rust dependencies are pinned to exact versions in `Cargo.toml` and
 
 ## Security Practices for Contributors
 
+Contributors and reviewers working on changes that touch authentication,
+cryptography, authorization paths, or HTTP integrations should consult the
+[Security Review Checklist](SECURITY_REVIEW_CHECKLIST.md) before opening or
+approving a PR. The checklist codifies the specific checks required for each
+risk category present in this codebase.
+
 ### General
 
 - **Never commit secrets.** Use environment variables or a secrets manager.
