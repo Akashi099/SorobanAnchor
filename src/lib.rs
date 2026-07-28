@@ -221,6 +221,11 @@ pub use response_validator::{
     AnchorInfoResponse, DepositResponse as ValidatorDepositResponse, QuoteResponse,
     Sep38QuoteResponse, WithdrawResponse, TransactionStatusResponseValidated,
     SchemaVersion, VALIDATOR_SCHEMA_V1,
+    // Issue #661: response shape compatibility checks for older anchors
+    CompatibilityLevel, CompatibilityReport,
+    check_deposit_compatibility, check_withdraw_compatibility,
+    check_sep38_quote_compatibility, check_anchor_info_compatibility,
+    check_transaction_status_compatibility,
 };
 #[cfg(not(feature = "wasm"))]
 pub use webhook::{deliver_webhook, get_dead_letter_webhooks, query_dlq, verify_webhook_signature, WebhookDeliveryConfig, DlqEntry};
@@ -254,6 +259,12 @@ pub use admin_audit_log::{AdminAuditLog, AdminConfigChangeEvent, AdminAuditLogCo
 pub use contract::{HealthStatus, MetadataFreshnessReport, RateLimiterHealth};
 pub use contract::{AnchorHealthMetrics, AnchorProofRecord};
 pub use transaction_state_tracker::{BudgetStatus, BudgetAlert};
+// Issue #657: multi-anchor reputation weighting
+pub use contract::{AnchorReputationRecord, ReputationWeights};
+// Issue #658: time-based routing policies
+pub use contract::{RoutingTimeWindow, TimedRoutingPolicy};
+// Issue #659: per-network routing profiles
+pub use contract::NetworkRoutingProfile;
 #[cfg(not(feature = "wasm"))]
 pub use sep38::{CrossAnchorFeeAggregator, FeeAnomalyReport};
 #[cfg(not(feature = "wasm"))]
