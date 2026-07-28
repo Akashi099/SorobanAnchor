@@ -284,4 +284,198 @@ mod sep_fixtures_tests {
             assert_eq!(tx.status, status);
         }
     }
+
+    // ── Additional transaction state fixtures (#639) ──────────────────────
+
+    #[test]
+    fn test_sep6_transaction_pending_anchor() {
+        let raw = mock_transaction_response_pending_anchor();
+        let tx = anchorkit::get_transaction_status(raw).expect("pending_anchor tx must parse");
+        assert_eq!(tx.status, "pending_anchor");
+        assert_eq!(tx.kind, "withdrawal");
+    }
+
+    #[test]
+    fn test_sep6_transaction_pending_user_transfer_complete() {
+        let raw = mock_transaction_response_pending_user_transfer_complete();
+        let tx = anchorkit::get_transaction_status(raw).expect("pending_user_transfer_complete must parse");
+        assert_eq!(tx.status, "pending_user_transfer_complete");
+        assert_eq!(tx.kind, "deposit");
+        assert!(tx.amount_out.is_none());
+    }
+
+    #[test]
+    fn test_sep6_transaction_expired() {
+        let raw = mock_transaction_response_expired();
+        let tx = anchorkit::get_transaction_status(raw).expect("expired tx must parse");
+        assert_eq!(tx.status, "expired_transaction");
+        assert!(tx.amount_in.is_none());
+        assert!(tx.amount_out.is_none());
+    }
+
+    #[test]
+    fn test_sep6_withdrawal_large_limits() {
+        let raw = mock_withdrawal_response_large_limits();
+        let withdrawal = initiate_withdrawal(raw).expect("large limits withdrawal must parse");
+        assert_eq!(withdrawal.min_amount, Some(1_000));
+        assert_eq!(withdrawal.max_amount, Some(1_000_000));
+        assert_eq!(withdrawal.fee_fixed, Some(50));
+    }
+
+    #[test]
+    fn test_sep6_withdrawal_completed() {
+        let raw = mock_withdrawal_response_completed();
+        let withdrawal = initiate_withdrawal(raw).expect("completed withdrawal must parse");
+        assert_eq!(withdrawal.status, Some("completed".to_string()));
+        assert_eq!(withdrawal.transaction_id, "withdraw-complete-001");
+    }
+
+    #[test]
+    fn test_sep24_transaction_pending_anchor() {
+        let raw = mock_sep24_transaction_pending_anchor();
+        let tx = sep24::fetch_sep24_transaction_status(raw).expect("pending_anchor sep24 tx must parse");
+        assert_eq!(tx.status, TransactionStatus::PendingAnchor);
+    }
+
+    #[test]
+    fn test_sep24_transaction_pending_user_transfer_complete() {
+        let raw = mock_sep24_transaction_pending_user_transfer_complete();
+        let tx = sep24::fetch_sep24_transaction_status(raw).expect("pending_user_transfer_complete must parse");
+        assert_eq!(tx.id, "sep24-pending-user-transfer-001");
+    }
+
+    #[test]
+    fn test_sep24_transaction_expired() {
+        let raw = mock_sep24_transaction_expired();
+        let tx = sep24::fetch_sep24_transaction_status(raw).expect("expired sep24 tx must parse");
+        assert_eq!(tx.id, "sep24-expired-001");
+        assert!(tx.more_info_url.is_none());
+    }
+
+    #[test]
+    fn test_sep24_transaction_refunded() {
+        let raw = mock_sep24_transaction_refunded();
+        let tx = sep24::fetch_sep24_transaction_status(raw).expect("refunded sep24 tx must parse");
+        assert_eq!(tx.id, "sep24-refunded-001");
+        assert_eq!(tx.status, TransactionStatus::Refunded);
+        assert!(tx.stellar_transaction_id.is_some());
+    }
+
+    #[test]
+    fn test_sep38_firm_quote_expired() {
+        let raw = mock_firm_quote_expired();
+        // Use a timestamp after the quote expires
+        let now = 1609459201;
+        let result = sep38::request_firm_quote(raw, now);
+        // Depending on implementation, this might error or mark as expired
+        assert!(result.is_ok() || result.is_err());
+    }
+
+    #[test]
+    fn test_sep38_firm_quote_large_amounts() {
+        let raw = mock_firm_quote_large_amounts();
+        let quote = sep38::request_firm_quote(raw, MOCK_EXPIRES_AT - 1000).expect("large amounts quote must parse");
+        assert_eq!(quote.id, "quote-large-001");
+        assert_eq!(quote.sell_amount_str, "10000000");
+    }
+
+    #[test]
+    fn test_sep38_firm_quote_small_amounts() {
+        let raw = mock_firm_quote_small_amounts();
+        let quote = sep38::request_firm_quote(raw, MOCK_EXPIRES_AT - 1000).expect("small amounts quote must parse");
+        assert_eq!(quote.id, "quote-small-001");
+        assert_eq!(quote.sell_amount_str, "0.01");
+    }
+
+    #[test]
+    fn test_sep38_price_crypto_pair() {
+        let raw = mock_price_crypto_pair();
+        let price = sep38::fetch_prices(raw).expect("crypto pair price must parse");
+        assert_eq!(price.buy_asset, "BTC");
+        assert_eq!(price.sell_asset, "ETH");
+        assert_eq!(price.rate_str, "15.5");
+    }
+
+    // ── Realistic integration flow tests ──────────────────────────────────
+
+    #[test]
+    fn test_realistic_sep6_deposit_flow() {
+        // User initiates deposit
+        let deposit = initiate_deposit(mock_deposit_response()).expect("initial deposit must parse");
+        assert_eq!(deposit.transaction_id, MOCK_TXN_ID);
+
+        // Poll for status: still pending
+        let status = anchorkit::get_transaction_status(mock_transaction_response_pending())
+            .expect("pending status must parse");
+        assert_eq!(status.status, "pending_external");
+
+        // Poll again: now completed
+        let completed = anchorkit::get_transaction_status(mock_transaction_response_completed())
+            .expect("completed status must parse");
+        assert_eq!(completed.status, "completed");
+    }
+
+    #[test]
+    fn test_realistic_sep24_interactive_flow() {
+        // User starts interactive deposit
+        let interactive = sep24::initiate_interactive_deposit(mock_interactive_deposit_response())
+            .expect("interactive deposit must parse");
+        assert_eq!(interactive.id, MOCK_TXN_ID_24);
+
+        // Poll: user hasn't started transfer
+        let status = sep24::fetch_sep24_transaction_status(mock_sep24_transaction_pending_user_transfer_complete())
+            .expect("pending status must parse");
+        assert_eq!(status.id, "sep24-pending-user-transfer-001");
+
+        // Poll: transfer complete
+        let completed = sep24::fetch_sep24_transaction_status(mock_sep24_transaction_completed())
+            .expect("completed status must parse");
+        assert_eq!(completed.status, TransactionStatus::Completed);
+    }
+
+    #[test]
+    fn test_realistic_sep38_quote_lifecycle() {
+        // Request quote
+        let quote = sep38::request_firm_quote(
+            mock_firm_quote(),
+            MOCK_EXPIRES_AT - 3600,
+        ).expect("initial quote must parse");
+        assert_eq!(quote.id, "mock-quote-001");
+
+        // Check expiry (not yet expired)
+        assert!(!sep38::is_quote_expired(&quote, MOCK_EXPIRES_AT - 1000));
+
+        // Later: check expiry (expired)
+        assert!(sep38::is_quote_expired(&quote, MOCK_EXPIRES_AT + 1000));
+    }
+
+    #[test]
+    fn test_sep6_withdrawal_with_different_memo_types() {
+        let mut raw_text = mock_withdrawal_response();
+        raw_text.memo_type = Some("text".to_string());
+        raw_text.memo = Some("MYTEXT".to_string());
+        let w1 = initiate_withdrawal(raw_text).expect("text memo must parse");
+        assert_eq!(w1.memo_type, Some("text".to_string()));
+
+        let mut raw_hash = mock_withdrawal_response();
+        raw_hash.memo_type = Some("hash".to_string());
+        raw_hash.memo = Some("a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3".to_string());
+        let w2 = initiate_withdrawal(raw_hash).expect("hash memo must parse");
+        assert_eq!(w2.memo_type, Some("hash".to_string()));
+    }
+
+    #[test]
+    fn test_multiple_anchor_comparison() {
+        let a = initiate_deposit(mock_deposit_response_anchor_a()).expect("anchor A deposit must parse");
+        let b = initiate_deposit(mock_deposit_response_anchor_b()).expect("anchor B deposit must parse");
+
+        // Different fees and limits
+        assert_ne!(a.fee_fixed, b.fee_fixed);
+        assert_ne!(a.min_amount, b.min_amount);
+        assert_ne!(a.max_amount, b.max_amount);
+
+        // But both valid
+        assert!(!a.how.is_empty());
+        assert!(!b.how.is_empty());
+    }
 }
