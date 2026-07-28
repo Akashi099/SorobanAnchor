@@ -675,6 +675,241 @@ pub fn validate_stellar_account_id(account_id: &str) -> Result<(), Error> {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+// ── Issue #661: Response shape compatibility checks for older anchors ──────────
+
+/// Classification of how compatible a response from an anchor is with the
+/// current schema expectations.
+///
+/// Compatibility is intentionally non-binary: an older anchor may omit
+/// optional fields that were added in later schema iterations while still
+/// providing all required fields.  This enum lets callers decide whether to
+/// accept, warn, or reject a response rather than applying a hard pass/fail.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum CompatibilityLevel {
+    /// All required **and** optional fields are present and valid.
+    FullyCompatible,
+    /// All required fields are present and valid, but one or more optional
+    /// fields recognised by the current schema are absent.  The response is
+    /// usable but callers may miss enriched data.
+    PartiallyCompatible,
+    /// One or more required fields are missing or invalid.  The response
+    /// cannot be used safely.
+    Incompatible,
+}
+
+impl CompatibilityLevel {
+    /// Returns a human-readable label for this compatibility level.
+    pub fn label(&self) -> &'static str {
+        match self {
+            CompatibilityLevel::FullyCompatible   => "fully_compatible",
+            CompatibilityLevel::PartiallyCompatible => "partially_compatible",
+            CompatibilityLevel::Incompatible        => "incompatible",
+        }
+    }
+
+    /// Returns `true` when the response is safe to use (required fields are
+    /// all present), regardless of whether optional fields are missing.
+    pub fn is_usable(&self) -> bool {
+        matches!(self, CompatibilityLevel::FullyCompatible | CompatibilityLevel::PartiallyCompatible)
+    }
+}
+
+/// Result of a compatibility check, pairing the level with a human-readable
+/// reason and the list of optional fields that were absent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompatibilityReport {
+    /// The overall compatibility classification.
+    pub level: CompatibilityLevel,
+    /// Short explanation of why this level was assigned.
+    pub reason: alloc::string::String,
+    /// Names of optional fields that are absent in this response.
+    pub missing_optional_fields: alloc::vec::Vec<alloc::string::String>,
+}
+
+impl CompatibilityReport {
+    fn fully_compatible() -> Self {
+        CompatibilityReport {
+            level: CompatibilityLevel::FullyCompatible,
+            reason: alloc::string::String::from("all required and optional fields present"),
+            missing_optional_fields: alloc::vec::Vec::new(),
+        }
+    }
+
+    fn partially_compatible(missing: alloc::vec::Vec<alloc::string::String>) -> Self {
+        CompatibilityReport {
+            level: CompatibilityLevel::PartiallyCompatible,
+            reason: alloc::string::String::from("required fields present; optional fields missing"),
+            missing_optional_fields: missing,
+        }
+    }
+
+    fn incompatible(reason: &str) -> Self {
+        CompatibilityReport {
+            level: CompatibilityLevel::Incompatible,
+            reason: alloc::string::String::from(reason),
+            missing_optional_fields: alloc::vec::Vec::new(),
+        }
+    }
+}
+
+// ── Deposit compatibility ──────────────────────────────────────────────────
+
+/// Check compatibility of a raw deposit response from an older anchor.
+///
+/// Required fields: `transaction_id`, `status`, `deposit_address`.
+/// Optional fields (recognised by the current schema): `expires_at`.
+///
+/// | transaction_id | status | deposit_address | expires_at | Result |
+/// |---|---|---|---|---|
+/// | present & valid | valid SEP-6 status | non-empty | any | FullyCompatible or PartiallyCompatible |
+/// | empty            | –                 | –          | –   | Incompatible |
+/// | present          | empty / invalid   | –          | –   | Incompatible |
+/// | present          | valid             | empty      | –   | Incompatible |
+pub fn check_deposit_compatibility(
+    transaction_id: &str,
+    status: &str,
+    deposit_address: &str,
+    expires_at: Option<u64>,
+) -> CompatibilityReport {
+    if transaction_id.is_empty() {
+        return CompatibilityReport::incompatible("transaction_id is missing");
+    }
+    if status.is_empty() || !is_valid_sep6_status(status) {
+        return CompatibilityReport::incompatible("status is missing or not a recognised SEP-6 value");
+    }
+    if deposit_address.is_empty() {
+        return CompatibilityReport::incompatible("deposit_address is missing");
+    }
+
+    if expires_at.is_none() {
+        CompatibilityReport::partially_compatible(alloc::vec![alloc::string::String::from("expires_at")])
+    } else {
+        CompatibilityReport::fully_compatible()
+    }
+}
+
+// ── Withdraw compatibility ─────────────────────────────────────────────────
+
+/// Check compatibility of a raw withdrawal response from an older anchor.
+///
+/// Required fields: `transaction_id`, `status`.
+/// Optional fields: `estimated_completion`.
+pub fn check_withdraw_compatibility(
+    transaction_id: &str,
+    status: &str,
+    estimated_completion: Option<u64>,
+) -> CompatibilityReport {
+    if transaction_id.is_empty() {
+        return CompatibilityReport::incompatible("transaction_id is missing");
+    }
+    if status.is_empty() || !is_valid_sep6_status(status) {
+        return CompatibilityReport::incompatible("status is missing or not a recognised SEP-6 value");
+    }
+
+    if estimated_completion.is_none() {
+        CompatibilityReport::partially_compatible(
+            alloc::vec![alloc::string::String::from("estimated_completion")],
+        )
+    } else {
+        CompatibilityReport::fully_compatible()
+    }
+}
+
+// ── SEP-38 quote compatibility ─────────────────────────────────────────────
+
+/// Check compatibility of a raw SEP-38 quote response from an older anchor.
+///
+/// Required fields: `id`, `price`, `sell_amount`, `buy_amount`.
+/// Optional fields: `expires_at`, `fee`.
+pub fn check_sep38_quote_compatibility(
+    id: &str,
+    price: &str,
+    sell_amount: &str,
+    buy_amount: &str,
+    expires_at: Option<&str>,
+    fee: Option<&str>,
+) -> CompatibilityReport {
+    if id.is_empty() {
+        return CompatibilityReport::incompatible("id is missing");
+    }
+    if price.is_empty() || !is_valid_positive_decimal(price) {
+        return CompatibilityReport::incompatible(
+            "price is missing or not a positive number",
+        );
+    }
+    if sell_amount.is_empty() || !is_valid_positive_decimal(sell_amount) {
+        return CompatibilityReport::incompatible(
+            "sell_amount is missing or not a positive number",
+        );
+    }
+    if buy_amount.is_empty() || !is_valid_positive_decimal(buy_amount) {
+        return CompatibilityReport::incompatible(
+            "buy_amount is missing or not a positive number",
+        );
+    }
+
+    let mut missing: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+    if expires_at.map(|s| s.is_empty()).unwrap_or(true) {
+        missing.push(alloc::string::String::from("expires_at"));
+    }
+    if fee.map(|s| s.is_empty()).unwrap_or(true) {
+        missing.push(alloc::string::String::from("fee"));
+    }
+
+    if missing.is_empty() {
+        CompatibilityReport::fully_compatible()
+    } else {
+        CompatibilityReport::partially_compatible(missing)
+    }
+}
+
+// ── Anchor info compatibility ──────────────────────────────────────────────
+
+/// Check compatibility of a raw anchor info response from an older anchor.
+///
+/// Required fields: `name`, `supported_assets` (non-empty).
+/// Optional fields: none currently defined — this is reserved for future
+/// schema additions (e.g. `contact_email`, `documentation_url`).
+pub fn check_anchor_info_compatibility(
+    name: &str,
+    supported_assets: &[alloc::string::String],
+) -> CompatibilityReport {
+    if name.is_empty() {
+        return CompatibilityReport::incompatible("name is missing");
+    }
+    if supported_assets.is_empty() {
+        return CompatibilityReport::incompatible("supported_assets is missing or empty");
+    }
+    CompatibilityReport::fully_compatible()
+}
+
+// ── Transaction status compatibility ──────────────────────────────────────
+
+/// Check compatibility of a raw transaction status response from an older anchor.
+///
+/// Required fields: `transaction_id`, `status`, `kind`.
+/// Optional fields: none currently defined.
+pub fn check_transaction_status_compatibility(
+    transaction_id: &str,
+    status: &str,
+    kind: &str,
+) -> CompatibilityReport {
+    if transaction_id.is_empty() {
+        return CompatibilityReport::incompatible("transaction_id is missing");
+    }
+    if status.is_empty() || !is_valid_sep6_status(status) {
+        return CompatibilityReport::incompatible(
+            "status is missing or not a recognised SEP-6 value",
+        );
+    }
+    if kind.is_empty() {
+        return CompatibilityReport::incompatible("kind is missing");
+    }
+    CompatibilityReport::fully_compatible()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1252,5 +1487,188 @@ mod tests {
         let assets = alloc::vec![alloc::string::String::from("native")];
         let r = validate_anchor_info_with_version("A", assets, SchemaVersion::V1).unwrap();
         assert_eq!(r.schema_version, SchemaVersion::V1);
+    }
+
+    // ── Issue #661: compatibility check tests ─────────────────────────────────
+
+    // -- CompatibilityLevel helpers --
+
+    #[test]
+    fn test_compatibility_level_is_usable() {
+        assert!(CompatibilityLevel::FullyCompatible.is_usable());
+        assert!(CompatibilityLevel::PartiallyCompatible.is_usable());
+        assert!(!CompatibilityLevel::Incompatible.is_usable());
+    }
+
+    #[test]
+    fn test_compatibility_level_labels() {
+        assert_eq!(CompatibilityLevel::FullyCompatible.label(),    "fully_compatible");
+        assert_eq!(CompatibilityLevel::PartiallyCompatible.label(), "partially_compatible");
+        assert_eq!(CompatibilityLevel::Incompatible.label(),        "incompatible");
+    }
+
+    // -- Deposit compatibility --
+
+    #[test]
+    fn test_deposit_compat_fully_compatible() {
+        let r = check_deposit_compatibility("txn-1", "completed", "GABC...", Some(9999999));
+        assert_eq!(r.level, CompatibilityLevel::FullyCompatible);
+        assert!(r.is_usable());
+        assert!(r.missing_optional_fields.is_empty());
+    }
+
+    #[test]
+    fn test_deposit_compat_partially_compatible_missing_expires_at() {
+        let r = check_deposit_compatibility("txn-1", "pending", "GABC...", None);
+        assert_eq!(r.level, CompatibilityLevel::PartiallyCompatible);
+        assert!(r.is_usable());
+        assert!(r.missing_optional_fields.contains(&alloc::string::String::from("expires_at")));
+    }
+
+    #[test]
+    fn test_deposit_compat_incompatible_missing_txn_id() {
+        let r = check_deposit_compatibility("", "completed", "GABC...", None);
+        assert_eq!(r.level, CompatibilityLevel::Incompatible);
+        assert!(!r.is_usable());
+    }
+
+    #[test]
+    fn test_deposit_compat_incompatible_invalid_status() {
+        let r = check_deposit_compatibility("txn-1", "unknown_status", "GABC...", None);
+        assert_eq!(r.level, CompatibilityLevel::Incompatible);
+    }
+
+    #[test]
+    fn test_deposit_compat_incompatible_empty_address() {
+        let r = check_deposit_compatibility("txn-1", "completed", "", None);
+        assert_eq!(r.level, CompatibilityLevel::Incompatible);
+    }
+
+    // -- Withdraw compatibility --
+
+    #[test]
+    fn test_withdraw_compat_fully_compatible() {
+        let r = check_withdraw_compatibility("txn-2", "completed", Some(1_700_000_000));
+        assert_eq!(r.level, CompatibilityLevel::FullyCompatible);
+        assert!(r.missing_optional_fields.is_empty());
+    }
+
+    #[test]
+    fn test_withdraw_compat_partially_compatible_missing_estimated_completion() {
+        let r = check_withdraw_compatibility("txn-2", "pending_external", None);
+        assert_eq!(r.level, CompatibilityLevel::PartiallyCompatible);
+        assert!(r.missing_optional_fields.contains(
+            &alloc::string::String::from("estimated_completion")
+        ));
+    }
+
+    #[test]
+    fn test_withdraw_compat_incompatible_empty_status() {
+        let r = check_withdraw_compatibility("txn-2", "", None);
+        assert_eq!(r.level, CompatibilityLevel::Incompatible);
+    }
+
+    #[test]
+    fn test_withdraw_compat_incompatible_missing_txn_id() {
+        let r = check_withdraw_compatibility("", "completed", Some(0));
+        assert_eq!(r.level, CompatibilityLevel::Incompatible);
+    }
+
+    // -- SEP-38 quote compatibility --
+
+    #[test]
+    fn test_sep38_quote_compat_fully_compatible() {
+        let r = check_sep38_quote_compatibility(
+            "qid", "1.5", "100.0", "150.0",
+            Some("2026-01-01T00:00:00Z"), Some("0.5"),
+        );
+        assert_eq!(r.level, CompatibilityLevel::FullyCompatible);
+    }
+
+    #[test]
+    fn test_sep38_quote_compat_partially_compatible_missing_both_optional() {
+        let r = check_sep38_quote_compatibility(
+            "qid", "1.5", "100.0", "150.0", None, None,
+        );
+        assert_eq!(r.level, CompatibilityLevel::PartiallyCompatible);
+        assert!(r.missing_optional_fields.contains(&alloc::string::String::from("expires_at")));
+        assert!(r.missing_optional_fields.contains(&alloc::string::String::from("fee")));
+    }
+
+    #[test]
+    fn test_sep38_quote_compat_partially_compatible_missing_fee_only() {
+        let r = check_sep38_quote_compatibility(
+            "qid", "1.5", "100.0", "150.0",
+            Some("2026-01-01T00:00:00Z"), None,
+        );
+        assert_eq!(r.level, CompatibilityLevel::PartiallyCompatible);
+        assert!(r.missing_optional_fields.contains(&alloc::string::String::from("fee")));
+        assert!(!r.missing_optional_fields.contains(&alloc::string::String::from("expires_at")));
+    }
+
+    #[test]
+    fn test_sep38_quote_compat_incompatible_empty_id() {
+        let r = check_sep38_quote_compatibility("", "1.5", "100.0", "150.0", None, None);
+        assert_eq!(r.level, CompatibilityLevel::Incompatible);
+    }
+
+    #[test]
+    fn test_sep38_quote_compat_incompatible_invalid_price() {
+        let r = check_sep38_quote_compatibility("qid", "not-a-number", "100.0", "150.0", None, None);
+        assert_eq!(r.level, CompatibilityLevel::Incompatible);
+    }
+
+    #[test]
+    fn test_sep38_quote_compat_incompatible_zero_sell_amount() {
+        let r = check_sep38_quote_compatibility("qid", "1.5", "0.0", "150.0", None, None);
+        assert_eq!(r.level, CompatibilityLevel::Incompatible);
+    }
+
+    // -- Anchor info compatibility --
+
+    #[test]
+    fn test_anchor_info_compat_fully_compatible() {
+        let assets = alloc::vec![alloc::string::String::from("native")];
+        let r = check_anchor_info_compatibility("Anchor Corp", &assets);
+        assert_eq!(r.level, CompatibilityLevel::FullyCompatible);
+    }
+
+    #[test]
+    fn test_anchor_info_compat_incompatible_empty_name() {
+        let assets = alloc::vec![alloc::string::String::from("native")];
+        let r = check_anchor_info_compatibility("", &assets);
+        assert_eq!(r.level, CompatibilityLevel::Incompatible);
+    }
+
+    #[test]
+    fn test_anchor_info_compat_incompatible_empty_assets() {
+        let r = check_anchor_info_compatibility("Anchor Corp", &[]);
+        assert_eq!(r.level, CompatibilityLevel::Incompatible);
+    }
+
+    // -- Transaction status compatibility --
+
+    #[test]
+    fn test_tx_status_compat_fully_compatible() {
+        let r = check_transaction_status_compatibility("txn-99", "completed", "deposit");
+        assert_eq!(r.level, CompatibilityLevel::FullyCompatible);
+    }
+
+    #[test]
+    fn test_tx_status_compat_incompatible_missing_kind() {
+        let r = check_transaction_status_compatibility("txn-99", "completed", "");
+        assert_eq!(r.level, CompatibilityLevel::Incompatible);
+    }
+
+    #[test]
+    fn test_tx_status_compat_incompatible_invalid_status() {
+        let r = check_transaction_status_compatibility("txn-99", "bad_status", "deposit");
+        assert_eq!(r.level, CompatibilityLevel::Incompatible);
+    }
+
+    #[test]
+    fn test_tx_status_compat_incompatible_empty_txn_id() {
+        let r = check_transaction_status_compatibility("", "completed", "withdrawal");
+        assert_eq!(r.level, CompatibilityLevel::Incompatible);
     }
 }
