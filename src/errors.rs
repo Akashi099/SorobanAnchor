@@ -47,7 +47,10 @@ use soroban_sdk::contracterror;
 /// | `IllegalTransition`  | 23, 24, 26        | 24        |
 /// | `SessionExpired`     | 25, 27            | 25        |
 /// | `SessionClosed`      | 26 (one branch)   | 26        |
-#[contracterror]
+// `export = false` skips XDR spec generation: the SCSpecUDTErrorEnumV0 spec
+// entry caps error enums at 50 cases, and this enum now has 51. All error
+// conversions (`panic_with_error!`, `From<ErrorCode> for Error`) still work.
+#[contracterror(export = false)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum ErrorCode {
@@ -207,6 +210,8 @@ impl ErrorCode {
             ErrorCode::QuoteExpired              => "Quote has passed its validity deadline",
             ErrorCode::SignatureVerificationFailed => "Attestation signature verification failed",
             ErrorCode::BatchSizeExceeded         => "Batch size exceeds the per-call maximum",
+            ErrorCode::InvalidAssetPair          => "Base and quote asset must differ",
+            ErrorCode::InvalidAmount             => "Amount is zero or otherwise invalid",
         }
     }
 }

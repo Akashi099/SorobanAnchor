@@ -33,7 +33,10 @@ extern crate alloc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use crate::errors::Error;
+// This module works with the raw error codes (`Error::InvalidAssetPair` etc.),
+// so bind `Error` to the `ErrorCode` enum rather than the `AnchorKitError`
+// struct the crate-level `Error` alias points at.
+use crate::errors::ErrorCode as Error;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -150,13 +153,13 @@ pub struct CandidateQuote {
 
 /// Select the best quote from `candidates` according to `strategy`.
 /// Returns `None` when the candidate list is empty.
-pub fn select_best(
-    candidates: &[CandidateQuote],
+pub fn select_best<'a>(
+    candidates: &'a [CandidateQuote],
     strategy: &str,
     fee_weight: f32,
     speed_weight: f32,
     reputation_weight: f32,
-) -> Option<&CandidateQuote> {
+) -> Option<&'a CandidateQuote> {
     if candidates.is_empty() {
         return None;
     }

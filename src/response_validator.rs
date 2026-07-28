@@ -729,6 +729,11 @@ pub struct CompatibilityReport {
 }
 
 impl CompatibilityReport {
+    /// Convenience: whether the report's [`CompatibilityLevel`] is usable.
+    pub fn is_usable(&self) -> bool {
+        self.level.is_usable()
+    }
+
     fn fully_compatible() -> Self {
         CompatibilityReport {
             level: CompatibilityLevel::FullyCompatible,
