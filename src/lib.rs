@@ -128,6 +128,7 @@ pub mod errors;
 pub mod sep10_jwt;
 pub mod rate_limiter;
 pub mod retry;
+pub mod trace_context;
 pub mod replay_detection;
 pub mod transaction_state_tracker;
 pub mod contract;
@@ -180,6 +181,8 @@ pub use errors::Error;
 pub use rate_limiter::{RateLimiter, RateLimitConfig, RateLimitState};
 pub use retry::{retry_with_backoff, is_retryable, RetryConfig, JitterSource, LedgerJitterSource, MockJitterSource};
 pub use retry::{BackoffStrategy, JitterPolicy};
+pub use retry::retry_with_backoff_traced;
+pub use trace_context::{TraceContext, TraceError, TRACEPARENT_HEADER, TRACE_ID_HEADER, SPAN_ID_HEADER};
 pub use deterministic_hash::{compute_payload_hash, verify_payload_hash};
 pub use contract::{AnchorKitContract, AnchorTomlProvenance, EndpointUpdated, CacheConfig};
 pub use contract::{AttestorRevocationRecord};
@@ -202,7 +205,7 @@ pub use config::{load_runtime_config_file, parse_runtime_config_str, ConfigForma
 #[cfg(not(feature = "wasm"))]
 pub use http_client::ProxyConfig;
 #[cfg(all(not(feature = "wasm"), feature = "std"))]
-pub use http_client::{build_client, build_client_with_policy, fetch_stellar_toml_with_proxy, deliver_webhook_with_proxy};
+pub use http_client::{build_client, build_client_with_policy, fetch_stellar_toml_with_proxy, deliver_webhook_with_proxy, deliver_webhook_with_proxy_traced};
 #[cfg(not(feature = "wasm"))]
 pub use http_client::{ConnectionPolicy, TransportErrorKind, classify_transport_error, is_transport_error_retryable};
 #[cfg(not(feature = "wasm"))]
@@ -221,7 +224,7 @@ pub use response_validator::{
     SchemaVersion, VALIDATOR_SCHEMA_V1,
 };
 #[cfg(not(feature = "wasm"))]
-pub use webhook::{deliver_webhook, get_dead_letter_webhooks, query_dlq, verify_webhook_signature, WebhookDeliveryConfig, DlqEntry};
+pub use webhook::{deliver_webhook, deliver_webhook_traced, dlq_entries_for_trace, get_dead_letter_webhooks, query_dlq, verify_webhook_signature, WebhookDeliveryConfig, DlqEntry};
 #[cfg(not(feature = "wasm"))]
 pub use stellar_toml::{ParsedCurrency, ParsedStellarToml, parse_stellar_toml, fetch_stellar_toml_url};
 #[cfg(not(feature = "wasm"))]
