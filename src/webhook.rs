@@ -171,9 +171,9 @@ fn extract_timestamp_and_nonce(payload: &str) -> Result<(u64, String), ()> {
     
     // Extract nonce value (simplified - assumes nonce is in quotes)
     let nonce_str = &payload[nonce_start.unwrap() + 8..];
-    let quote_start = nonce_str.find('"')?;
+    let quote_start = nonce_str.find('"').ok_or(())?;
     let after_quote = &nonce_str[quote_start + 1..];
-    let quote_end = after_quote.find('"')?;
+    let quote_end = after_quote.find('"').ok_or(())?;
     let nonce = after_quote[..quote_end].to_string();
     
     Ok((timestamp, nonce))
@@ -240,7 +240,7 @@ impl NonceTracker for MemoryNonceTracker {
     
     fn cleanup_expired(&mut self, current_time: u64, max_age_seconds: u64) {
         let cutoff = current_time.saturating_sub(max_age_seconds);
-        self.nonces.retain(|_, &ts| ts >= cutoff);
+        self.nonces.retain(|_, ts| *ts >= cutoff);
     }
 }
 
@@ -773,9 +773,13 @@ mod tests {
                 base_delay_ms: 1,
                 backoff_multiplier: 1,
                 max_delay_ms: 10,
+                strategy: crate::retry::BackoffStrategy::Exponential,
+                jitter_policy: crate::retry::JitterPolicy::None,
             },
             dead_letter_storage_key: "test-key".to_string(),
             signing_key: None,
+            max_payload_age_seconds: None,
+            require_nonce_for_replay_protection: false,
         }
     }
 

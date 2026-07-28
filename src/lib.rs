@@ -138,6 +138,8 @@ pub mod admin_audit_log;
 pub mod cache_governance;
 pub mod session_state_machine;
 pub mod migration;
+pub mod url_normalizer;
+pub mod compliance_policy;
 
 // ── std-only modules (filesystem, runtime config) ─────────────────────────────
 #[cfg(feature = "std")]
@@ -204,7 +206,9 @@ pub use config::{load_runtime_config_file, parse_runtime_config_str, ConfigForma
 
 // ── Host-only re-exports ──────────────────────────────────────────────────────
 #[cfg(not(feature = "wasm"))]
-pub use http_client::{ProxyConfig, build_client, build_client_with_policy, fetch_stellar_toml_with_proxy, deliver_webhook_with_proxy};
+pub use http_client::ProxyConfig;
+#[cfg(all(not(feature = "wasm"), feature = "std"))]
+pub use http_client::{build_client, build_client_with_policy, fetch_stellar_toml_with_proxy, deliver_webhook_with_proxy};
 #[cfg(not(feature = "wasm"))]
 pub use http_client::{ConnectionPolicy, TransportErrorKind, classify_transport_error, is_transport_error_retryable};
 #[cfg(not(feature = "wasm"))]

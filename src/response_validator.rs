@@ -289,7 +289,7 @@ pub fn validate_deposit_with_version(
     version: SchemaVersion,
 ) -> Result<DepositResponse, Error> {
     match version {
-        SchemaVersion::V1 => validate_deposit_v1(
+        _ => validate_deposit_v1(
             transaction_id,
             status,
             deposit_address,
@@ -339,7 +339,7 @@ pub fn validate_withdraw_with_version(
     version: SchemaVersion,
 ) -> Result<WithdrawResponse, Error> {
     match version {
-        SchemaVersion::V1 => validate_withdraw_v1(transaction_id, status, estimated_completion),
+        _ => validate_withdraw_v1(transaction_id, status, estimated_completion),
     }
 }
 
@@ -376,7 +376,7 @@ pub fn validate_quote_with_version(
     version: SchemaVersion,
 ) -> Result<QuoteResponse, Error> {
     match version {
-        SchemaVersion::V1 => validate_quote_v1(id, status, amount, asset, fee),
+        _ => validate_quote_v1(id, status, amount, asset, fee),
     }
 }
 
@@ -428,7 +428,7 @@ pub fn validate_sep38_quote_with_version(
     version: SchemaVersion,
 ) -> Result<Sep38QuoteResponse, Error> {
     match version {
-        SchemaVersion::V1 => validate_sep38_quote_v1(id, expires_at, price, sell_amount, buy_amount, fee),
+        _ => validate_sep38_quote_v1(id, expires_at, price, sell_amount, buy_amount, fee),
     }
 }
 
@@ -489,7 +489,7 @@ pub fn validate_anchor_info_with_version(
     version: SchemaVersion,
 ) -> Result<AnchorInfoResponse, Error> {
     match version {
-        SchemaVersion::V1 => validate_anchor_info_v1(name, supported_assets),
+        _ => validate_anchor_info_v1(name, supported_assets),
     }
 }
 
@@ -526,7 +526,7 @@ pub fn validate_transaction_status_with_version(
     version: SchemaVersion,
 ) -> Result<TransactionStatusResponseValidated, Error> {
     match version {
-        SchemaVersion::V1 => validate_transaction_status_v1(transaction_id, status, kind),
+        _ => validate_transaction_status_v1(transaction_id, status, kind),
     }
 }
 
@@ -1022,7 +1022,7 @@ mod tests {
 
     #[test]
     fn test_deposit_long_transaction_id_accepted() {
-        let long_id = "dep_".to_string() + &"x".repeat(200);
+        let long_id = alloc::string::ToString::to_string("dep_") + &"x".repeat(200);
         let result = validate_deposit_response(&long_id, "pending", "GADDR...", 0, 0);
         assert!(result.is_ok());
     }
