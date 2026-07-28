@@ -17,6 +17,8 @@ mod webhook_middleware_tests {
             retry_config: RetryConfig::new(max_retries, 0, 0, 1),
             dead_letter_storage_key: "test_dlq".into(),
             signing_key: None,
+            max_payload_age_seconds: None,
+            require_nonce_for_replay_protection: false,
         }
     }
 
@@ -27,6 +29,8 @@ mod webhook_middleware_tests {
             retry_config: RetryConfig::new(max_retries, 0, 0, 1),
             dead_letter_storage_key: "test_dlq".into(),
             signing_key: Some(key),
+            max_payload_age_seconds: None,
+            require_nonce_for_replay_protection: false,
         }
     }
 
