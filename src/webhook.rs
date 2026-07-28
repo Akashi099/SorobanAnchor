@@ -716,6 +716,66 @@ where
     }
 }
 
+/// Like [`deliver_webhook`], additionally recording delivery metrics.
+///
+/// Emitted metrics (see [`crate::metrics::names`]):
+///
+/// * [`names::WEBHOOK_DELIVERIES`] — one per call.
+/// * [`names::WEBHOOK_ATTEMPTS`] — one per HTTP POST attempt, retries included.
+/// * [`names::WEBHOOK_SUCCESSES`] / [`names::WEBHOOK_FAILURES`] — final outcome.
+/// * [`names::WEBHOOK_DLQ_ENTRIES`] — counter, one per entry written to the DLQ.
+/// * [`names::WEBHOOK_DLQ_DEPTH`] — gauge, total entries across all DLQ keys
+///   after this delivery (a resource-usage signal for DLQ growth).
+///
+/// Delegates to [`deliver_webhook`] so delivery semantics stay identical.
+///
+/// [`names::WEBHOOK_DELIVERIES`]: crate::metrics::names::WEBHOOK_DELIVERIES
+/// [`names::WEBHOOK_ATTEMPTS`]: crate::metrics::names::WEBHOOK_ATTEMPTS
+/// [`names::WEBHOOK_SUCCESSES`]: crate::metrics::names::WEBHOOK_SUCCESSES
+/// [`names::WEBHOOK_FAILURES`]: crate::metrics::names::WEBHOOK_FAILURES
+/// [`names::WEBHOOK_DLQ_ENTRIES`]: crate::metrics::names::WEBHOOK_DLQ_ENTRIES
+/// [`names::WEBHOOK_DLQ_DEPTH`]: crate::metrics::names::WEBHOOK_DLQ_DEPTH
+pub fn deliver_webhook_metered<H, S, T>(
+    config: &WebhookDeliveryConfig,
+    payload: &str,
+    dlq: &mut BTreeMap<String, Vec<DlqEntry>>,
+    http_post: H,
+    sleep_fn: S,
+    now_fn: T,
+    metrics: &crate::metrics::MetricsRegistry,
+) -> Result<(), AnchorKitError>
+where
+    H: Fn(&str, &str, Option<&str>) -> Result<u16, String>,
+    S: FnMut(u64),
+    T: Fn() -> u64,
+{
+    use crate::metrics::names;
+
+    metrics.incr(names::WEBHOOK_DELIVERIES);
+    let result = deliver_webhook(
+        config,
+        payload,
+        dlq,
+        |url, body, sig| {
+            metrics.incr(names::WEBHOOK_ATTEMPTS);
+            http_post(url, body, sig)
+        },
+        sleep_fn,
+        now_fn,
+    );
+    match &result {
+        Ok(()) => metrics.incr(names::WEBHOOK_SUCCESSES),
+        Err(_) => {
+            metrics.incr(names::WEBHOOK_FAILURES);
+            // deliver_webhook appends exactly one DLQ entry per failed delivery.
+            metrics.incr(names::WEBHOOK_DLQ_ENTRIES);
+        }
+    }
+    let dlq_depth: usize = dlq.values().map(Vec::len).sum();
+    metrics.set_gauge(names::WEBHOOK_DLQ_DEPTH, dlq_depth as u64);
+    result
+}
+
 // ---------------------------------------------------------------------------
 // DLQ inspection
 // ---------------------------------------------------------------------------

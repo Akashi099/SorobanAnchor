@@ -443,6 +443,53 @@ where
     }
 }
 
+/// Like [`retry_with_backoff`], additionally recording metrics for the
+/// operation named `operation` into `metrics`.
+///
+/// Emitted counters (see [`crate::metrics::names`]):
+///
+/// * `<operation>.retry.attempts` — one per execution of `f` (first try included).
+/// * `<operation>.retry.backoffs` — one per backoff sleep, i.e. per actual retry.
+/// * `<operation>.retry.successes` / `<operation>.retry.failures` — final outcome.
+///
+/// Delegates to [`retry_with_backoff`] so retry semantics stay identical.
+#[cfg(not(feature = "wasm"))]
+pub fn retry_with_backoff_metered<T, E, F, S, J>(
+    config: &RetryConfig,
+    mut f: F,
+    retryable: impl Fn(&E) -> bool,
+    mut sleep_fn: S,
+    jitter_source: &mut J,
+    metrics: &crate::metrics::MetricsRegistry,
+    operation: &str,
+) -> Result<T, E>
+where
+    F: FnMut(u32) -> Result<T, E>,
+    S: FnMut(u64),
+    J: JitterSource,
+{
+    use crate::metrics::names;
+
+    let result = retry_with_backoff(
+        config,
+        |attempt| {
+            metrics.incr(&names::retry_attempts(operation));
+            f(attempt)
+        },
+        retryable,
+        |delay| {
+            metrics.incr(&names::retry_backoffs(operation));
+            sleep_fn(delay)
+        },
+        jitter_source,
+    );
+    match &result {
+        Ok(_) => metrics.incr(&names::retry_successes(operation)),
+        Err(_) => metrics.incr(&names::retry_failures(operation)),
+    }
+    result
+}
+
 #[cfg(test)]
 mod retry_tests {
     use super::*;

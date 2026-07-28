@@ -152,6 +152,8 @@ mod response_validator;
 #[cfg(not(feature = "wasm"))]
 pub mod http_client;
 #[cfg(not(feature = "wasm"))]
+pub mod metrics;
+#[cfg(not(feature = "wasm"))]
 pub mod webhook;
 #[cfg(not(feature = "wasm"))]
 pub mod sep6;
@@ -221,7 +223,15 @@ pub use response_validator::{
     SchemaVersion, VALIDATOR_SCHEMA_V1,
 };
 #[cfg(not(feature = "wasm"))]
-pub use webhook::{deliver_webhook, get_dead_letter_webhooks, query_dlq, verify_webhook_signature, WebhookDeliveryConfig, DlqEntry};
+pub use metrics::{LatencySummary, MetricsRegistry, MetricsSnapshot};
+#[cfg(all(not(feature = "wasm"), feature = "std"))]
+pub use metrics::time_operation;
+#[cfg(not(feature = "wasm"))]
+pub use retry::retry_with_backoff_metered;
+#[cfg(not(feature = "wasm"))]
+pub use http_client::post_with_options_metered;
+#[cfg(not(feature = "wasm"))]
+pub use webhook::{deliver_webhook, deliver_webhook_metered, get_dead_letter_webhooks, query_dlq, verify_webhook_signature, WebhookDeliveryConfig, DlqEntry};
 #[cfg(not(feature = "wasm"))]
 pub use stellar_toml::{ParsedCurrency, ParsedStellarToml, parse_stellar_toml, fetch_stellar_toml_url};
 #[cfg(not(feature = "wasm"))]
