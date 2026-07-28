@@ -6,7 +6,10 @@ SOURCE_DATE_EPOCH ?= 1717200000
 
 .PHONY: build test wasm lint \
         integration-test integration-test-live \
-        release release-sign release-sign-dry-run release-validate release-verify \
+        integration-test-pipeline \
+        stress-test \
+        bench bench-save bench-compare \
+        release release-validate \
         clean-dist reproducible-wasm verify-reproducible
 
 # ── Core build targets ────────────────────────────────────────────────────────
@@ -47,10 +50,37 @@ lint:
 integration-test:
 	cargo test --test cli_integration_harness -- --nocapture
 
+## Run the extended integration pipeline tests (local simulation, no network required).
+integration-test-pipeline:
+	cargo test --test integration_pipeline_tests -- --nocapture
+
 ## Run the CLI integration test harness against a live testnet.
 ## Requires: ANCHOR_CONTRACT_ID, ANCHOR_ADMIN_SECRET
 integration-test-live:
 	SOROBAN_ANCHOR_INTEGRATION=testnet cargo test --test cli_integration_harness -- --nocapture
+
+## Run the dedicated live network smoke tests against a live testnet.
+## Requires: ANCHOR_CONTRACT_ID, ANCHOR_ADMIN_SECRET
+smoke-test-live:
+	SOROBAN_ANCHOR_INTEGRATION=testnet cargo test --test live_smoke_tests -- --nocapture
+
+## Run the full stress-test suite (excluded from normal CI).
+stress-test:
+	cargo test --features stress-tests -- --nocapture
+
+## Run all performance benchmarks (results in target/criterion/).
+bench:
+	cargo bench --bench load_benchmarks
+
+## Run benchmarks and save results as a named baseline for later comparison.
+## Usage: make bench-save BASELINE=my-baseline
+bench-save:
+	cargo bench --bench load_benchmarks -- --save-baseline $(or $(BASELINE),main)
+
+## Compare current benchmark results against a saved baseline.
+## Usage: make bench-compare BASELINE=main
+bench-compare:
+	cargo bench --bench load_benchmarks -- --baseline $(or $(BASELINE),main)
 
 # ── Release packaging ─────────────────────────────────────────────────────────
 
@@ -70,10 +100,13 @@ release-sign-dry-run:
 release-validate:
 	@bash scripts/validate_bundle.sh $(DIST_DIR)/anchorkit-$(VERSION).tar.gz
 
-## Verify the integrity and signature of a release bundle.
-## Usage: make release-verify TARBALL=dist/anchorkit-0.1.0.tar.gz
-release-verify:
-	@bash scripts/verify_release.sh $(TARBALL)
+## Verify artifact checksums for the current release bundle.
+verify-checksums:
+	@bash scripts/verify_artifact_checksums.sh $(VERSION)
+
+## Generate artifact checksums for the current release bundle (run after `make release`).
+generate-checksums:
+	@bash scripts/verify_artifact_checksums.sh --generate $(VERSION)
 
 ## Remove the dist/ directory.
 clean-dist:

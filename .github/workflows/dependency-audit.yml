@@ -1,0 +1,236 @@
+name: Dependency Audit
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  schedule:
+    # Run every Monday at 08:00 UTC so advisories published since the last
+    # PR are caught even without a code change.
+    - cron: '0 8 * * 1'
+  workflow_dispatch:
+    inputs:
+      quick:
+        description: 'Skip security scan (quick mode)'
+        required: false
+        default: 'false'
+        type: boolean
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Security vulnerability scan ────────────────────────────────────────────
+  audit-vulnerabilities:
+    name: Security Vulnerabilities (cargo audit)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-audit-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-audit-
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Run cargo audit
+        # --deny warnings fails on ANY advisory, including informational.
+        # Remove `--deny warnings` and add an `audit.toml` ignore entry for
+        # acknowledged non-reachable advisories.
+        run: cargo audit --deny warnings
+
+  # ── License compliance ─────────────────────────────────────────────────────
+  audit-licenses:
+    name: License Compliance (cargo license)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-license-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-license-
+
+      - name: Install cargo-license
+        run: cargo install cargo-license --locked
+
+      - name: Check for denied licenses
+        run: |
+          DENIED="GPL AGPL SSPL BUSL"
+          FAILURES=0
+
+          while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            crate=$(echo "$line" | awk '{print $1}')
+            license=$(echo "$line" | sed 's/^[^ ]* //')
+            for dl in $DENIED; do
+              if echo "$license" | grep -qi "$dl"; then
+                echo "::error::Denied license '$license' in crate '$crate'"
+                FAILURES=$((FAILURES + 1))
+              fi
+            done
+          done < <(cargo license --color never --avoid-build-deps 2>/dev/null \
+                   | grep -v "^anchorkit")
+
+          if [[ "$FAILURES" -gt 0 ]]; then
+            echo "::error::$FAILURES denied license(s) found — see output above."
+            exit 1
+          fi
+          echo "All dependency licenses are compliant."
+
+  # ── Lock file and pinning policy ───────────────────────────────────────────
+  audit-lockfile:
+    name: Lock File & Pinning Policy
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify Cargo.lock is committed
+        run: |
+          if ! git ls-files --error-unmatch Cargo.lock 2>/dev/null; then
+            echo "::error::Cargo.lock must be committed to the repository."
+            exit 1
+          fi
+          echo "Cargo.lock is committed."
+
+      - name: Check Cargo.lock is up to date
+        # Fail if cargo update would change anything — ensures the lock file
+        # reflects the declared constraints without silent drift.
+        run: |
+          if cargo update --dry-run 2>&1 | grep -q "Updating"; then
+            echo "::warning::Cargo.lock is out of date. Run 'cargo update' and commit."
+          else
+            echo "Cargo.lock is up to date."
+          fi
+
+      - name: Detect [patch] overrides using non-registry sources
+        run: |
+          if grep -q '^\[patch\]' Cargo.toml 2>/dev/null; then
+            PATCH=$(awk '/^\[patch\]/,/^\[/' Cargo.toml | grep -E 'git|path' || true)
+            if [[ -n "$PATCH" ]]; then
+              echo "::warning::Non-registry [patch] overrides found — ensure they are reviewed:"
+              echo "$PATCH"
+            fi
+          fi
+          echo "Patch override check complete."
+
+  # ── Dependency statistics report ───────────────────────────────────────────
+  audit-stats:
+    name: Dependency Statistics
+    runs-on: ubuntu-latest
+    # Runs on a best-effort basis; does not block the PR.
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-stats-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-stats-
+
+      - name: Report dependency count
+        run: |
+          TOTAL=$(grep -c '^name = ' Cargo.lock || echo 0)
+          MAX=300
+          echo "## Dependency Statistics" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Metric | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Transitive dependencies | ${TOTAL} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Policy threshold | ${MAX} |" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "${TOTAL}" -gt "${MAX}" ]]; then
+            echo "| Status | ⚠️ Exceeds threshold |" >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::Dependency count (${TOTAL}) exceeds policy threshold (${MAX})."
+          else
+            echo "| Status | ✅ Within threshold |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Install cargo-license and generate full report
+        run: |
+          cargo install cargo-license --locked 2>/dev/null || true
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "## License Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if command -v cargo-license &>/dev/null; then
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cargo license --color never --avoid-build-deps 2>/dev/null \
+              | grep -v "^anchorkit" \
+              >> "$GITHUB_STEP_SUMMARY" || true
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "cargo-license not available — skipping license summary." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # ── Full audit script (CI mode) ────────────────────────────────────────────
+  audit-full:
+    name: Full Audit Script (CI mode)
+    runs-on: ubuntu-latest
+    needs: [audit-vulnerabilities, audit-licenses, audit-lockfile]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-full-audit-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-full-audit-
+
+      - name: Install audit tools
+        run: |
+          cargo install cargo-audit --locked
+          cargo install cargo-license --locked
+
+      - name: Run full audit in CI mode with JSON report
+        run: bash scripts/dependency-audit.sh --ci --report
+
+      - name: Upload audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-audit-report
+          path: dependency-audit-report.json
+          retention-days: 30

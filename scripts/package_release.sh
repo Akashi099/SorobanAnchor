@@ -101,14 +101,37 @@ echo "${VERSION}" > "${BUNDLE_DIR}/VERSION"
 echo "      Bundle contents:"
 find "${BUNDLE_DIR}" -type f | sort | sed 's/^/        /'
 
-# ── Step 6: Create tarball ───────────────────────────────────────────────────
-echo "[6/7] Creating tarball ${TARBALL}..."
+# ── Step 6: Create preliminary tarball (will be rebuilt with CHECKSUMS) ──────
+echo "[6/7] Assembling tarball ${TARBALL}..."
 mkdir -p "${DIST_DIR}"
-tar -czf "${TARBALL}" -C "${DIST_DIR}" "anchorkit-${VERSION}"
-echo "      Tarball size: $(du -sh "${TARBALL}" | cut -f1)"
 
-# ── Step 7: Generate checksum ────────────────────────────────────────────────
-echo "[7/7] Generating checksum..."
+# ── Step 6b: Generate per-artifact checksum manifest inside the bundle ───────
+echo "[6b] Generating per-artifact checksum manifest (CHECKSUMS.sha256)..."
+sha256_artifact() {
+    if command -v sha256sum &>/dev/null; then
+        sha256sum "$1" | awk '{print $1}'
+    elif command -v shasum &>/dev/null; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        echo "UNAVAILABLE"
+    fi
+}
+
+CHECKSUMS_FILE="${BUNDLE_DIR}/CHECKSUMS.sha256"
+{
+    find "${BUNDLE_DIR}" -type f | sort | while read -r f; do
+        hash=$(sha256_artifact "$f")
+        rel="${f#${BUNDLE_DIR}/}"
+        echo "${hash}  ${rel}"
+    done
+} > "${CHECKSUMS_FILE}"
+echo "      Written: ${CHECKSUMS_FILE}"
+
+# ── Step 7: Generate tarball checksum ────────────────────────────────────────
+echo "[7/7] Generating tarball checksum..."
+# Rebuild the tarball now that CHECKSUMS.sha256 is inside the bundle.
+tar -czf "${TARBALL}" -C "${DIST_DIR}" "anchorkit-${VERSION}"
+
 CHECKSUM_FILE="${DIST_DIR}/anchorkit-${VERSION}.sha256"
 if command -v sha256sum &>/dev/null; then
     sha256sum "${TARBALL}" > "${CHECKSUM_FILE}"
@@ -136,7 +159,4 @@ echo "  docs/                  — Documentation"
 echo "  README.md              — Project documentation"
 echo "  LICENSE                — MIT license"
 echo "  VERSION                — Release version string"
-echo ""
-echo "Next steps:"
-echo "  Sign artifacts : bash scripts/sign_release.sh ${VERSION}"
-echo "  Verify bundle  : bash scripts/verify_release.sh ${TARBALL}"
+echo "  CHECKSUMS.sha256       — Per-artifact SHA-256 checksums"

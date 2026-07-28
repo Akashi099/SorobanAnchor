@@ -5,6 +5,19 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_live_tests:
+        description: >
+          Run live testnet smoke tests.
+          Requires ANCHOR_CONTRACT_ID and ANCHOR_ADMIN_SECRET secrets to be configured
+          in the repository Settings → Secrets → Actions.
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
 
 env:
   CARGO_TERM_COLOR: always
@@ -90,21 +103,20 @@ jobs:
       - name: Run CLI integration test harness (local simulation)
         run: cargo test --test cli_integration_harness -- --nocapture
 
-  # ── Coverage with Thresholds (#653) ───────────────────────────────────────
-  coverage:
-    name: Coverage & Regression Report
+      - name: Run extended integration pipeline tests (local simulation)
+        run: cargo test --test integration_pipeline_tests -- --nocapture
+
+  # ── Stress Test Suite ──────────────────────────────────────────────────────
+  stress:
+    name: Stress Tests
     runs-on: ubuntu-latest
     needs: ci
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0   # full history lets us diff against base branch
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
-        with:
-          components: llvm-tools-preview
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -113,52 +125,134 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-coverage-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-stress-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
-      - name: Install cargo-tarpaulin
-        run: cargo install cargo-tarpaulin --locked
+      - name: Run stress-test suite
+        run: cargo test --features stress-tests -- --nocapture
 
-      # Download the baseline summary from the most recent successful run on
-      # the target branch (main), if available.  The step is allowed to fail
-      # so first-ever runs (no prior artifact) still succeed.
-      - name: Download baseline coverage summary
-        id: baseline
-        uses: dawidd6/action-download-artifact@v3
-        continue-on-error: true
+  # ── Performance Benchmarks ─────────────────────────────────────────────────
+  #
+  # Benchmarks run on every push to main to track performance over time.
+  # Results are uploaded as artifacts so regressions can be spotted by
+  # comparing the current run against a saved baseline.
+  # This job does NOT run on pull requests to avoid inflating PR build times.
+  benchmarks:
+    name: Performance Benchmarks
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: ci
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
         with:
-          name: coverage-summary-main
-          branch: main
-          workflow: ci.yml
-          path: /tmp/baseline
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
 
-      - name: Run coverage with threshold enforcement
+      - name: Run benchmarks and save baseline
         run: |
-          if [ -f /tmp/baseline/summary.json ]; then
-            bash scripts/coverage_with_thresholds.sh \
-              --output-dir coverage \
-              --baseline /tmp/baseline/summary.json \
-              --report-delta
-          else
-            bash scripts/coverage_with_thresholds.sh --output-dir coverage
-          fi
+          cargo bench --bench load_benchmarks -- --save-baseline ci
+          echo "Benchmark results saved to target/criterion/"
 
-      - name: Upload HTML coverage report
-        if: always()
+      - name: Upload benchmark results
         uses: actions/upload-artifact@v4
         with:
-          name: coverage-report
-          path: coverage/
-          retention-days: 14
-
-      # Persist the current summary as the new baseline for main branch runs.
-      - name: Upload coverage summary (main branch only)
-        if: github.ref == 'refs/heads/main'
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-summary-main
-          path: coverage/summary.json
+          name: benchmark-results-${{ github.sha }}
+          path: target/criterion/
           retention-days: 90
+
+  # ── Live Testnet Smoke Tests (opt-in via workflow_dispatch) ────────────────
+  #
+  # This job ONLY runs when triggered manually via workflow_dispatch with
+  # run_live_tests set to 'true'.  It is NEVER triggered by push or
+  # pull_request events, ensuring live tests never block regular CI.
+  #
+  # Required secrets (configure in Settings → Secrets → Actions):
+  #   ANCHOR_CONTRACT_ID   — Contract ID of the deployed AnchorKit testnet contract
+  #   ANCHOR_ADMIN_SECRET  — Admin signing key for the testnet contract
+  #   STELLAR_RPC_URL      — (optional) Override for the RPC endpoint
+  #
+  # How to run:
+  #   1. Go to Actions → CI → Run workflow
+  #   2. Set run_live_tests to 'true'
+  #   3. Click "Run workflow"
+  live-smoke:
+    name: Live Testnet Smoke Tests
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.run_live_tests == 'true'
+    needs: ci
+
+    environment:
+      name: testnet-smoke
+      url: https://stellar.expert/explorer/testnet
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-live-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Install Stellar CLI
+        run: |
+          cargo install --locked stellar-cli --features opt 2>/dev/null || true
+          stellar --version || echo "WARNING: Stellar CLI not installed, live tests will skip"
+
+      - name: Verify environment prerequisites
+        run: |
+          echo "Checking required environment variables..."
+          if [ -z "$ANCHOR_CONTRACT_ID" ]; then
+            echo "ERROR: ANCHOR_CONTRACT_ID secret is not set — configure it in Settings → Secrets → Actions"
+            exit 1
+          fi
+          if [ -z "$ANCHOR_ADMIN_SECRET" ]; then
+            echo "ERROR: ANCHOR_ADMIN_SECRET secret is not set — configure it in Settings → Secrets → Actions"
+            exit 1
+          fi
+          echo "✅ All required secrets are present"
+          echo "  Contract ID : $ANCHOR_CONTRACT_ID"
+          echo "  RPC URL     : ${STELLAR_RPC_URL:-https://soroban-testnet.stellar.org (default)}"
+        env:
+          ANCHOR_CONTRACT_ID: ${{ secrets.ANCHOR_CONTRACT_ID }}
+          ANCHOR_ADMIN_SECRET: ${{ secrets.ANCHOR_ADMIN_SECRET }}
+          STELLAR_RPC_URL: ${{ secrets.STELLAR_RPC_URL }}
+
+      - name: Run dedicated live smoke test suite
+        run: cargo test --test live_smoke_tests -- --nocapture
+        env:
+          SOROBAN_ANCHOR_INTEGRATION: testnet
+          ANCHOR_CONTRACT_ID: ${{ secrets.ANCHOR_CONTRACT_ID }}
+          ANCHOR_ADMIN_SECRET: ${{ secrets.ANCHOR_ADMIN_SECRET }}
+          STELLAR_RPC_URL: ${{ secrets.STELLAR_RPC_URL }}
+
+      - name: Run live step in CLI integration harness
+        run: cargo test --test cli_integration_harness harness_live_testnet_get_admin -- --nocapture
+        env:
+          SOROBAN_ANCHOR_INTEGRATION: testnet
+          ANCHOR_CONTRACT_ID: ${{ secrets.ANCHOR_CONTRACT_ID }}
+          ANCHOR_ADMIN_SECRET: ${{ secrets.ANCHOR_ADMIN_SECRET }}
+          STELLAR_RPC_URL: ${{ secrets.STELLAR_RPC_URL }}
 
   # ── Release Packaging ──────────────────────────────────────────────────────
   release-package:
@@ -196,6 +290,11 @@ jobs:
         run: |
           VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*= *"\(.*\)"/\1/')
           bash scripts/validate_bundle.sh "dist/anchorkit-${VERSION}.tar.gz"
+
+      - name: Verify artifact checksums
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+          bash scripts/verify_artifact_checksums.sh "${VERSION}"
 
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4

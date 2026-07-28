@@ -440,6 +440,8 @@ soroban contract invoke --id <contract-id> --network $SOROBAN_NETWORK \
 
 - [README.md](../README.md)
 - [Governance and Security](./governance-and-security.md)
+- [Security Review Checklist](./SECURITY_REVIEW_CHECKLIST.md)
+- [Reproducible Builds](./REPRODUCIBLE_BUILDS.md)
 - [Service Management](./service-management.md)
 - [Contract Functions](./CONTRACT_FUNCTIONS.md)
 
