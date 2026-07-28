@@ -883,9 +883,13 @@ mod tests {
                 base_delay_ms: 0,
                 max_delay_ms: 0,
                 backoff_multiplier: 1,
+                strategy: crate::retry::BackoffStrategy::Exponential,
+                jitter_policy: crate::retry::JitterPolicy::None,
             },
             dead_letter_storage_key: "proxy-test".to_string(),
             signing_key: None,
+            max_payload_age_seconds: None,
+            require_nonce_for_replay_protection: false,
         };
 
         let mut dlq: BTreeMap<String, alloc::vec::Vec<DlqEntry>> = BTreeMap::new();
@@ -922,9 +926,13 @@ mod tests {
                 base_delay_ms: 0,
                 max_delay_ms: 0,
                 backoff_multiplier: 1,
+                strategy: crate::retry::BackoffStrategy::Exponential,
+                jitter_policy: crate::retry::JitterPolicy::None,
             },
             dead_letter_storage_key: "proxy-fail-test".to_string(),
             signing_key: None,
+            max_payload_age_seconds: None,
+            require_nonce_for_replay_protection: false,
         };
 
         let mut dlq: BTreeMap<String, alloc::vec::Vec<DlqEntry>> = BTreeMap::new();

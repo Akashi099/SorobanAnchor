@@ -1676,13 +1676,6 @@ pub const MAX_OPS_PER_SESSION: u64 = 100;
 /// Minimum TTL for replay-protection entries (7 days in ledgers at ~5 s/ledger).
 pub const REPLAY_TTL: u32 = 120_960;
 
-/// Maximum number of attestations allowed in a single batch submission.
-pub const MAX_BATCH_SIZE: usize = 100;
-
-/// Rate-limit slot multiplier applied per attestation in a batch submission.
-/// Each attestation in a batch consumes this many slots from the rate-limit window.
-pub const BATCH_ATTESTATION_RATE_MULTIPLIER: u32 = 1;
-
 /// Inclusive lower bound for the configurable JWT max-length (set_jwt_max_len).
 const MIN_JWT_MAX_LEN: u32 = 2048;
 /// Inclusive upper bound for the configurable JWT max-length (set_jwt_max_len).
@@ -6832,7 +6825,7 @@ impl AnchorKitContract {
             env.storage().instance().extend_ttl(INSTANCE_TTL, INSTANCE_TTL);
 
             env.events().publish(
-                (symbol_short!("cache"), symbol_short!("invalidate"), anchor.clone()),
+                (symbol_short!("cache"), symbol_short!("invalid"), anchor.clone()),
                 env.ledger().timestamp(),
             );
         }
