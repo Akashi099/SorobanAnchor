@@ -716,6 +716,120 @@ where
     }
 }
 
+/// [`deliver_webhook`] with structured logging of every delivery attempt.
+///
+/// Behaviour is identical to [`deliver_webhook`]; in addition the following
+/// entries are recorded on `logger` (see [`crate::structured_log`] for the
+/// schema):
+///
+/// - `webhook.delivery_started` (info) — before the first attempt.
+/// - `webhook.delivery_attempt_failed` (warn) — per failed attempt, with the
+///   attempt number, HTTP status (0 on transport failure) and error text.
+/// - `webhook.delivery_succeeded` (info) — on success, with the number of
+///   attempts used.
+/// - `webhook.delivery_failed` (error) and `webhook.dlq_entry_added` (warn) —
+///   on exhaustion, the latter with the resulting DLQ depth for the key.
+pub fn deliver_webhook_logged<H, S, T>(
+    config: &WebhookDeliveryConfig,
+    payload: &str,
+    dlq: &mut BTreeMap<String, Vec<DlqEntry>>,
+    http_post: H,
+    sleep_fn: S,
+    now_fn: T,
+    logger: &crate::structured_log::StructuredLogger,
+) -> Result<(), AnchorKitError>
+where
+    H: Fn(&str, &str, Option<&str>) -> Result<u16, String>,
+    S: FnMut(u64),
+    T: Fn() -> u64,
+{
+    use crate::structured_log::events;
+
+    logger.info(
+        events::WEBHOOK_DELIVERY_STARTED,
+        now_fn(),
+        &[
+            ("endpoint_url", config.endpoint_url.as_str().into()),
+            ("dlq_key", config.dead_letter_storage_key.as_str().into()),
+            ("payload_bytes", payload.len().into()),
+            ("max_attempts", config.retry_config.max_attempts.into()),
+            ("signed", config.signing_key.is_some().into()),
+        ],
+    );
+
+    let attempts = core::cell::Cell::new(0u32);
+    let logging_post = |url: &str, body: &str, sig: Option<&str>| {
+        let attempt = attempts.get() + 1;
+        attempts.set(attempt);
+        let result = http_post(url, body, sig);
+        let (status, error) = match &result {
+            Ok(s) if *s < 400 => return result,
+            Ok(s) => (*s, format!("HTTP {s}")),
+            Err(e) => (0u16, e.clone()),
+        };
+        logger.warn(
+            events::WEBHOOK_DELIVERY_ATTEMPT_FAILED,
+            now_fn(),
+            &[
+                ("endpoint_url", config.endpoint_url.as_str().into()),
+                ("attempt", attempt.into()),
+                ("status", status.into()),
+                ("error", error.into()),
+            ],
+        );
+        result
+    };
+
+    let outcome = deliver_webhook(config, payload, dlq, logging_post, sleep_fn, &now_fn);
+
+    match &outcome {
+        Ok(()) => {
+            logger.info(
+                events::WEBHOOK_DELIVERY_SUCCEEDED,
+                now_fn(),
+                &[
+                    ("endpoint_url", config.endpoint_url.as_str().into()),
+                    ("attempts", attempts.get().into()),
+                ],
+            );
+        }
+        Err(_) => {
+            let dlq_depth = dlq
+                .get(&config.dead_letter_storage_key)
+                .map(Vec::len)
+                .unwrap_or(0);
+            let last = dlq
+                .get(&config.dead_letter_storage_key)
+                .and_then(|entries| entries.last());
+            logger.error(
+                events::WEBHOOK_DELIVERY_FAILED,
+                now_fn(),
+                &[
+                    ("endpoint_url", config.endpoint_url.as_str().into()),
+                    ("attempts", attempts.get().into()),
+                    (
+                        "last_status",
+                        last.map(|e| e.last_status_code).unwrap_or(0).into(),
+                    ),
+                    (
+                        "last_error",
+                        last.map(|e| e.last_error.as_str()).unwrap_or("").into(),
+                    ),
+                ],
+            );
+            logger.warn(
+                events::WEBHOOK_DLQ_ENTRY_ADDED,
+                now_fn(),
+                &[
+                    ("dlq_key", config.dead_letter_storage_key.as_str().into()),
+                    ("dlq_depth", dlq_depth.into()),
+                ],
+            );
+        }
+    }
+    outcome
+}
+
 // ---------------------------------------------------------------------------
 // DLQ inspection
 // ---------------------------------------------------------------------------

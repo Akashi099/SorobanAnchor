@@ -573,6 +573,213 @@ pub fn proposal_count(env: &Env) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Structured-logging wrappers (host-side only)
+// ---------------------------------------------------------------------------
+
+/// Structured-logging wrappers around the governance API.
+///
+/// Each `*_logged` function behaves exactly like its unlogged counterpart and
+/// additionally records structured entries (see [`crate::structured_log`]) on
+/// the supplied logger. Only compiled for host builds — on-chain (`wasm`)
+/// builds keep using the plain functions and the contract event stream.
+#[cfg(not(feature = "wasm"))]
+mod logged {
+    use super::*;
+    use crate::structured_log::{events, StructuredLogger};
+
+    /// Render a soroban [`Address`] as a host string for log fields.
+    fn address_field(_env: &Env, addr: &Address) -> alloc::string::String {
+        let s = addr.to_string();
+        let len = s.len() as usize;
+        let mut buf = alloc::vec![0u8; len];
+        s.copy_into_slice(&mut buf);
+        alloc::string::String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// Wire name of a [`CacheEntryType`] for log fields.
+    fn entry_type_field(entry_type: CacheEntryType) -> &'static str {
+        match entry_type {
+            CacheEntryType::Metadata => "metadata",
+            CacheEntryType::Capabilities => "capabilities",
+            CacheEntryType::Other => "other",
+        }
+    }
+
+    /// [`set_policy_set`] plus a `cache.policy_updated` (info) entry on
+    /// success or `cache.policy_rejected` (warn) when validation fails.
+    pub fn set_policy_set_logged(
+        env: &Env,
+        policies: CachePolicySet,
+        logger: &StructuredLogger,
+    ) -> Result<(), AnchorKitError> {
+        let ts = env.ledger().timestamp();
+        let summary = [
+            ("metadata_max_ttl_seconds", policies.metadata.max_ttl_seconds.into()),
+            ("capabilities_max_ttl_seconds", policies.capabilities.max_ttl_seconds.into()),
+            ("other_max_ttl_seconds", policies.other.max_ttl_seconds.into()),
+        ];
+        match set_policy_set(env, policies) {
+            Ok(()) => {
+                logger.info(events::CACHE_POLICY_UPDATED, ts, &summary);
+                Ok(())
+            }
+            Err(err) => {
+                logger.warn(
+                    events::CACHE_POLICY_REJECTED,
+                    ts,
+                    &[("error", alloc::format!("{:?}", err).into())],
+                );
+                Err(err)
+            }
+        }
+    }
+
+    /// [`enforce_write_policy`] plus a `cache.ttl_clamped` (warn) entry when
+    /// the caller-supplied TTL had to be adjusted to the policy band.
+    pub fn enforce_write_policy_logged(
+        env: &Env,
+        entry_type: CacheEntryType,
+        requested_ttl: u64,
+        current_age_seconds: u64,
+        logger: &StructuredLogger,
+    ) -> (u64, bool) {
+        let (effective_ttl, refresh_needed) =
+            enforce_write_policy(env, entry_type, requested_ttl, current_age_seconds);
+        if requested_ttl != 0 && effective_ttl != requested_ttl {
+            logger.warn(
+                events::CACHE_TTL_CLAMPED,
+                env.ledger().timestamp(),
+                &[
+                    ("entry_type", entry_type_field(entry_type).into()),
+                    ("requested_ttl_seconds", requested_ttl.into()),
+                    ("effective_ttl_seconds", effective_ttl.into()),
+                ],
+            );
+        }
+        (effective_ttl, refresh_needed)
+    }
+
+    /// [`enforce_invalidation_policy`] plus a `cache.invalidation_denied`
+    /// (warn) entry when the policy forbids forced invalidation.
+    pub fn enforce_invalidation_policy_logged(
+        env: &Env,
+        entry_type: CacheEntryType,
+        logger: &StructuredLogger,
+    ) -> Result<(), AnchorKitError> {
+        let result = enforce_invalidation_policy(env, entry_type);
+        if result.is_err() {
+            logger.warn(
+                events::CACHE_INVALIDATION_DENIED,
+                env.ledger().timestamp(),
+                &[("entry_type", entry_type_field(entry_type).into())],
+            );
+        }
+        result
+    }
+
+    /// [`propose`] plus a `cache.proposal_created` (info) entry.
+    pub fn propose_logged(
+        env: &Env,
+        proposer: &Address,
+        anchor: &Address,
+        logger: &StructuredLogger,
+    ) -> u64 {
+        let proposal_id = propose(env, proposer, anchor);
+        logger.info(
+            events::CACHE_PROPOSAL_CREATED,
+            env.ledger().timestamp(),
+            &[
+                ("proposal_id", proposal_id.into()),
+                ("anchor", address_field(env, anchor).into()),
+                ("proposer", address_field(env, proposer).into()),
+                ("ledger", env.ledger().sequence().into()),
+            ],
+        );
+        proposal_id
+    }
+
+    /// [`endorse`] plus a `cache.proposal_endorsed` (info) entry with the
+    /// running endorsement count, or `cache.proposal_endorse_failed` (warn)
+    /// when the proposal is missing, expired, or already executed.
+    pub fn endorse_logged(
+        env: &Env,
+        endorser: &Address,
+        proposal_id: u64,
+        logger: &StructuredLogger,
+    ) -> Result<(), AnchorKitError> {
+        let ts = env.ledger().timestamp();
+        match endorse(env, endorser, proposal_id) {
+            Ok(()) => {
+                let endorsement_count = get_proposal(env, proposal_id)
+                    .map(|p| p.endorsements.len())
+                    .unwrap_or(0);
+                logger.info(
+                    events::CACHE_PROPOSAL_ENDORSED,
+                    ts,
+                    &[
+                        ("proposal_id", proposal_id.into()),
+                        ("endorser", address_field(env, endorser).into()),
+                        ("endorsement_count", endorsement_count.into()),
+                    ],
+                );
+                Ok(())
+            }
+            Err(err) => {
+                logger.warn(
+                    events::CACHE_PROPOSAL_ENDORSE_FAILED,
+                    ts,
+                    &[
+                        ("proposal_id", proposal_id.into()),
+                        ("error", alloc::format!("{:?}", err).into()),
+                    ],
+                );
+                Err(err)
+            }
+        }
+    }
+
+    /// [`execute`] plus a `cache.proposal_executed` (info) entry, or
+    /// `cache.proposal_execute_failed` (warn) when execution is not possible.
+    pub fn execute_logged(
+        env: &Env,
+        proposal_id: u64,
+        logger: &StructuredLogger,
+    ) -> Result<Address, AnchorKitError> {
+        let ts = env.ledger().timestamp();
+        match execute(env, proposal_id) {
+            Ok(anchor) => {
+                logger.info(
+                    events::CACHE_PROPOSAL_EXECUTED,
+                    ts,
+                    &[
+                        ("proposal_id", proposal_id.into()),
+                        ("anchor", address_field(env, &anchor).into()),
+                    ],
+                );
+                Ok(anchor)
+            }
+            Err(err) => {
+                logger.warn(
+                    events::CACHE_PROPOSAL_EXECUTE_FAILED,
+                    ts,
+                    &[
+                        ("proposal_id", proposal_id.into()),
+                        ("error", alloc::format!("{:?}", err).into()),
+                    ],
+                );
+                Err(err)
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "wasm"))]
+pub use logged::{
+    endorse_logged, enforce_invalidation_policy_logged, enforce_write_policy_logged,
+    execute_logged, propose_logged, set_policy_set_logged,
+};
+
+// ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
 
