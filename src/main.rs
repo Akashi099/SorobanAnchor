@@ -1180,6 +1180,7 @@ fn status(tx_id: &str, anchor_url: &str, proxy_url: Option<&str>, no_proxy: Opti
     let proxy_cfg = anchorkit::ProxyConfig {
         proxy_url: proxy_url.map(|s| s.to_string()),
         no_proxy: no_proxy.map(|s| s.to_string()),
+        ..anchorkit::ProxyConfig::default()
     };
     let client = anchorkit::build_client(
         if proxy_cfg.is_configured() { Some(&proxy_cfg) } else { None },
@@ -1658,6 +1659,7 @@ fn discover(anchor_url: &str, proxy_url: Option<&str>, no_proxy: Option<&str>, t
     let proxy_cfg = anchorkit::ProxyConfig {
         proxy_url: proxy_url.map(|s| s.to_string()),
         no_proxy: no_proxy.map(|s| s.to_string()),
+        ..anchorkit::ProxyConfig::default()
     };
     let proxy = if proxy_cfg.is_configured() { Some(&proxy_cfg) } else { None };
 

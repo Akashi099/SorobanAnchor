@@ -38,7 +38,14 @@ pub struct RuntimeConfig {
 /// Proxy settings embedded in the runtime configuration file.
 ///
 /// When present, all outbound HTTP requests (stellar.toml discovery, webhook
-/// delivery, SEP-6 status checks) route through the specified proxy.
+/// delivery, SEP-6 status checks) route through the selected proxy.
+/// Scheme-specific proxies (`http_proxy_url` / `https_proxy_url`) take
+/// precedence over the catch-all `proxy_url`; hosts on `no_proxy` bypass all
+/// proxies. Optional `credentials` authenticate to the proxy via HTTP Basic.
+///
+/// The configuration is validated on load: malformed proxy URLs, credentials
+/// without a username, and credentials supplied without any proxy URL are all
+/// rejected (see [`ProxyConfig::validate`]).
 ///
 /// # Example (JSON)
 ///
@@ -46,14 +53,17 @@ pub struct RuntimeConfig {
 /// {
 ///   "proxy": {
 ///     "proxy_url": "http://proxy.corp.example.com:3128",
-///     "no_proxy": "localhost,127.0.0.1"
+///     "https_proxy_url": "http://tls-proxy.corp.example.com:3129",
+///     "no_proxy": "localhost,127.0.0.1",
+///     "credentials": { "username": "svc-anchor", "password": "s3cret" }
 ///   }
 /// }
 /// ```
 ///
-/// This is a re-export of [`http_client::ProxyConfig`] so that config files and
-/// the HTTP client share a single type.
-pub use crate::http_client::ProxyConfig;
+/// These are re-exports of [`http_client::ProxyConfig`] /
+/// [`http_client::ProxyCredentials`] so that config files and the HTTP client
+/// share a single type.
+pub use crate::http_client::{ProxyConfig, ProxyCredentials};
 
 #[derive(Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -342,6 +352,10 @@ fn validate_runtime_config(config: &RuntimeConfig) -> Result<(), String> {
         }
     }
 
+    if let Some(proxy) = &config.proxy {
+        proxy.validate().map_err(|err| format!("proxy: {err}"))?;
+    }
+
     Ok(())
 }
 
@@ -421,6 +435,7 @@ mod proxy_config_tests {
         let configured = ProxyConfig {
             proxy_url: Some("http://proxy.example.com:3128".to_string()),
             no_proxy: None,
+            ..ProxyConfig::default()
         };
         assert!(configured.is_configured());
 
@@ -453,5 +468,105 @@ no_proxy = "localhost"
             Some("http://proxy.corp.example.com:3128")
         );
         assert_eq!(proxy.no_proxy.as_deref(), Some("localhost"));
+    }
+
+    // ── Proxy credentials and validation (#606) ───────────────────────────────
+
+    #[test]
+    fn test_config_with_proxy_credentials_and_per_scheme_urls() {
+        let proxy_section = r#","proxy": {
+            "proxy_url": "http://proxy.corp.example.com:3128",
+            "https_proxy_url": "http://tls-proxy.corp.example.com:3129",
+            "no_proxy": "localhost",
+            "credentials": {"username": "svc-anchor", "password": "s3cret"}
+        }"#;
+        let json = base_config_json(proxy_section);
+        let config = parse_runtime_config_str(&json, ConfigFormat::Json).unwrap();
+        let proxy = config.proxy.expect("proxy should be Some");
+        assert_eq!(
+            proxy.https_proxy_url.as_deref(),
+            Some("http://tls-proxy.corp.example.com:3129")
+        );
+        let creds = proxy.credentials.as_ref().expect("credentials should be Some");
+        assert_eq!(creds.username, "svc-anchor");
+        assert_eq!(creds.password, "s3cret");
+        assert!(proxy.has_credentials());
+    }
+
+    #[test]
+    fn test_config_toml_with_proxy_credentials() {
+        let toml_input = r#"
+[contract]
+name = "TestAnchor"
+version = "1.0.0"
+network = "testnet"
+
+[[attestors.registry]]
+name = "attestor-1"
+address = "GABC123"
+role = "primary"
+enabled = true
+
+[proxy]
+http_proxy_url = "http://http-proxy.corp:3128"
+https_proxy_url = "http://tls-proxy.corp:3129"
+
+[proxy.credentials]
+username = "svc-anchor"
+password = "s3cret"
+"#;
+        let config = parse_runtime_config_str(toml_input, ConfigFormat::Toml).unwrap();
+        let proxy = config.proxy.expect("proxy should be Some");
+        assert_eq!(proxy.http_proxy_url.as_deref(), Some("http://http-proxy.corp:3128"));
+        assert_eq!(
+            proxy.credentials.as_ref().map(|c| c.username.as_str()),
+            Some("svc-anchor")
+        );
+    }
+
+    #[test]
+    fn test_config_rejects_invalid_proxy_scheme_at_parse_time() {
+        let proxy_section = r#","proxy": {"proxy_url": "socks5://proxy.corp:1080"}"#;
+        let json = base_config_json(proxy_section);
+        let err = parse_runtime_config_str(&json, ConfigFormat::Json).unwrap_err();
+        assert!(err.contains("invalid proxy URL"), "got: {err}");
+        assert!(err.starts_with("proxy:"), "error should be scoped to proxy, got: {err}");
+    }
+
+    #[test]
+    fn test_config_rejects_credentials_without_proxy_url() {
+        let proxy_section =
+            r#","proxy": {"credentials": {"username": "svc", "password": "pw"}}"#;
+        let json = base_config_json(proxy_section);
+        let err = parse_runtime_config_str(&json, ConfigFormat::Json).unwrap_err();
+        assert!(err.contains("no proxy URL configured"), "got: {err}");
+    }
+
+    #[test]
+    fn test_config_rejects_credentials_missing_password() {
+        let proxy_section = r#","proxy": {"proxy_url": "http://proxy.corp:3128", "credentials": {"username": "svc"}}"#;
+        let json = base_config_json(proxy_section);
+        assert!(
+            parse_runtime_config_str(&json, ConfigFormat::Json).is_err(),
+            "credentials without a password field must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_config_rejects_unknown_proxy_field() {
+        let proxy_section = r#","proxy": {"proxy_url": "http://proxy.corp:3128", "pasword": "typo"}"#;
+        let json = base_config_json(proxy_section);
+        assert!(
+            parse_runtime_config_str(&json, ConfigFormat::Json).is_err(),
+            "unknown proxy fields (likely typos) must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_config_rejects_empty_credential_username() {
+        let proxy_section = r#","proxy": {"proxy_url": "http://proxy.corp:3128", "credentials": {"username": "", "password": "pw"}}"#;
+        let json = base_config_json(proxy_section);
+        let err = parse_runtime_config_str(&json, ConfigFormat::Json).unwrap_err();
+        assert!(err.contains("username cannot be empty"), "got: {err}");
     }
 }

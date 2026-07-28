@@ -206,7 +206,7 @@ pub use config::{load_runtime_config_file, parse_runtime_config_str, ConfigForma
 
 // ── Host-only re-exports ──────────────────────────────────────────────────────
 #[cfg(not(feature = "wasm"))]
-pub use http_client::ProxyConfig;
+pub use http_client::{ProxyConfig, ProxyCredentials, RequestCredentials};
 #[cfg(all(not(feature = "wasm"), feature = "std"))]
 pub use http_client::{build_client, build_client_with_policy, fetch_stellar_toml_with_proxy, deliver_webhook_with_proxy};
 #[cfg(not(feature = "wasm"))]
