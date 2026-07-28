@@ -186,6 +186,26 @@ pub struct AttestationPage {
     pub total: u64,
 }
 
+// ── Issue #663: Deterministic ordering for attestation results ────────────────
+
+/// Criteria for deterministically ordering [`Attestation`] records off-chain.
+///
+/// On-chain pages are always returned in ascending `id` order.  Use these
+/// variants when you need a different ordering client-side.  The `id` field
+/// is always the final tiebreaker so results are fully stable regardless of
+/// storage order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AttestationSortOrder {
+    /// Sort by `id` ascending (default on-chain order).
+    IdAsc,
+    /// Sort by `id` descending (newest first).
+    IdDesc,
+    /// Sort by `timestamp` ascending, then `id` ascending on ties.
+    TimestampAsc,
+    /// Sort by `timestamp` descending (most recent first), then `id` ascending on ties.
+    TimestampDesc,
+}
+
 /// Input record for [`AnchorKitContract::submit_attestation_batch`].
 #[contracttype]
 #[derive(Clone)]
@@ -9520,6 +9540,46 @@ impl AnchorKitContract {
             },
         }
     }
+}
+
+// ── Issue #663: Off-chain deterministic ordering for attestation results ──────
+
+/// Sort a slice of [`Attestation`] records into a new `Vec` using the given
+/// [`AttestationSortOrder`].
+///
+/// The sort is stable with respect to non-tiebreaker criteria. `id` is always
+/// the final tiebreaker for `TimestampAsc`/`TimestampDesc` so results are
+/// fully deterministic regardless of how records are stored.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use anchorkit::contract::{Attestation, AttestationSortOrder, sort_attestations};
+/// // Assumes you have collected attestations from paginated queries.
+/// ```
+#[cfg(not(feature = "wasm"))]
+pub fn sort_attestations(
+    records: &[Attestation],
+    order: AttestationSortOrder,
+) -> alloc::vec::Vec<Attestation> {
+    let mut result: alloc::vec::Vec<Attestation> = records.to_vec();
+    result.sort_by(|a, b| {
+        let primary = match order {
+            AttestationSortOrder::IdAsc       => a.id.cmp(&b.id),
+            AttestationSortOrder::IdDesc      => b.id.cmp(&a.id),
+            AttestationSortOrder::TimestampAsc  => a.timestamp.cmp(&b.timestamp),
+            AttestationSortOrder::TimestampDesc => b.timestamp.cmp(&a.timestamp),
+        };
+        // Tiebreak on `id` ascending for timestamp-based orders.
+        if primary == core::cmp::Ordering::Equal
+            && matches!(order, AttestationSortOrder::TimestampAsc | AttestationSortOrder::TimestampDesc)
+        {
+            a.id.cmp(&b.id)
+        } else {
+            primary
+        }
+    });
+    result
 }
 
 // ---------------------------------------------------------------------------
