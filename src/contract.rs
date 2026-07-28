@@ -348,7 +348,8 @@ pub struct AttestorRevocationRecord {
 // |                          | cache_capabilities, refresh_capabilities_cache  |
 // | ToggleServices           | enable_service, disable_service,                |
 // |                          | snapshot_services, rollback_services            |
-// | SetRateLimits            | set_rate_limit_config, set_role_rate_limit      |
+// | SetRateLimits            | set_rate_limit_config, set_role_rate_limit,     |
+// |                          | set_address_rate_limit                          |
 // | SetJwtConfig             | set_sep10_jwt_verifying_key, rotate_sep10_key,  |
 // |                          | set_jwt_max_len, set_jwt_skew                   |
 // | ManageAnchorMetadata     | set_anchor_metadata, reactivate_anchor,         |
@@ -388,7 +389,8 @@ pub enum AdminCapability {
     /// Gate on `enable_service`, `disable_service`, `snapshot_services`,
     /// and `rollback_services`.
     ToggleServices      = 6,
-    /// Gate on `set_rate_limit_config` and `set_role_rate_limit`.
+    /// Gate on `set_rate_limit_config`, `set_role_rate_limit`, and
+    /// `set_address_rate_limit`.
     SetRateLimits       = 7,
     /// Gate on `set_sep10_jwt_verifying_key`, `rotate_sep10_key`,
     /// `set_jwt_max_len`, and `set_jwt_skew`.
@@ -8699,6 +8701,26 @@ impl AnchorKitContract {
         RateLimiter::get_role_override(&env, role)
     }
 
+    /// Set a per-attestor (per-address) rate limit override. Requires the
+    /// primary admin or a holder of [`AdminCapability::SetRateLimits`].
+    ///
+    /// Address overrides take precedence over role overrides and the global
+    /// default (see [`RateLimiter::resolve_config`]), so this is the
+    /// mechanism for giving an individual high-value or low-volume attestor
+    /// its own policy without affecting the rest of its role/tenant.
+    pub fn set_address_rate_limit(env: Env, caller: Address, address: Address, config: RateLimitConfig) {
+        Self::require_admin_or_capability(&env, &caller, AdminCapability::SetRateLimits);
+        RateLimiter::validate_config(&config)
+            .unwrap_or_else(|_| panic_with_error!(&env, ErrorCode::ValidationError));
+        RateLimiter::set_address_override(&env, &address, config);
+        AdminAuditLog::log_action(&env, &caller, "set_address_rate_limit", soroban_sdk::String::from_str(&env, "address"), "", "updated");
+    }
+
+    /// Get per-address rate limit override, or None if not set.
+    pub fn get_address_rate_limit(env: Env, address: Address) -> Option<RateLimitConfig> {
+        RateLimiter::get_address_override(&env, &address)
+    }
+
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
@@ -10569,6 +10591,178 @@ mod admin_capability_tests {
         AnchorKitContract::grant_role(env.clone(), delegate.clone(), AdminRole::KycAdmin);
         AnchorKitContract::revoke_role(env.clone(), delegate.clone(), AdminRole::KycAdmin);
         assert!(!AnchorKitContract::has_role(env, delegate, AdminRole::KycAdmin));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — per-role / per-attestor rate limit overrides (#631)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod rate_limit_override_tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::{Address, Env};
+
+    fn init_env() -> (Env, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        AnchorKitContract::initialize(env.clone(), admin.clone());
+        (env, admin)
+    }
+
+    /// With no overrides set, resolution falls back to the global default.
+    #[test]
+    fn test_default_behavior_uses_global_config() {
+        let (env, admin) = init_env();
+        let attestor = Address::generate(&env);
+
+        AnchorKitContract::set_rate_limit_config(env.clone(), admin, 7, 42);
+        let resolved = RateLimiter::resolve_config(&env, &attestor, None);
+        assert_eq!(resolved.max_submissions, 7);
+        assert_eq!(resolved.window_length, 42);
+    }
+
+    /// A role override takes effect for attestors resolved under that role.
+    #[test]
+    fn test_role_override_takes_precedence_over_global() {
+        let (env, admin) = init_env();
+        let attestor = Address::generate(&env);
+        let role = Symbol::new(&env, "KycAdmin");
+
+        AnchorKitContract::set_rate_limit_config(env.clone(), admin.clone(), 10, 100);
+        AnchorKitContract::set_role_rate_limit(
+            env.clone(),
+            admin,
+            role.clone(),
+            RateLimitConfig { max_submissions: 3, window_length: 20 },
+        );
+
+        let resolved = RateLimiter::resolve_config(&env, &attestor, Some(role.clone()));
+        assert_eq!(resolved.max_submissions, 3);
+        assert_eq!(resolved.window_length, 20);
+        assert_eq!(
+            AnchorKitContract::get_role_rate_limit(env, role),
+            Some(RateLimitConfig { max_submissions: 3, window_length: 20 })
+        );
+    }
+
+    /// A per-address override takes precedence over a per-role override.
+    #[test]
+    fn test_address_override_takes_precedence_over_role() {
+        let (env, admin) = init_env();
+        let attestor = Address::generate(&env);
+        let role = Symbol::new(&env, "KycAdmin");
+
+        AnchorKitContract::set_rate_limit_config(env.clone(), admin.clone(), 10, 100);
+        AnchorKitContract::set_role_rate_limit(
+            env.clone(),
+            admin.clone(),
+            role.clone(),
+            RateLimitConfig { max_submissions: 3, window_length: 20 },
+        );
+        AnchorKitContract::set_address_rate_limit(
+            env.clone(),
+            admin,
+            attestor.clone(),
+            RateLimitConfig { max_submissions: 1, window_length: 5 },
+        );
+
+        let resolved = RateLimiter::resolve_config(&env, &attestor, Some(role));
+        assert_eq!(resolved.max_submissions, 1);
+        assert_eq!(resolved.window_length, 5);
+        assert_eq!(
+            AnchorKitContract::get_address_rate_limit(env, attestor),
+            Some(RateLimitConfig { max_submissions: 1, window_length: 5 })
+        );
+    }
+
+    /// An address override does not leak to other attestors sharing the same role.
+    #[test]
+    fn test_address_override_does_not_affect_other_attestors() {
+        let (env, admin) = init_env();
+        let overridden = Address::generate(&env);
+        let other = Address::generate(&env);
+        let role = Symbol::new(&env, "KycAdmin");
+
+        AnchorKitContract::set_rate_limit_config(env.clone(), admin.clone(), 10, 100);
+        AnchorKitContract::set_role_rate_limit(
+            env.clone(),
+            admin.clone(),
+            role.clone(),
+            RateLimitConfig { max_submissions: 5, window_length: 50 },
+        );
+        AnchorKitContract::set_address_rate_limit(
+            env.clone(),
+            admin,
+            overridden.clone(),
+            RateLimitConfig { max_submissions: 1, window_length: 5 },
+        );
+
+        let resolved_overridden = RateLimiter::resolve_config(&env, &overridden, Some(role.clone()));
+        assert_eq!(resolved_overridden.max_submissions, 1);
+
+        let resolved_other = RateLimiter::resolve_config(&env, &other, Some(role));
+        assert_eq!(resolved_other.max_submissions, 5, "other attestor must keep the role override, not the address override");
+    }
+
+    /// get_address_rate_limit returns None when no override has been set.
+    #[test]
+    fn test_get_address_rate_limit_none_when_unset() {
+        let (env, _admin) = init_env();
+        let attestor = Address::generate(&env);
+        assert_eq!(AnchorKitContract::get_address_rate_limit(env, attestor), None);
+    }
+
+    /// Invalid override values (zero max_submissions / window_length) are rejected.
+    #[test]
+    #[should_panic]
+    fn test_set_address_rate_limit_rejects_invalid_config() {
+        let (env, admin) = init_env();
+        let attestor = Address::generate(&env);
+        AnchorKitContract::set_address_rate_limit(
+            env,
+            admin,
+            attestor,
+            RateLimitConfig { max_submissions: 0, window_length: 10 },
+        );
+    }
+
+    /// A caller without SetRateLimits (and not the admin) cannot set an address override.
+    #[test]
+    #[should_panic]
+    fn test_set_address_rate_limit_requires_capability() {
+        let (env, _admin) = init_env();
+        let stranger = Address::generate(&env);
+        let attestor = Address::generate(&env);
+        AnchorKitContract::set_address_rate_limit(
+            env,
+            stranger,
+            attestor,
+            RateLimitConfig { max_submissions: 5, window_length: 50 },
+        );
+    }
+
+    /// A delegate holding only SetRateLimits can set an address override.
+    #[test]
+    fn test_set_address_rate_limit_allowed_for_capability_holder() {
+        let (env, admin) = init_env();
+        let delegate = Address::generate(&env);
+        let attestor = Address::generate(&env);
+        AnchorKitContract::grant_capability(env.clone(), delegate.clone(), AdminCapability::SetRateLimits);
+
+        AnchorKitContract::set_address_rate_limit(
+            env.clone(),
+            delegate,
+            attestor.clone(),
+            RateLimitConfig { max_submissions: 2, window_length: 8 },
+        );
+
+        assert_eq!(
+            AnchorKitContract::get_address_rate_limit(env, attestor),
+            Some(RateLimitConfig { max_submissions: 2, window_length: 8 })
+        );
     }
 }
 
