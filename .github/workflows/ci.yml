@@ -291,6 +291,11 @@ jobs:
           VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*= *"\(.*\)"/\1/')
           bash scripts/validate_bundle.sh "dist/anchorkit-${VERSION}.tar.gz"
 
+      - name: Verify artifact checksums
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+          bash scripts/verify_artifact_checksums.sh "${VERSION}"
+
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4
         with:

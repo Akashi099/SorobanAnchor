@@ -92,6 +92,14 @@ release:
 release-validate:
 	@bash scripts/validate_bundle.sh $(DIST_DIR)/anchorkit-$(VERSION).tar.gz
 
+## Verify artifact checksums for the current release bundle.
+verify-checksums:
+	@bash scripts/verify_artifact_checksums.sh $(VERSION)
+
+## Generate artifact checksums for the current release bundle (run after `make release`).
+generate-checksums:
+	@bash scripts/verify_artifact_checksums.sh --generate $(VERSION)
+
 ## Remove the dist/ directory.
 clean-dist:
 	rm -rf $(DIST_DIR)
