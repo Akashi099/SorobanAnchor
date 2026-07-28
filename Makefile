@@ -6,7 +6,7 @@ SOURCE_DATE_EPOCH ?= 1717200000
 
 .PHONY: build test wasm lint \
         integration-test integration-test-live \
-        release release-validate \
+        release release-sign release-sign-dry-run release-validate release-verify \
         clean-dist reproducible-wasm verify-reproducible
 
 # ── Core build targets ────────────────────────────────────────────────────────
@@ -58,9 +58,22 @@ integration-test-live:
 release:
 	@bash scripts/package_release.sh $(VERSION)
 
+## Sign the release artifacts (GPG by default; set ANCHORKIT_SIGNING_BACKEND=minisign for minisign).
+release-sign:
+	@bash scripts/sign_release.sh $(VERSION)
+
+## Sign the release artifacts in dry-run mode (prints commands without executing).
+release-sign-dry-run:
+	@bash scripts/sign_release.sh --dry-run $(VERSION)
+
 ## Validate the release bundle produced by `make release`.
 release-validate:
 	@bash scripts/validate_bundle.sh $(DIST_DIR)/anchorkit-$(VERSION).tar.gz
+
+## Verify the integrity and signature of a release bundle.
+## Usage: make release-verify TARBALL=dist/anchorkit-0.1.0.tar.gz
+release-verify:
+	@bash scripts/verify_release.sh $(TARBALL)
 
 ## Remove the dist/ directory.
 clean-dist:

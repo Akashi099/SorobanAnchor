@@ -133,6 +133,10 @@ pub enum ErrorCode {
     SignatureVerificationFailed = 61,
     /// Batch submission contains more items than the per-call maximum.
     BatchSizeExceeded         = 62,
+    /// Base and quote asset are the same (circular corridor).
+    InvalidAssetPair          = 63,
+    /// Amount is zero or otherwise invalid for routing.
+    InvalidAmount             = 64,
 }
 
 impl ErrorCode {
