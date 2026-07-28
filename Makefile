@@ -88,6 +88,14 @@ bench-compare:
 release:
 	@bash scripts/package_release.sh $(VERSION)
 
+## Sign the release artifacts (GPG by default; set ANCHORKIT_SIGNING_BACKEND=minisign for minisign).
+release-sign:
+	@bash scripts/sign_release.sh $(VERSION)
+
+## Sign the release artifacts in dry-run mode (prints commands without executing).
+release-sign-dry-run:
+	@bash scripts/sign_release.sh --dry-run $(VERSION)
+
 ## Validate the release bundle produced by `make release`.
 release-validate:
 	@bash scripts/validate_bundle.sh $(DIST_DIR)/anchorkit-$(VERSION).tar.gz

@@ -260,7 +260,7 @@ jobs:
     runs-on: ubuntu-latest
     # Only run on pushes to main, not on PRs
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [ci, integration]
+    needs: [ci, integration, coverage]
 
     steps:
       - uses: actions/checkout@v4

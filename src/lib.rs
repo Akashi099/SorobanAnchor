@@ -164,6 +164,12 @@ pub mod stellar_toml;
 #[cfg(not(feature = "wasm"))]
 pub mod streaming_monitor;
 
+// ── Multi-asset quote routing (#656) ─────────────────────────────────────────
+// Available in host (non-WASM) builds. Provides asset-pair routing across
+// multiple corridors in a single pass.
+#[cfg(not(feature = "wasm"))]
+pub mod multi_asset_routing;
+
 // ── Mock helpers (test / CI without live anchor) ──────────────────────────────
 #[cfg(feature = "mock-only")]
 pub mod mock;
@@ -252,6 +258,12 @@ pub use transaction_state_tracker::{BudgetStatus, BudgetAlert};
 pub use sep38::{CrossAnchorFeeAggregator, FeeAnomalyReport};
 #[cfg(not(feature = "wasm"))]
 pub use streaming_monitor::{StreamingTransactionMonitor, TransactionStatusUpdate, StateTransition, BackpressureConfig};
+#[cfg(not(feature = "wasm"))]
+pub use multi_asset_routing::{
+    route_multi_asset, validate_asset_pair_request, normalize_asset_code as normalize_asset_code_routing,
+    pair_key, select_best,
+    AssetPairRequest, AssetPairQuote, CandidateQuote, MultiAssetRoutingResult,
+};
 
 #[cfg(all(test, not(feature = "wasm")))]
 mod stellar_toml_tests;
