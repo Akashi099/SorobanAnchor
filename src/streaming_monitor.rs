@@ -452,6 +452,116 @@ impl StreamingTransactionMonitor {
             sleep_fn(self.poll_interval_ms);
         }
     }
+
+    /// [`run`](Self::run) with structured logging of the polling workflow.
+    ///
+    /// Behaviour (polling, retries, backpressure, emitted
+    /// [`TransactionStatusUpdate`] events) is identical to [`run`](Self::run);
+    /// in addition the following entries are recorded on `logger` (see
+    /// [`crate::structured_log`] for the schema):
+    ///
+    /// - `txstatus.monitor_started` (info) — once, before the first poll.
+    /// - `txstatus.poll_error` (warn) — per failed poll attempt, with the
+    ///   attempt number for the current poll cycle and the error text.
+    /// - `txstatus.state_changed` (info) — per state transition.
+    /// - `txstatus.more_info_available` (info) — when an interactive URL is emitted.
+    /// - `txstatus.completed` (info) / `txstatus.failed` (error) — terminal outcome.
+    pub fn run_logged<P, E, S, T>(
+        &mut self,
+        mut poll_fn: P,
+        mut on_event: E,
+        sleep_fn: S,
+        timestamp_fn: T,
+        logger: &crate::structured_log::StructuredLogger,
+    ) where
+        P: FnMut(u64) -> Result<PollResult, alloc::string::String>,
+        E: FnMut(TransactionStatusUpdate),
+        S: FnMut(u64),
+        T: Fn() -> u64,
+    {
+        use crate::structured_log::events;
+
+        let transaction_id = self.transaction_id;
+        logger.info(
+            events::TXSTATUS_MONITOR_STARTED,
+            timestamp_fn(),
+            &[
+                ("transaction_id", transaction_id.into()),
+                ("poll_interval_ms", self.poll_interval_ms.into()),
+            ],
+        );
+
+        let poll_errors = core::cell::Cell::new(0u32);
+        self.run(
+            |id| {
+                let result = poll_fn(id);
+                if let Err(reason) = &result {
+                    let attempt = poll_errors.get() + 1;
+                    poll_errors.set(attempt);
+                    logger.warn(
+                        events::TXSTATUS_POLL_ERROR,
+                        timestamp_fn(),
+                        &[
+                            ("transaction_id", transaction_id.into()),
+                            ("consecutive_errors", attempt.into()),
+                            ("error", reason.as_str().into()),
+                        ],
+                    );
+                } else {
+                    poll_errors.set(0);
+                }
+                result
+            },
+            |update| {
+                match &update {
+                    TransactionStatusUpdate::StateChanged { from, to, timestamp } => {
+                        logger.info(
+                            events::TXSTATUS_STATE_CHANGED,
+                            *timestamp,
+                            &[
+                                ("transaction_id", transaction_id.into()),
+                                ("from", alloc::format!("{:?}", from).into()),
+                                ("to", alloc::format!("{:?}", to).into()),
+                            ],
+                        );
+                    }
+                    TransactionStatusUpdate::MoreInfoAvailable { url } => {
+                        logger.info(
+                            events::TXSTATUS_MORE_INFO_AVAILABLE,
+                            timestamp_fn(),
+                            &[
+                                ("transaction_id", transaction_id.into()),
+                                ("url", url.as_str().into()),
+                            ],
+                        );
+                    }
+                    TransactionStatusUpdate::Completed { stellar_tx_id } => {
+                        logger.info(
+                            events::TXSTATUS_COMPLETED,
+                            timestamp_fn(),
+                            &[
+                                ("transaction_id", transaction_id.into()),
+                                ("stellar_tx_id", stellar_tx_id.as_str().into()),
+                            ],
+                        );
+                    }
+                    TransactionStatusUpdate::Failed { reason } => {
+                        logger.error(
+                            events::TXSTATUS_FAILED,
+                            timestamp_fn(),
+                            &[
+                                ("transaction_id", transaction_id.into()),
+                                ("reason", reason.as_str().into()),
+                            ],
+                        );
+                    }
+                }
+                on_event(update);
+            },
+            sleep_fn,
+            &timestamp_fn,
+        );
+    }
 }
 
 /// Trace context used by a monitor that was not given one.

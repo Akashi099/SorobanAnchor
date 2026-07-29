@@ -41,6 +41,7 @@
 //! | `deterministic_hash` | Canonical SHA-256 hashing for attestation payloads |
 //! | `transaction_state_tracker` | State-machine tracking for on-chain transactions |
 //! | `response_validator` | Schema validation for anchor API responses |
+//! | `structured_log` | Structured JSON-line logging for operational workflows |
 //!
 //! ## Quick-start example
 //!
@@ -168,6 +169,8 @@ pub mod sep38;
 pub mod stellar_toml;
 #[cfg(not(feature = "wasm"))]
 pub mod streaming_monitor;
+#[cfg(not(feature = "wasm"))]
+pub mod structured_log;
 
 // ── Multi-asset quote routing (#656) ─────────────────────────────────────────
 // Available in host (non-WASM) builds. Provides asset-pair routing across
@@ -298,6 +301,8 @@ pub use multi_asset_routing::{
     pair_key, select_best,
     AssetPairRequest, AssetPairQuote, CandidateQuote, MultiAssetRoutingResult,
 };
+#[cfg(not(feature = "wasm"))]
+pub use structured_log::{StructuredLogger, LogLevel, LogRecord, FieldValue, log_attestor_registration};
 
 #[cfg(all(test, not(feature = "wasm")))]
 mod stellar_toml_tests;
