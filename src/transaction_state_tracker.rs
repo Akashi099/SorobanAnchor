@@ -2422,7 +2422,7 @@ mod tests {
         assert_eq!(record.state, TransactionState::Failed);
         assert!(record.recovery_metadata.is_some());
         let meta = record.recovery_metadata.unwrap();
-        assert_eq!(meta.failure_reason.to_string(), "imported timeout");
+        assert_eq!(meta.failure_reason, soroban_sdk::String::from_str(&env, "imported timeout"));
         assert_eq!(meta.retry_count, 1);
         assert_eq!(meta.failed_from_state, TransactionState::InProgress);
     }
@@ -2450,7 +2450,7 @@ mod tests {
         tracker.import_recovery_state(json, initiator.clone(), &env).unwrap();
 
         let meta = tracker.get_recovery_metadata(1, &env).unwrap().unwrap();
-        assert_eq!(meta.failure_reason.to_string(), "updated reason");
+        assert_eq!(meta.failure_reason, soroban_sdk::String::from_str(&env, "updated reason"));
         assert_eq!(meta.retry_count, 5);
         assert_eq!(meta.failed_from_state, TransactionState::Pending);
     }
@@ -2552,7 +2552,7 @@ mod tests {
         tracker2.import_recovery_state(&json, initiator.clone(), &env).unwrap();
 
         let meta = tracker2.get_recovery_metadata(1, &env).unwrap().unwrap();
-        assert_eq!(meta.failure_reason.to_string(), "round-trip error");
+        assert_eq!(meta.failure_reason, soroban_sdk::String::from_str(&env, "round-trip error"));
         assert_eq!(meta.failed_from_state, TransactionState::InProgress);
         assert_eq!(meta.retry_count, 0);
     }

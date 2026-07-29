@@ -5,6 +5,7 @@
 
 extern crate alloc;
 use alloc::string::String;
+use alloc::string::ToString;
 use alloc::vec::Vec as AllocVec;
 
 use crate::errors::Error;
@@ -1966,12 +1967,14 @@ mod tests {
         let cmp = QuoteComparator::new(1.0, 0.0); // Only care about price
         
         // Without penalty, near-stale should win (cheaper)
-        let best = select_best_quote(&[fresh.clone(), near_stale.clone()], &cmp, now).unwrap();
+        let plain_binding = [fresh.clone(), near_stale.clone()];
+        let best = select_best_quote(&plain_binding, &cmp, now).unwrap();
         assert_eq!(best.id, "near_stale");
         
         // With 50% penalty, fresh should win despite being more expensive
+        let quotes_binding = [fresh, near_stale];
         let best = select_best_quote_with_freshness(
-            &[fresh, near_stale], 
+            &quotes_binding, 
             &cmp, 
             now, 
             60, // near-stale threshold
