@@ -332,6 +332,34 @@
           }
         }
       }
+    },
+    "proxy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "proxy_url": {
+          "type": ["string", "null"],
+          "pattern": "^https?://\\S+$"
+        },
+        "http_proxy_url": {
+          "type": ["string", "null"],
+          "pattern": "^https?://\\S+$"
+        },
+        "https_proxy_url": {
+          "type": ["string", "null"],
+          "pattern": "^https?://\\S+$"
+        },
+        "no_proxy": { "type": ["string", "null"] },
+        "credentials": {
+          "type": ["object", "null"],
+          "required": ["username", "password"],
+          "additionalProperties": false,
+          "properties": {
+            "username": { "type": "string", "minLength": 1 },
+            "password": { "type": "string" }
+          }
+        }
+      }
     }
   }
 }

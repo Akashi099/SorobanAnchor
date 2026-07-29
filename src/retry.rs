@@ -1,5 +1,7 @@
 use alloc::vec::Vec;
 
+use crate::trace_context::TraceContext;
+
 /// The backoff strategy to use when computing retry delays.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum BackoffStrategy {
@@ -441,6 +443,90 @@ where
         Some(e) => Err(e),
         None => unreachable!("retry_with_backoff: max_attempts must be >= 1"),
     }
+}
+
+/// Execute `f` with backoff retry, threading a [`TraceContext`] through every
+/// attempt.
+///
+/// Identical to [`retry_with_backoff`] except that `f` also receives the trace
+/// context for the attempt it is running. Each attempt gets its own child span
+/// via [`TraceContext::child_for_attempt`], so all attempts share `parent`'s
+/// `trace_id` while remaining individually identifiable in logs.
+///
+/// This is the building block that keeps trace context alive across retries:
+/// callers that pass their inbound context here get end-to-end correlation
+/// without threading identifiers through their own closure state.
+///
+/// # Arguments
+///
+/// * `config` - Retry parameters (attempts, delays, multiplier).
+/// * `parent` - The trace context this retry loop runs under. Attempt spans are
+///   derived from it; it is never mutated.
+/// * `f` - The fallible operation. Receives the 0-based attempt index and the
+///   trace context for that attempt.
+/// * `retryable` - Predicate that returns `true` when an error warrants a retry.
+/// * `sleep_fn` - Callback invoked with the delay in milliseconds between attempts.
+/// * `jitter_source` - Per-attempt seeds used to spread retry timing.
+///
+/// # Returns
+///
+/// `Ok(T)` on the first successful attempt, or `Err(E)` after all attempts are
+/// exhausted or a non-retryable error is encountered.
+///
+/// # Errors
+///
+/// Returns the last error produced by `f`, exactly as [`retry_with_backoff`] does.
+///
+/// # Examples
+///
+/// ```rust
+/// use anchorkit::retry::{retry_with_backoff_traced, MockJitterSource, RetryConfig};
+/// use anchorkit::trace_context::TraceContext;
+///
+/// let config = RetryConfig::default();
+/// let parent = TraceContext::root_from_seed("deposit:txn-001");
+/// let mut seen_trace_ids: Vec<String> = Vec::new();
+/// let mut js = MockJitterSource::new(vec![0]);
+///
+/// let result = retry_with_backoff_traced(
+///     &config,
+///     &parent,
+///     |attempt, trace| {
+///         seen_trace_ids.push(trace.trace_id().to_string());
+///         if attempt < 2 { Err("transient") } else { Ok(attempt) }
+///     },
+///     |_err| true,
+///     |_ms| {},
+///     &mut js,
+/// );
+///
+/// assert_eq!(result, Ok(2));
+/// // The trace survived every retry.
+/// assert!(seen_trace_ids.iter().all(|id| id == parent.trace_id()));
+/// ```
+pub fn retry_with_backoff_traced<T, E, F, S, J>(
+    config: &RetryConfig,
+    parent: &TraceContext,
+    mut f: F,
+    retryable: impl Fn(&E) -> bool,
+    sleep_fn: S,
+    jitter_source: &mut J,
+) -> Result<T, E>
+where
+    F: FnMut(u32, &TraceContext) -> Result<T, E>,
+    S: FnMut(u64),
+    J: JitterSource,
+{
+    retry_with_backoff(
+        config,
+        |attempt| {
+            let attempt_trace = parent.child_for_attempt(attempt);
+            f(attempt, &attempt_trace)
+        },
+        retryable,
+        sleep_fn,
+        jitter_source,
+    )
 }
 
 #[cfg(test)]
@@ -963,5 +1049,218 @@ mod retry_tests {
     #[test]
     fn test_jitter_policy_default() {
         assert_eq!(JitterPolicy::default(), JitterPolicy::Full);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #610 — trace context propagation across retries
+    // -----------------------------------------------------------------------
+
+    use alloc::string::{String, ToString};
+
+    /// Every attempt of a retried operation sees the same trace ID.
+    #[test]
+    fn test_trace_id_survives_every_retry() {
+        let config = RetryConfig::new(4, 1, 10, 1);
+        let parent = TraceContext::root_from_seed("retry-trace-survival");
+        let mut js = MockJitterSource::new(vec![0]);
+        let mut seen: Vec<String> = Vec::new();
+
+        let result = retry_with_backoff_traced(
+            &config,
+            &parent,
+            |attempt, trace| {
+                seen.push(trace.trace_id().to_string());
+                if attempt < 3 {
+                    Err(TestError::Transient)
+                } else {
+                    Ok(attempt)
+                }
+            },
+            is_retryable_test,
+            |_| {},
+            &mut js,
+        );
+
+        assert_eq!(result, Ok(3));
+        assert_eq!(seen.len(), 4, "all four attempts should have run");
+        assert!(
+            seen.iter().all(|id| id == parent.trace_id()),
+            "trace_id must not change across retries: {seen:?}"
+        );
+    }
+
+    /// Each attempt gets a distinct span parented to the retry-loop span.
+    #[test]
+    fn test_each_attempt_gets_a_distinct_child_span() {
+        let config = RetryConfig::new(3, 1, 10, 1);
+        let parent = TraceContext::root_from_seed("retry-span-per-attempt");
+        let mut js = MockJitterSource::new(vec![0]);
+        let mut spans: Vec<String> = Vec::new();
+
+        let _ = retry_with_backoff_traced(
+            &config,
+            &parent,
+            |_attempt, trace| {
+                spans.push(trace.span_id().to_string());
+                assert_eq!(
+                    trace.parent_span_id(),
+                    Some(parent.span_id()),
+                    "attempt span must be parented to the retry-loop span"
+                );
+                Err::<i32, _>(TestError::Transient)
+            },
+            is_retryable_test,
+            |_| {},
+            &mut js,
+        );
+
+        assert_eq!(spans.len(), 3);
+        assert_ne!(spans[0], spans[1]);
+        assert_ne!(spans[1], spans[2]);
+        assert_ne!(spans[0], spans[2]);
+    }
+
+    /// Attempt spans are reproducible: the same parent and attempt index always
+    /// produce the same span, so a replayed retry is recognisable in logs.
+    #[test]
+    fn test_attempt_spans_are_reproducible() {
+        let config = RetryConfig::new(3, 1, 10, 1);
+        let parent = TraceContext::root_from_seed("retry-reproducible");
+
+        let run = |parent: &TraceContext| {
+            let mut js = MockJitterSource::new(vec![0]);
+            let mut spans: Vec<String> = Vec::new();
+            let _ = retry_with_backoff_traced(
+                &config,
+                parent,
+                |_attempt, trace| {
+                    spans.push(trace.span_id().to_string());
+                    Err::<i32, _>(TestError::Transient)
+                },
+                is_retryable_test,
+                |_| {},
+                &mut js,
+            );
+            spans
+        };
+
+        assert_eq!(run(&parent), run(&parent));
+    }
+
+    /// A non-retryable failure still reports the trace context of the attempt
+    /// that failed — the operator can find the exact span that stopped the loop.
+    #[test]
+    fn test_trace_available_on_non_retryable_failure() {
+        let config = RetryConfig::new(5, 1, 10, 1);
+        let parent = TraceContext::root_from_seed("retry-permanent");
+        let mut js = MockJitterSource::new(vec![0]);
+        let mut spans: Vec<String> = Vec::new();
+
+        let result = retry_with_backoff_traced(
+            &config,
+            &parent,
+            |_attempt, trace| {
+                spans.push(trace.span_id().to_string());
+                Err::<i32, _>(TestError::Permanent)
+            },
+            is_retryable_test,
+            |_| {},
+            &mut js,
+        );
+
+        assert_eq!(result, Err(TestError::Permanent));
+        assert_eq!(spans.len(), 1, "permanent error must not retry");
+        assert_eq!(spans[0], parent.child_for_attempt(0).span_id());
+    }
+
+    /// The traced wrapper preserves the retry semantics of the plain version:
+    /// same attempt count and same backoff delays.
+    #[test]
+    fn test_traced_matches_untraced_retry_behaviour() {
+        let config = RetryConfig::with_strategy(
+            4,
+            100,
+            10_000,
+            2,
+            BackoffStrategy::Exponential,
+            JitterPolicy::None,
+        );
+        let parent = TraceContext::root_from_seed("retry-parity");
+
+        let mut plain_delays: Vec<u64> = Vec::new();
+        let mut js = MockJitterSource::new(vec![0]);
+        let plain = retry_with_backoff(
+            &config,
+            |_| Err::<i32, _>(TestError::Transient),
+            is_retryable_test,
+            |ms| plain_delays.push(ms),
+            &mut js,
+        );
+
+        let mut traced_delays: Vec<u64> = Vec::new();
+        let mut js = MockJitterSource::new(vec![0]);
+        let traced = retry_with_backoff_traced(
+            &config,
+            &parent,
+            |_, _| Err::<i32, _>(TestError::Transient),
+            is_retryable_test,
+            |ms| traced_delays.push(ms),
+            &mut js,
+        );
+
+        assert_eq!(plain, traced);
+        assert_eq!(plain_delays, traced_delays);
+    }
+
+    /// The attempt that finally succeeds is identifiable by its span, so an
+    /// operator can tell which try completed the request.
+    #[test]
+    fn test_successful_attempt_span_is_identifiable() {
+        let config = RetryConfig::new(5, 1, 10, 1);
+        let parent = TraceContext::root_from_seed("retry-success-span");
+        let mut js = MockJitterSource::new(vec![0]);
+
+        let result = retry_with_backoff_traced(
+            &config,
+            &parent,
+            |attempt, trace| {
+                if attempt < 2 {
+                    Err(TestError::Transient)
+                } else {
+                    Ok(trace.span_id().to_string())
+                }
+            },
+            is_retryable_test,
+            |_| {},
+            &mut js,
+        );
+
+        assert_eq!(result, Ok(parent.child_for_attempt(2).span_id().to_string()));
+    }
+
+    /// A retry loop nested inside another traced step keeps the outermost
+    /// trace ID — the case that matters for webhook delivery inside a request.
+    #[test]
+    fn test_trace_survives_nested_retry_loops() {
+        let config = RetryConfig::new(2, 1, 10, 1);
+        let request = TraceContext::root_from_seed("outer-request");
+        let delivery = request.child("webhook-delivery");
+        let mut js = MockJitterSource::new(vec![0]);
+        let mut seen: Vec<String> = Vec::new();
+
+        let _ = retry_with_backoff_traced(
+            &config,
+            &delivery,
+            |_, trace| {
+                seen.push(trace.trace_id().to_string());
+                Err::<i32, _>(TestError::Transient)
+            },
+            is_retryable_test,
+            |_| {},
+            &mut js,
+        );
+
+        assert_eq!(seen.len(), 2);
+        assert!(seen.iter().all(|id| id == request.trace_id()));
     }
 }
