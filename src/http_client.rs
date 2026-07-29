@@ -6,28 +6,66 @@
 //!
 //! # Proxy configuration
 //!
-//! [`ProxyConfig`] carries an optional `proxy_url` (e.g. `"http://proxy.corp:3128"`)
-//! and optional `no_proxy` bypass list.  Pass it to [`build_client`] to get a
-//! `reqwest::blocking::Client` that routes requests through the proxy.
+//! [`ProxyConfig`] carries an optional catch-all `proxy_url` (e.g.
+//! `"http://proxy.corp:3128"`), optional per-scheme `http_proxy_url` /
+//! `https_proxy_url` overrides, an optional `no_proxy` bypass list, and
+//! optional [`ProxyCredentials`] for proxies requiring Basic authentication.
+//! Pass it to [`build_client`] to get a `reqwest::blocking::Client` that
+//! routes requests through the selected proxy.
 //!
-//! When `proxy_url` is `None` the returned client uses the system default
-//! (respects `HTTP_PROXY` / `HTTPS_PROXY` environment variables).
+//! Selection precedence for a given request: the scheme-specific proxy
+//! (`http_proxy_url` / `https_proxy_url`) wins over `proxy_url`; hosts on the
+//! `no_proxy` list bypass all proxies. [`ProxyConfig::select_proxy_url`]
+//! exposes this decision as a pure function for testing and logging.
+//!
+//! When no proxy URL is configured the returned client uses the system
+//! default (respects `HTTP_PROXY` / `HTTPS_PROXY` environment variables).
+//!
+//! # Credential handling
+//!
+//! Two kinds of credentials are supported, both designed to stay out of logs:
+//!
+//! - [`ProxyCredentials`] — username/password sent to the *proxy* via
+//!   `Proxy-Authorization` (Basic). Set on [`ProxyConfig::credentials`].
+//! - [`RequestCredentials`] — bearer token, Basic auth, or a custom header
+//!   sent to the *target* endpoint. Set on
+//!   [`OutboundRequestOptions::credentials`].
+//!
+//! Both types redact secrets from their `Debug` output and zeroize their
+//! memory on drop. Prefer these fields over embedding `user:pass@` in URLs,
+//! which end up in error messages verbatim.
+//!
+//! Call [`ProxyConfig::validate`] (done automatically by [`build_client`] and
+//! the runtime-config loader) to reject malformed URLs and credential
+//! combinations early.
 //!
 //! # Examples
 //!
-//! ```rust,no_run
-//! use anchorkit::http_client::{ProxyConfig, build_client};
+//! ```rust
+//! use anchorkit::http_client::{ProxyConfig, ProxyCredentials};
 //!
-//! // No proxy — uses system defaults.
-//! let client = build_client(None, 30).unwrap();
-//!
-//! // Explicit proxy.
+//! // Explicit proxy with credentials and an HTTPS-specific override.
 //! let proxy = ProxyConfig {
 //!     proxy_url: Some("http://proxy.corp.example.com:3128".to_string()),
+//!     https_proxy_url: Some("http://tls-proxy.corp.example.com:3129".to_string()),
 //!     no_proxy: Some("localhost,127.0.0.1".to_string()),
+//!     credentials: Some(ProxyCredentials {
+//!         username: "svc-anchor".to_string(),
+//!         password: "hunter2".to_string(),
+//!     }),
+//!     ..ProxyConfig::default()
 //! };
-//! let client = build_client(Some(&proxy), 30).unwrap();
+//! assert!(proxy.validate().is_ok());
+//! assert_eq!(
+//!     proxy.select_proxy_url("https://anchor.example.com/sep6"),
+//!     Some("http://tls-proxy.corp.example.com:3129"),
+//! );
+//! assert_eq!(proxy.select_proxy_url("http://localhost/health"), None);
 //! ```
+//!
+//! On `std` builds, pass the config to [`build_client`] /
+//! [`build_client_with_policy`] to obtain a `reqwest::blocking::Client` that
+//! applies the same routing (`build_client(None, 30)` uses system defaults).
 
 #[cfg(feature = "std")]
 extern crate std;
@@ -64,8 +102,12 @@ use crate::trace_context::TraceContext;
 /// // Add HMAC signing on top.
 /// let opts = OutboundRequestOptions::with_idempotency_key("txn-001-deposit")
 ///     .with_signing_key(b"my-secret-key");
+///
+/// // Authenticate against the anchor with a bearer token.
+/// let opts = OutboundRequestOptions::with_idempotency_key("txn-001-deposit")
+///     .with_bearer_token("sep10-jwt-token");
 /// ```
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct OutboundRequestOptions {
     /// Idempotency key sent as `Idempotency-Key: <value>`.
     /// When `Some`, also sent as `X-Request-Id: <value>` for correlation.
@@ -176,6 +218,157 @@ impl OutboundRequestOptions {
     pub fn has_signing_key(&self) -> bool {
         self.signing_key.as_ref().map(|k| !k.is_empty()).unwrap_or(false)
     }
+
+    /// Return `true` when this options set includes endpoint credentials.
+    pub fn has_credentials(&self) -> bool {
+        self.credentials.is_some()
+    }
+
+    /// Validate the options, rejecting credential values that would produce
+    /// malformed or header-injecting requests. See
+    /// [`RequestCredentials::validate`].
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(ref creds) = self.credentials {
+            creds.validate()?;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RequestCredentials — endpoint authentication
+// ---------------------------------------------------------------------------
+
+/// Credentials injected into outbound requests to the *target* endpoint
+/// (as opposed to [`ProxyCredentials`], which authenticate to the proxy).
+///
+/// Secrets are redacted from `Debug` output and zeroized on drop.
+///
+/// # Variants
+///
+/// - `Bearer` — `Authorization: Bearer <token>` (e.g. a SEP-10 JWT).
+/// - `Basic` — `Authorization: Basic <base64(user:pass)>`.
+/// - `Header` — an arbitrary header, e.g. `X-Api-Key: <value>`, for anchors
+///   with non-standard authentication schemes.
+///
+/// # Examples
+///
+/// ```rust
+/// use anchorkit::http_client::RequestCredentials;
+///
+/// let bearer = RequestCredentials::Bearer("jwt-token".into());
+/// assert_eq!(bearer.to_header().0, "Authorization");
+///
+/// // Secrets never appear in Debug output.
+/// let shown = format!("{:?}", bearer);
+/// assert!(!shown.contains("jwt-token"));
+/// ```
+#[derive(Clone, PartialEq, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
+pub enum RequestCredentials {
+    /// Bearer token sent as `Authorization: Bearer <token>`.
+    Bearer(String),
+    /// HTTP Basic credentials sent as `Authorization: Basic <base64>`.
+    Basic {
+        /// Basic-auth username. Must not contain `:`.
+        username: String,
+        /// Basic-auth password.
+        password: String,
+    },
+    /// Arbitrary authentication header, e.g. `X-Api-Key`.
+    Header {
+        /// Header name (RFC 7230 token characters only).
+        name: String,
+        /// Header value.
+        value: String,
+    },
+}
+
+/// `Debug` redacts every secret; only usernames and header names are shown.
+impl core::fmt::Debug for RequestCredentials {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            RequestCredentials::Bearer(_) => f.debug_tuple("Bearer").field(&"<redacted>").finish(),
+            RequestCredentials::Basic { username, .. } => f
+                .debug_struct("Basic")
+                .field("username", username)
+                .field("password", &"<redacted>")
+                .finish(),
+            RequestCredentials::Header { name, .. } => f
+                .debug_struct("Header")
+                .field("name", name)
+                .field("value", &"<redacted>")
+                .finish(),
+        }
+    }
+}
+
+impl RequestCredentials {
+    /// Produce the `(header_name, header_value)` pair for this credential.
+    pub fn to_header(&self) -> (String, String) {
+        use base64::Engine as _;
+        match self {
+            RequestCredentials::Bearer(token) => {
+                ("Authorization".into(), alloc::format!("Bearer {}", token))
+            }
+            RequestCredentials::Basic { username, password } => {
+                let raw = alloc::format!("{}:{}", username, password);
+                let encoded = base64::engine::general_purpose::STANDARD.encode(raw.as_bytes());
+                ("Authorization".into(), alloc::format!("Basic {}", encoded))
+            }
+            RequestCredentials::Header { name, value } => (name.clone(), value.clone()),
+        }
+    }
+
+    /// Validate the credential material.
+    ///
+    /// Rejects empty tokens/usernames/header names, `:` in Basic usernames
+    /// (ambiguous per RFC 7617), non-token characters in header names, and
+    /// CR/LF anywhere (header injection).
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            RequestCredentials::Bearer(token) => {
+                if token.is_empty() {
+                    return Err("credentials: bearer token cannot be empty".into());
+                }
+                reject_ctl("bearer token", token)?;
+            }
+            RequestCredentials::Basic { username, password } => {
+                if username.is_empty() {
+                    return Err("credentials: username cannot be empty".into());
+                }
+                if username.contains(':') {
+                    return Err("credentials: username cannot contain ':'".into());
+                }
+                reject_ctl("username", username)?;
+                reject_ctl("password", password)?;
+            }
+            RequestCredentials::Header { name, value } => {
+                if name.is_empty() {
+                    return Err("credentials: header name cannot be empty".into());
+                }
+                let is_token_char = |c: char| {
+                    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '!' | '#' | '$' | '%' | '&' | '\'' | '*' | '+' | '^' | '`' | '|' | '~')
+                };
+                if !name.chars().all(is_token_char) {
+                    return Err(alloc::format!(
+                        "credentials: header name '{}' contains invalid characters", name
+                    ));
+                }
+                reject_ctl("header value", value)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Reject control characters (notably CR/LF) that would allow header injection.
+fn reject_ctl(what: &str, value: &str) -> Result<(), String> {
+    if value.chars().any(|c| c.is_ascii_control()) {
+        return Err(alloc::format!(
+            "credentials: {} contains control characters", what
+        ));
+    }
+    Ok(())
 }
 
 /// Compute `HMAC-SHA256(key, payload)` and return a lowercase hex string.
@@ -498,6 +691,37 @@ pub fn is_transport_error_retryable(kind: TransportErrorKind) -> bool {
 // ProxyConfig
 // ---------------------------------------------------------------------------
 
+/// Credentials for authenticating to a proxy (HTTP Basic).
+///
+/// Sent as `Proxy-Authorization: Basic <base64>` on connections through the
+/// configured proxy. The password is redacted from `Debug` output and the
+/// whole struct is zeroized on drop.
+///
+/// Prefer this field over embedding `user:pass@` in the proxy URL: URLs are
+/// echoed verbatim into error messages and logs, credentials here are not.
+#[derive(Clone, Default, PartialEq, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
+#[cfg_attr(
+    feature = "std",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(deny_unknown_fields)
+)]
+pub struct ProxyCredentials {
+    /// Proxy username. Must be non-empty and must not contain `:`.
+    pub username: String,
+    /// Proxy password.
+    pub password: String,
+}
+
+/// `Debug` shows the username but always redacts the password.
+impl core::fmt::Debug for ProxyCredentials {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ProxyCredentials")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Proxy settings for outbound HTTP requests.
 ///
 /// Used by [`build_client`], [`fetch_stellar_toml_with_proxy`], and
@@ -506,26 +730,259 @@ pub fn is_transport_error_retryable(kind: TransportErrorKind) -> bool {
 ///
 /// # Fields
 ///
-/// - `proxy_url` — Full proxy URL including scheme and port, e.g.
+/// - `proxy_url` — Catch-all proxy URL including scheme and port, e.g.
 ///   `"http://proxy.corp.example.com:3128"` or `"https://proxy.example.com:8080"`.
-///   When `None` the client falls back to `HTTP_PROXY` / `HTTPS_PROXY` env vars.
+///   When no proxy URL is set the client falls back to `HTTP_PROXY` /
+///   `HTTPS_PROXY` env vars.
+/// - `http_proxy_url` — Proxy used only for plain-HTTP target URLs.
+///   Takes precedence over `proxy_url` for those requests.
+/// - `https_proxy_url` — Proxy used only for HTTPS target URLs.
+///   Takes precedence over `proxy_url` for those requests.
 /// - `no_proxy`  — Comma-separated list of hosts / CIDR ranges that bypass the
 ///   proxy, e.g. `"localhost,127.0.0.1,.internal.example.com"`.
 ///   When `None` no bypass list is applied.
+/// - `credentials` — Optional [`ProxyCredentials`] for proxies requiring
+///   Basic authentication. Applied to every configured proxy URL.
+///
+/// All URL fields treat an empty string the same as `None` (not configured).
 #[derive(Clone, Debug, Default, PartialEq)]
-#[cfg_attr(feature = "std", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "std",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(deny_unknown_fields)
+)]
 pub struct ProxyConfig {
-    /// Proxy endpoint URL (e.g. `"http://proxy.corp.example.com:3128"`).
+    /// Catch-all proxy endpoint URL (e.g. `"http://proxy.corp.example.com:3128"`).
     pub proxy_url: Option<String>,
+    /// Proxy for plain-HTTP targets; overrides `proxy_url` for those requests.
+    pub http_proxy_url: Option<String>,
+    /// Proxy for HTTPS targets; overrides `proxy_url` for those requests.
+    pub https_proxy_url: Option<String>,
     /// Comma-separated no-proxy bypass list.
     pub no_proxy: Option<String>,
+    /// Optional proxy Basic-auth credentials.
+    pub credentials: Option<ProxyCredentials>,
 }
 
 impl ProxyConfig {
-    /// Returns `true` when a proxy URL has been configured.
+    /// Returns `true` when at least one proxy URL has been configured.
     pub fn is_configured(&self) -> bool {
-        self.proxy_url.as_deref().map(|s| !s.is_empty()).unwrap_or(false)
+        non_empty(&self.proxy_url).is_some()
+            || non_empty(&self.http_proxy_url).is_some()
+            || non_empty(&self.https_proxy_url).is_some()
     }
+
+    /// Returns `true` when proxy credentials have been supplied.
+    pub fn has_credentials(&self) -> bool {
+        self.credentials.is_some()
+    }
+
+    /// Validate the configuration.
+    ///
+    /// Rejected configurations:
+    /// - a proxy URL that does not start with `http://` or `https://`,
+    ///   has no host, or contains whitespace / control characters;
+    /// - credentials with an empty username, a username containing `:`,
+    ///   or control characters in either field (header injection);
+    /// - credentials supplied without any proxy URL (almost certainly a
+    ///   mistake — they would silently never be used);
+    /// - control characters in the `no_proxy` list.
+    ///
+    /// [`build_client`] / [`build_client_with_policy`] and the runtime-config
+    /// loader call this automatically.
+    pub fn validate(&self) -> Result<(), String> {
+        for (field, url) in [
+            ("proxy_url", &self.proxy_url),
+            ("http_proxy_url", &self.http_proxy_url),
+            ("https_proxy_url", &self.https_proxy_url),
+        ] {
+            if let Some(url) = url.as_deref() {
+                if !url.is_empty() {
+                    validate_proxy_url(field, url)?;
+                }
+            }
+        }
+
+        if let Some(ref creds) = self.credentials {
+            if creds.username.is_empty() {
+                return Err("proxy credentials: username cannot be empty".into());
+            }
+            if creds.username.contains(':') {
+                return Err("proxy credentials: username cannot contain ':'".into());
+            }
+            if creds.username.chars().any(|c| c.is_ascii_control())
+                || creds.password.chars().any(|c| c.is_ascii_control())
+            {
+                return Err("proxy credentials: username/password cannot contain control characters".into());
+            }
+            if !self.is_configured() {
+                return Err("proxy credentials supplied but no proxy URL configured".into());
+            }
+        }
+
+        if let Some(ref no_proxy) = self.no_proxy {
+            if no_proxy.chars().any(|c| c.is_ascii_control()) {
+                return Err("no_proxy cannot contain control characters".into());
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Pure proxy-selection logic: which configured proxy URL applies to
+    /// `target_url`?
+    ///
+    /// Returns `None` when no proxy applies — either nothing is configured
+    /// for the target's scheme or the target host matches the `no_proxy`
+    /// list. Scheme-specific proxies take precedence over `proxy_url`.
+    ///
+    /// `no_proxy` host matching: `*` bypasses everything; an entry starting
+    /// with `.` matches any subdomain; a bare host matches itself and its
+    /// subdomains. Matching is case-insensitive and ignores the target port.
+    /// (CIDR ranges are honoured by the underlying transport but compared
+    /// textually here.)
+    ///
+    /// This mirrors the routing the built client performs and exists so the
+    /// decision can be unit-tested and logged without a live HTTP stack.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use anchorkit::http_client::ProxyConfig;
+    ///
+    /// let cfg = ProxyConfig {
+    ///     proxy_url: Some("http://proxy.corp:3128".into()),
+    ///     https_proxy_url: Some("http://tls-proxy.corp:3129".into()),
+    ///     no_proxy: Some("localhost,.internal.corp".into()),
+    ///     ..ProxyConfig::default()
+    /// };
+    ///
+    /// assert_eq!(cfg.select_proxy_url("https://anchor.example.com/sep6"),
+    ///            Some("http://tls-proxy.corp:3129"));
+    /// assert_eq!(cfg.select_proxy_url("http://anchor.example.com/sep6"),
+    ///            Some("http://proxy.corp:3128"));
+    /// assert_eq!(cfg.select_proxy_url("https://api.internal.corp/health"), None);
+    /// ```
+    pub fn select_proxy_url(&self, target_url: &str) -> Option<&str> {
+        let scheme_is = |prefix: &str| {
+            target_url
+                .get(..prefix.len())
+                .map(|s| s.eq_ignore_ascii_case(prefix))
+                .unwrap_or(false)
+        };
+        let is_https = if scheme_is("https://") {
+            true
+        } else if scheme_is("http://") {
+            false
+        } else {
+            // Unknown scheme — only the catch-all proxy could apply.
+            return if self.host_bypasses_proxy(target_url) {
+                None
+            } else {
+                non_empty(&self.proxy_url)
+            };
+        };
+
+        if self.host_bypasses_proxy(target_url) {
+            return None;
+        }
+
+        if is_https {
+            non_empty(&self.https_proxy_url).or_else(|| non_empty(&self.proxy_url))
+        } else {
+            non_empty(&self.http_proxy_url).or_else(|| non_empty(&self.proxy_url))
+        }
+    }
+
+    /// Returns `true` when the host of `target_url` matches the `no_proxy` list.
+    fn host_bypasses_proxy(&self, target_url: &str) -> bool {
+        let list = match self.no_proxy.as_deref() {
+            Some(l) if !l.is_empty() => l,
+            _ => return false,
+        };
+        let host = match extract_host(target_url) {
+            Some(h) => h,
+            None => return false,
+        };
+        list.split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .any(|entry| {
+                if entry == "*" {
+                    return true;
+                }
+                let entry_lower = entry.to_ascii_lowercase();
+                let host_lower = host.to_ascii_lowercase();
+                if let Some(suffix) = entry_lower.strip_prefix('.') {
+                    host_lower.ends_with(&entry_lower) || host_lower == suffix
+                } else {
+                    host_lower == entry_lower
+                        || host_lower.ends_with(&alloc::format!(".{}", entry_lower))
+                }
+            })
+    }
+}
+
+/// Return the URL as `Some(&str)` only when present and non-empty.
+fn non_empty(url: &Option<String>) -> Option<&str> {
+    url.as_deref().filter(|s| !s.is_empty())
+}
+
+/// Extract the host portion of a URL: strips scheme, userinfo, port, path,
+/// query, and fragment. Handles bracketed IPv6 literals.
+fn extract_host(url: &str) -> Option<&str> {
+    let after_scheme = match url.find("://") {
+        Some(idx) => &url[idx + 3..],
+        None => url,
+    };
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    // Drop userinfo if present.
+    let host_port = match authority.rfind('@') {
+        Some(idx) => &authority[idx + 1..],
+        None => authority,
+    };
+    // Bracketed IPv6 literal: [::1]:8080 → ::1
+    if let Some(rest) = host_port.strip_prefix('[') {
+        return rest.find(']').map(|end| &rest[..end]);
+    }
+    let host = match host_port.rfind(':') {
+        Some(idx) => &host_port[..idx],
+        None => host_port,
+    };
+    if host.is_empty() {
+        None
+    } else {
+        Some(host)
+    }
+}
+
+/// Validate a single proxy URL string.
+fn validate_proxy_url(field: &str, url: &str) -> Result<(), String> {
+    let rest = if let Some(rest) = url.strip_prefix("http://") {
+        rest
+    } else if let Some(rest) = url.strip_prefix("https://") {
+        rest
+    } else {
+        return Err(alloc::format!(
+            "invalid proxy URL '{}' in {}: must start with http:// or https://",
+            url, field
+        ));
+    };
+    if extract_host(rest).is_none() {
+        return Err(alloc::format!(
+            "invalid proxy URL '{}' in {}: missing host", url, field
+        ));
+    }
+    if url.chars().any(|c| c.is_ascii_whitespace() || c.is_ascii_control()) {
+        return Err(alloc::format!(
+            "invalid proxy URL '{}' in {}: contains whitespace or control characters",
+            url, field
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -557,30 +1014,55 @@ pub fn build_client(
     }
 
     if let Some(cfg) = proxy {
-        if let Some(ref url) = cfg.proxy_url {
-            if !url.is_empty() {
-                if !url.starts_with("http://") && !url.starts_with("https://") {
-                    return Err(alloc::format!(
-                        "invalid proxy URL '{}': must start with http:// or https://", url
-                    ));
-                }
-                let mut proxy_obj = reqwest::Proxy::all(url.as_str())
-                    .map_err(|e| alloc::format!("invalid proxy URL '{}': {}", url, e))?;
-
-                if let Some(ref no_proxy) = cfg.no_proxy {
-                    if !no_proxy.is_empty() {
-                        proxy_obj = proxy_obj.no_proxy(reqwest::NoProxy::from_string(no_proxy));
-                    }
-                }
-
-                builder = builder.proxy(proxy_obj);
-            }
-        }
+        builder = apply_proxy_config(builder, cfg)?;
     }
 
     builder
         .build()
         .map_err(|e| alloc::format!("failed to build HTTP client: {}", e))
+}
+
+/// Validate `cfg` and register its proxies on a reqwest client builder.
+///
+/// Scheme-specific proxies are registered before the catch-all so reqwest's
+/// first-match interception gives them precedence, matching
+/// [`ProxyConfig::select_proxy_url`]. Credentials and the `no_proxy` bypass
+/// list are applied to every registered proxy.
+#[cfg(feature = "std")]
+fn apply_proxy_config(
+    mut builder: reqwest::blocking::ClientBuilder,
+    cfg: &ProxyConfig,
+) -> Result<reqwest::blocking::ClientBuilder, String> {
+    cfg.validate()?;
+
+    // Attach credentials and the bypass list to a freshly built proxy.
+    let finish = |mut proxy_obj: reqwest::Proxy| {
+        if let Some(ref creds) = cfg.credentials {
+            proxy_obj = proxy_obj.basic_auth(&creds.username, &creds.password);
+        }
+        if let Some(no_proxy) = cfg.no_proxy.as_deref().filter(|s| !s.is_empty()) {
+            proxy_obj = proxy_obj.no_proxy(reqwest::NoProxy::from_string(no_proxy));
+        }
+        proxy_obj
+    };
+    let bad_url = |url: &str, e: reqwest::Error| {
+        alloc::format!("invalid proxy URL '{}': {}", url, e)
+    };
+
+    if let Some(url) = non_empty(&cfg.http_proxy_url) {
+        let proxy_obj = reqwest::Proxy::http(url).map_err(|e| bad_url(url, e))?;
+        builder = builder.proxy(finish(proxy_obj));
+    }
+    if let Some(url) = non_empty(&cfg.https_proxy_url) {
+        let proxy_obj = reqwest::Proxy::https(url).map_err(|e| bad_url(url, e))?;
+        builder = builder.proxy(finish(proxy_obj));
+    }
+    if let Some(url) = non_empty(&cfg.proxy_url) {
+        let proxy_obj = reqwest::Proxy::all(url).map_err(|e| bad_url(url, e))?;
+        builder = builder.proxy(finish(proxy_obj));
+    }
+
+    Ok(builder)
 }
 
 /// Build a `reqwest::blocking::Client` with full [`ConnectionPolicy`] control.
@@ -637,23 +1119,7 @@ pub fn build_client_with_policy(
 
     // Proxy
     if let Some(cfg) = proxy {
-        if let Some(ref url) = cfg.proxy_url {
-            if !url.is_empty() {
-                if !url.starts_with("http://") && !url.starts_with("https://") {
-                    return Err(alloc::format!(
-                        "invalid proxy URL '{}': must start with http:// or https://", url
-                    ));
-                }
-                let mut proxy_obj = reqwest::Proxy::all(url.as_str())
-                    .map_err(|e| alloc::format!("invalid proxy URL '{}': {}", url, e))?;
-                if let Some(ref no_proxy) = cfg.no_proxy {
-                    if !no_proxy.is_empty() {
-                        proxy_obj = proxy_obj.no_proxy(reqwest::NoProxy::from_string(no_proxy));
-                    }
-                }
-                builder = builder.proxy(proxy_obj);
-            }
-        }
+        builder = apply_proxy_config(builder, cfg)?;
     }
 
     builder
@@ -689,6 +1155,7 @@ pub fn build_client_with_policy(
 /// let proxy = ProxyConfig {
 ///     proxy_url: Some("http://proxy.corp.example.com:3128".to_string()),
 ///     no_proxy: None,
+///     ..ProxyConfig::default()
 /// };
 /// let toml = fetch_stellar_toml_with_proxy("https://anchor.example.com", Some(&proxy), 30).unwrap();
 /// println!("Supports SEP-6: {}", toml.supports_sep6());
@@ -765,6 +1232,7 @@ pub fn fetch_stellar_toml_with_proxy(
 /// let proxy = ProxyConfig {
 ///     proxy_url: Some("http://proxy.corp.example.com:3128".to_string()),
 ///     no_proxy: None,
+///     ..ProxyConfig::default()
 /// };
 /// let mut dlq = BTreeMap::new();
 /// deliver_webhook_with_proxy(&config, r#"{"event":"deposit"}"#, &mut dlq, Some(&proxy), || 0).unwrap();
@@ -926,6 +1394,7 @@ mod tests {
         let cfg = ProxyConfig {
             proxy_url: Some("http://proxy.example.com:3128".to_string()),
             no_proxy: None,
+            ..ProxyConfig::default()
         };
         assert!(cfg.is_configured());
     }
@@ -935,6 +1404,7 @@ mod tests {
         let cfg = ProxyConfig {
             proxy_url: Some(String::new()),
             no_proxy: None,
+            ..ProxyConfig::default()
         };
         assert!(!cfg.is_configured());
     }
@@ -944,6 +1414,7 @@ mod tests {
         let cfg = ProxyConfig {
             proxy_url: None,
             no_proxy: Some("localhost".to_string()),
+            ..ProxyConfig::default()
         };
         assert!(!cfg.is_configured());
     }
@@ -953,6 +1424,7 @@ mod tests {
         let a = ProxyConfig {
             proxy_url: Some("http://proxy.example.com:3128".to_string()),
             no_proxy: Some("localhost".to_string()),
+            ..ProxyConfig::default()
         };
         let b = a.clone();
         assert_eq!(a, b);
@@ -971,6 +1443,7 @@ mod tests {
         let proxy = ProxyConfig {
             proxy_url: Some("http://proxy.example.com:3128".to_string()),
             no_proxy: None,
+            ..ProxyConfig::default()
         };
         let client = build_client(Some(&proxy), 10);
         assert!(client.is_ok(), "client with valid proxy URL should build successfully");
@@ -982,6 +1455,7 @@ mod tests {
         let proxy = ProxyConfig {
             proxy_url: Some("http://proxy.example.com:3128".to_string()),
             no_proxy: Some("localhost,127.0.0.1,.internal.example.com".to_string()),
+            ..ProxyConfig::default()
         };
         let client = build_client(Some(&proxy), 30);
         assert!(client.is_ok(), "client with proxy + no_proxy list should build successfully");
@@ -993,6 +1467,7 @@ mod tests {
         let proxy = ProxyConfig {
             proxy_url: Some("not-a-valid-url".to_string()),
             no_proxy: None,
+            ..ProxyConfig::default()
         };
         let result = build_client(Some(&proxy), 10);
         assert!(result.is_err(), "invalid proxy URL should return an error");
@@ -1026,6 +1501,7 @@ mod tests {
         let proxy = ProxyConfig {
             proxy_url: Some("https://secure-proxy.example.com:8080".to_string()),
             no_proxy: None,
+            ..ProxyConfig::default()
         };
         let client = build_client(Some(&proxy), 10);
         assert!(client.is_ok(), "HTTPS proxy URL should build successfully");
@@ -1130,6 +1606,7 @@ mod tests {
         let cfg = ProxyConfig {
             proxy_url: Some("http://proxy.example.com:3128".to_string()),
             no_proxy: Some("localhost".to_string()),
+            ..ProxyConfig::default()
         };
         let json = serde_json::to_string(&cfg).expect("serialization should succeed");
         assert!(json.contains("proxy_url"));
@@ -1480,8 +1957,480 @@ mod tests {
         let proxy = ProxyConfig {
             proxy_url: Some("not-a-url".into()),
             no_proxy: None,
+            ..ProxyConfig::default()
         };
         let result = build_client_with_policy(Some(&proxy), &ConnectionPolicy::default());
         assert!(result.is_err());
+    }
+
+    // ── ProxyConfig validation (#606) ─────────────────────────────────────────
+
+    fn full_proxy_config() -> ProxyConfig {
+        ProxyConfig {
+            proxy_url: Some("http://proxy.corp:3128".to_string()),
+            http_proxy_url: Some("http://http-proxy.corp:3128".to_string()),
+            https_proxy_url: Some("http://tls-proxy.corp:3129".to_string()),
+            no_proxy: Some("localhost,127.0.0.1,.internal.corp".to_string()),
+            credentials: Some(ProxyCredentials {
+                username: "svc-anchor".to_string(),
+                password: "s3cret".to_string(),
+            }),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_full_configuration() {
+        assert_eq!(full_proxy_config().validate(), Ok(()));
+    }
+
+    #[test]
+    fn validate_accepts_empty_configuration() {
+        assert_eq!(ProxyConfig::default().validate(), Ok(()));
+    }
+
+    #[test]
+    fn validate_rejects_bad_scheme_in_per_scheme_url() {
+        let cfg = ProxyConfig {
+            http_proxy_url: Some("socks5://proxy.corp:1080".to_string()),
+            ..ProxyConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("invalid proxy URL"), "got: {err}");
+        assert!(err.contains("http_proxy_url"), "error should name the field, got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_url_without_host() {
+        let cfg = ProxyConfig {
+            proxy_url: Some("http://".to_string()),
+            ..ProxyConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("missing host"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_url_with_whitespace() {
+        let cfg = ProxyConfig {
+            proxy_url: Some("http://proxy.corp:3128 evil".to_string()),
+            ..ProxyConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_empty_username() {
+        let mut cfg = full_proxy_config();
+        cfg.credentials = Some(ProxyCredentials {
+            username: String::new(),
+            password: "pw".to_string(),
+        });
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("username cannot be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_username_with_colon() {
+        let mut cfg = full_proxy_config();
+        cfg.credentials = Some(ProxyCredentials {
+            username: "user:name".to_string(),
+            password: "pw".to_string(),
+        });
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("':'"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_control_characters_in_password() {
+        let mut cfg = full_proxy_config();
+        cfg.credentials = Some(ProxyCredentials {
+            username: "user".to_string(),
+            password: "pw\r\nX-Injected: 1".to_string(),
+        });
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("control characters"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_credentials_without_proxy() {
+        let cfg = ProxyConfig {
+            credentials: Some(ProxyCredentials {
+                username: "user".to_string(),
+                password: "pw".to_string(),
+            }),
+            ..ProxyConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("no proxy URL configured"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_control_characters_in_no_proxy() {
+        let cfg = ProxyConfig {
+            proxy_url: Some("http://proxy.corp:3128".to_string()),
+            no_proxy: Some("localhost\r\nevil".to_string()),
+            ..ProxyConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn is_configured_true_for_scheme_specific_only() {
+        let cfg = ProxyConfig {
+            https_proxy_url: Some("http://tls-proxy.corp:3129".to_string()),
+            ..ProxyConfig::default()
+        };
+        assert!(cfg.is_configured());
+        assert!(!cfg.has_credentials());
+    }
+
+    // ── Proxy selection (#606) ────────────────────────────────────────────────
+
+    #[test]
+    fn select_prefers_scheme_specific_proxy() {
+        let cfg = full_proxy_config();
+        assert_eq!(
+            cfg.select_proxy_url("https://anchor.example.com/sep6"),
+            Some("http://tls-proxy.corp:3129")
+        );
+        assert_eq!(
+            cfg.select_proxy_url("http://anchor.example.com/sep6"),
+            Some("http://http-proxy.corp:3128")
+        );
+    }
+
+    #[test]
+    fn select_falls_back_to_catch_all_proxy() {
+        let cfg = ProxyConfig {
+            proxy_url: Some("http://proxy.corp:3128".to_string()),
+            ..ProxyConfig::default()
+        };
+        assert_eq!(
+            cfg.select_proxy_url("https://anchor.example.com"),
+            Some("http://proxy.corp:3128")
+        );
+        assert_eq!(
+            cfg.select_proxy_url("http://anchor.example.com"),
+            Some("http://proxy.corp:3128")
+        );
+    }
+
+    #[test]
+    fn select_returns_none_when_unconfigured() {
+        assert_eq!(
+            ProxyConfig::default().select_proxy_url("https://anchor.example.com"),
+            None
+        );
+    }
+
+    #[test]
+    fn select_returns_none_for_scheme_without_proxy() {
+        // Only an HTTPS proxy is configured — plain HTTP goes direct.
+        let cfg = ProxyConfig {
+            https_proxy_url: Some("http://tls-proxy.corp:3129".to_string()),
+            ..ProxyConfig::default()
+        };
+        assert_eq!(cfg.select_proxy_url("http://anchor.example.com"), None);
+    }
+
+    #[test]
+    fn select_honours_no_proxy_exact_host() {
+        let cfg = full_proxy_config();
+        assert_eq!(cfg.select_proxy_url("https://localhost/health"), None);
+        assert_eq!(cfg.select_proxy_url("http://127.0.0.1:8080/health"), None);
+    }
+
+    #[test]
+    fn select_honours_no_proxy_subdomain_suffix() {
+        let cfg = full_proxy_config();
+        // ".internal.corp" matches subdomains and the bare domain itself.
+        assert_eq!(cfg.select_proxy_url("https://api.internal.corp/v1"), None);
+        assert_eq!(cfg.select_proxy_url("https://internal.corp/v1"), None);
+        // A lookalike host must NOT bypass.
+        assert!(cfg.select_proxy_url("https://notinternal.corp.example.com").is_some());
+    }
+
+    #[test]
+    fn select_bare_no_proxy_entry_matches_subdomains() {
+        let cfg = ProxyConfig {
+            proxy_url: Some("http://proxy.corp:3128".to_string()),
+            no_proxy: Some("example.com".to_string()),
+            ..ProxyConfig::default()
+        };
+        assert_eq!(cfg.select_proxy_url("https://example.com"), None);
+        assert_eq!(cfg.select_proxy_url("https://api.example.com"), None);
+        assert!(cfg.select_proxy_url("https://badexample.com").is_some());
+    }
+
+    #[test]
+    fn select_no_proxy_wildcard_bypasses_everything() {
+        let cfg = ProxyConfig {
+            proxy_url: Some("http://proxy.corp:3128".to_string()),
+            no_proxy: Some("*".to_string()),
+            ..ProxyConfig::default()
+        };
+        assert_eq!(cfg.select_proxy_url("https://anywhere.example.com"), None);
+    }
+
+    #[test]
+    fn select_is_case_insensitive_and_ignores_port() {
+        let cfg = ProxyConfig {
+            proxy_url: Some("http://proxy.corp:3128".to_string()),
+            no_proxy: Some("Anchor.Example.COM".to_string()),
+            ..ProxyConfig::default()
+        };
+        assert_eq!(cfg.select_proxy_url("HTTPS://anchor.example.com:8443/x"), None);
+    }
+
+    #[test]
+    fn select_handles_userinfo_and_ipv6_hosts() {
+        let cfg = ProxyConfig {
+            proxy_url: Some("http://proxy.corp:3128".to_string()),
+            no_proxy: Some("::1".to_string()),
+            ..ProxyConfig::default()
+        };
+        assert_eq!(cfg.select_proxy_url("http://[::1]:8080/health"), None);
+        // Userinfo must not confuse host extraction.
+        assert_eq!(
+            cfg.select_proxy_url("https://user:pw@anchor.example.com/x"),
+            Some("http://proxy.corp:3128")
+        );
+    }
+
+    // ── Secret redaction (#606) ───────────────────────────────────────────────
+
+    #[test]
+    fn proxy_credentials_debug_redacts_password() {
+        let creds = ProxyCredentials {
+            username: "svc-anchor".to_string(),
+            password: "super-secret-pw".to_string(),
+        };
+        let shown = alloc::format!("{:?}", creds);
+        assert!(shown.contains("svc-anchor"), "username should be visible: {shown}");
+        assert!(!shown.contains("super-secret-pw"), "password must be redacted: {shown}");
+        assert!(shown.contains("<redacted>"), "got: {shown}");
+    }
+
+    #[test]
+    fn proxy_config_debug_redacts_password() {
+        let shown = alloc::format!("{:?}", full_proxy_config());
+        assert!(!shown.contains("s3cret"), "password must be redacted: {shown}");
+    }
+
+    #[test]
+    fn request_credentials_debug_redacts_secrets() {
+        let bearer = RequestCredentials::Bearer("jwt-secret-token".to_string());
+        let basic = RequestCredentials::Basic {
+            username: "user".to_string(),
+            password: "basic-secret".to_string(),
+        };
+        let header = RequestCredentials::Header {
+            name: "X-Api-Key".to_string(),
+            value: "api-key-secret".to_string(),
+        };
+        for (creds, secret) in [
+            (&bearer, "jwt-secret-token"),
+            (&basic, "basic-secret"),
+            (&header, "api-key-secret"),
+        ] {
+            let shown = alloc::format!("{:?}", creds);
+            assert!(!shown.contains(secret), "secret must be redacted: {shown}");
+            assert!(shown.contains("<redacted>"), "got: {shown}");
+        }
+    }
+
+    #[test]
+    fn outbound_options_debug_redacts_signing_key_and_credentials() {
+        let opts = OutboundRequestOptions::with_idempotency_key("idem-1")
+            .with_signing_key(b"hmac-secret")
+            .with_bearer_token("bearer-secret");
+        let shown = alloc::format!("{:?}", opts);
+        assert!(shown.contains("idem-1"), "idempotency key is not a secret: {shown}");
+        assert!(!shown.contains("hmac-secret"), "got: {shown}");
+        assert!(!shown.contains("bearer-secret"), "got: {shown}");
+    }
+
+    // ── RequestCredentials headers and validation (#606) ──────────────────────
+
+    #[test]
+    fn bearer_credentials_emit_authorization_header() {
+        let creds = RequestCredentials::Bearer("my-jwt".to_string());
+        assert_eq!(
+            creds.to_header(),
+            ("Authorization".to_string(), "Bearer my-jwt".to_string())
+        );
+    }
+
+    #[test]
+    fn basic_credentials_emit_base64_authorization_header() {
+        let creds = RequestCredentials::Basic {
+            username: "user".to_string(),
+            password: "pass".to_string(),
+        };
+        // base64("user:pass") == "dXNlcjpwYXNz"
+        assert_eq!(
+            creds.to_header(),
+            ("Authorization".to_string(), "Basic dXNlcjpwYXNz".to_string())
+        );
+    }
+
+    #[test]
+    fn header_credentials_emit_custom_header() {
+        let creds = RequestCredentials::Header {
+            name: "X-Api-Key".to_string(),
+            value: "key-123".to_string(),
+        };
+        assert_eq!(creds.to_header(), ("X-Api-Key".to_string(), "key-123".to_string()));
+    }
+
+    #[test]
+    fn request_credentials_validation_rejects_bad_values() {
+        assert!(RequestCredentials::Bearer(String::new()).validate().is_err());
+        assert!(RequestCredentials::Bearer("tok\r\nen".to_string()).validate().is_err());
+        assert!(RequestCredentials::Basic {
+            username: String::new(),
+            password: "pw".to_string(),
+        }
+        .validate()
+        .is_err());
+        assert!(RequestCredentials::Basic {
+            username: "a:b".to_string(),
+            password: "pw".to_string(),
+        }
+        .validate()
+        .is_err());
+        assert!(RequestCredentials::Header {
+            name: "Bad Header".to_string(),
+            value: "v".to_string(),
+        }
+        .validate()
+        .is_err());
+        assert!(RequestCredentials::Header {
+            name: "X-Api-Key".to_string(),
+            value: "v\nv".to_string(),
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn request_credentials_validation_accepts_good_values() {
+        assert_eq!(RequestCredentials::Bearer("jwt".to_string()).validate(), Ok(()));
+        assert_eq!(
+            RequestCredentials::Basic {
+                username: "user".to_string(),
+                password: "pw".to_string(),
+            }
+            .validate(),
+            Ok(())
+        );
+        assert_eq!(
+            RequestCredentials::Header {
+                name: "X-Api-Key".to_string(),
+                value: "key-123".to_string(),
+            }
+            .validate(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn outbound_options_validate_delegates_to_credentials() {
+        assert_eq!(OutboundRequestOptions::default().validate(), Ok(()));
+        let good = OutboundRequestOptions::default().with_bearer_token("jwt");
+        assert_eq!(good.validate(), Ok(()));
+        let bad = OutboundRequestOptions::default().with_bearer_token("");
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn build_headers_includes_credentials_alongside_existing_headers() {
+        let opts = OutboundRequestOptions::with_idempotency_key("idem-7")
+            .with_signing_key(b"sk")
+            .with_basic_auth("user", "pass");
+        let headers = opts.build_headers("body");
+        let names: alloc::vec::Vec<&str> = headers.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(names.contains(&"Idempotency-Key"));
+        assert!(names.contains(&"X-Request-Id"));
+        assert!(names.contains(&"X-Anchor-Signature"));
+        assert!(names.contains(&"Authorization"));
+        assert!(opts.has_credentials());
+    }
+
+    #[test]
+    fn post_with_options_passes_authorization_to_transport() {
+        let opts = OutboundRequestOptions::default().with_bearer_token("sep10-jwt");
+        let mut captured: alloc::vec::Vec<(String, String)> = alloc::vec::Vec::new();
+        let result = post_with_options(
+            "https://anchor.example.com/sep6/deposit",
+            r#"{"amount":10}"#,
+            Some(&opts),
+            |_url, _body, hdrs| {
+                captured.extend(hdrs.iter().cloned());
+                Ok(200u16)
+            },
+        );
+        assert_eq!(result, Ok(200));
+        let auth = captured.iter().find(|(k, _)| k == "Authorization");
+        assert_eq!(auth.map(|(_, v)| v.as_str()), Some("Bearer sep10-jwt"));
+    }
+
+    // ── Client construction with credentials (std) ────────────────────────────
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn build_client_with_full_proxy_config_succeeds() {
+        let client = build_client(Some(&full_proxy_config()), 10);
+        assert!(client.is_ok(), "full proxy config should build: {:?}", client.err());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn build_client_rejects_credentials_without_proxy() {
+        let cfg = ProxyConfig {
+            credentials: Some(ProxyCredentials {
+                username: "user".to_string(),
+                password: "pw".to_string(),
+            }),
+            ..ProxyConfig::default()
+        };
+        let result = build_client(Some(&cfg), 10);
+        assert!(result.is_err());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn build_client_rejects_invalid_per_scheme_proxy() {
+        let cfg = ProxyConfig {
+            https_proxy_url: Some("ftp://proxy.corp:21".to_string()),
+            ..ProxyConfig::default()
+        };
+        let result = build_client(Some(&cfg), 10);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid proxy URL"));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn build_client_with_policy_accepts_full_proxy_config() {
+        let client = build_client_with_policy(Some(&full_proxy_config()), &ConnectionPolicy::strict());
+        assert!(client.is_ok());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn proxy_credentials_serde_round_trip() {
+        let cfg = full_proxy_config();
+        let json = serde_json::to_string(&cfg).expect("serialize");
+        let back: ProxyConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(cfg, back);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn proxy_config_rejects_unknown_fields() {
+        let json = r#"{"proxy_url":"http://proxy.corp:3128","proxy_password":"oops"}"#;
+        let result: Result<ProxyConfig, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "unknown fields (likely typos) must be rejected");
     }
 }
