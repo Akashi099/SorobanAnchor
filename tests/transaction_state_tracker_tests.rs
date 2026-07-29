@@ -685,9 +685,11 @@ mod snapshot_tests {
 
 #[cfg(test)]
 mod auto_eviction_tests {
-    use anchorkit::transaction_state_tracker::TransactionStateTracker;
+    use anchorkit::transaction_state_tracker::{
+        RecoveryRetentionPolicy, TransactionState, TransactionStateTracker,
+    };
     use soroban_sdk::testutils::{Address as _, Ledger, LedgerInfo};
-    use soroban_sdk::Env;
+    use soroban_sdk::{Env, String};
 
     fn make_env() -> Env {
         let env = Env::default();
@@ -819,5 +821,228 @@ mod auto_eviction_tests {
         // No terminal records to evict; all pending entries remain.
         // Size grows by 1 (the new one), nothing was removed.
         assert_eq!(tracker.cache_size(), size_before + 1);
+    }
+
+    // -------------------------------------------------------------------------
+    // #628 — recovery metadata pruning & archival
+    // -------------------------------------------------------------------------
+
+    fn make_failed_tracker(env: &Env, id: u64) -> TransactionStateTracker {
+        let mut tracker = TransactionStateTracker::new(true);
+        let initiator = soroban_sdk::Address::generate(env);
+        tracker.create_transaction(id, initiator, env).unwrap();
+        tracker.start_transaction(id, env).unwrap();
+        tracker.fail_transaction(id, String::from_str(env, "network timeout"), env).unwrap();
+        tracker
+    }
+
+    #[test]
+    fn test_retention_policy_validate_rejects_zero_values() {
+        assert!(RecoveryRetentionPolicy { max_age_seconds: 0, max_retry_count: 5 }.validate().is_err());
+        assert!(RecoveryRetentionPolicy { max_age_seconds: 60, max_retry_count: 0 }.validate().is_err());
+        assert!(RecoveryRetentionPolicy { max_age_seconds: 60, max_retry_count: 5 }.validate().is_ok());
+    }
+
+    #[test]
+    fn test_set_and_get_retention_policy_defaults_and_override() {
+        let env = make_env();
+        assert_eq!(
+            TransactionStateTracker::get_retention_policy(&env),
+            RecoveryRetentionPolicy::default_policy()
+        );
+
+        let custom = RecoveryRetentionPolicy { max_age_seconds: 60, max_retry_count: 1 };
+        TransactionStateTracker::set_retention_policy(&env, custom.clone());
+        assert_eq!(TransactionStateTracker::get_retention_policy(&env), custom);
+    }
+
+    /// An ineligible record (too young, too few retries) must not be pruned.
+    #[test]
+    fn test_prune_ineligible_record_is_untouched() {
+        let env = make_env();
+        let mut tracker = make_failed_tracker(&env, 1);
+        let policy = RecoveryRetentionPolicy { max_age_seconds: 1_000_000, max_retry_count: 5 };
+
+        let pruned = tracker.prune_recovery_metadata(1, &policy, &env).unwrap();
+        assert!(!pruned, "a fresh, low-retry record must not be eligible for pruning");
+        assert!(tracker.get_recovery_metadata(1, &env).unwrap().is_some());
+    }
+
+    /// A record older than `max_age_seconds` becomes eligible for pruning.
+    #[test]
+    fn test_prune_eligible_after_max_age() {
+        let env = make_env();
+        let mut tracker = make_failed_tracker(&env, 1);
+        let policy = RecoveryRetentionPolicy { max_age_seconds: 500, max_retry_count: 100 };
+
+        // Advance the ledger well past the age threshold.
+        env.ledger().set(LedgerInfo {
+            timestamp: 1_000 + 1_000,
+            protocol_version: 21,
+            sequence_number: 2,
+            network_id: Default::default(),
+            base_reserve: 0,
+            min_persistent_entry_ttl: 4096,
+            min_temp_entry_ttl: 16,
+            max_entry_ttl: 6_312_000,
+        });
+
+        let pruned = tracker.prune_recovery_metadata(1, &policy, &env).unwrap();
+        assert!(pruned, "a record past max_age_seconds must be eligible for pruning");
+        assert!(tracker.get_recovery_metadata(1, &env).unwrap().is_none());
+    }
+
+    /// A record whose retry_count has reached the ceiling becomes eligible
+    /// even if it is not old enough by the age rule alone.
+    #[test]
+    fn test_prune_eligible_after_max_retry_count() {
+        let env = make_env();
+        let mut tracker = make_failed_tracker(&env, 1);
+        let policy = RecoveryRetentionPolicy { max_age_seconds: 1_000_000, max_retry_count: 2 };
+
+        tracker.record_recovery_attempt(1, &env).unwrap();
+        tracker.record_recovery_attempt(1, &env).unwrap();
+
+        let pruned = tracker.prune_recovery_metadata(1, &policy, &env).unwrap();
+        assert!(pruned, "a record at the retry ceiling must be eligible regardless of age");
+        assert!(tracker.get_recovery_metadata(1, &env).unwrap().is_none());
+    }
+
+    /// Pruning a transaction with no recovery metadata (or that doesn't
+    /// exist) is a safe no-op that reports `false`.
+    #[test]
+    fn test_prune_missing_transaction_returns_false() {
+        let env = make_env();
+        let mut tracker = TransactionStateTracker::new(true);
+        let policy = RecoveryRetentionPolicy::default_policy();
+        assert!(!tracker.prune_recovery_metadata(999, &policy, &env).unwrap());
+    }
+
+    /// Archival preserves the required context (failure reason, prior state,
+    /// retry count) before clearing the live metadata.
+    #[test]
+    fn test_archive_preserves_context_then_clears_live_metadata() {
+        let env = make_env();
+        let mut tracker = make_failed_tracker(&env, 1);
+        let policy = RecoveryRetentionPolicy { max_age_seconds: 500, max_retry_count: 100 };
+
+        env.ledger().set(LedgerInfo {
+            timestamp: 1_000 + 1_000,
+            protocol_version: 21,
+            sequence_number: 7,
+            network_id: Default::default(),
+            base_reserve: 0,
+            min_persistent_entry_ttl: 4096,
+            min_temp_entry_ttl: 16,
+            max_entry_ttl: 6_312_000,
+        });
+
+        let archived = tracker.archive_recovery_metadata(1, &policy, &env).unwrap();
+        assert!(archived, "an aged-out record must be archived");
+
+        // Live metadata is gone...
+        assert!(tracker.get_recovery_metadata(1, &env).unwrap().is_none());
+
+        // ...but the required context survives in the archive.
+        let entry = tracker.get_archived_recovery_metadata(1, &env).unwrap().unwrap();
+        assert_eq!(entry.transaction_id, 1);
+        assert_eq!(entry.failure_reason, String::from_str(&env, "network timeout"));
+        assert_eq!(entry.failed_from_state, TransactionState::InProgress);
+        assert_eq!(entry.retry_count, 0);
+        assert_eq!(entry.archived_at_ledger, 7);
+    }
+
+    /// An ineligible record must not be archived, and its live metadata must
+    /// remain untouched.
+    #[test]
+    fn test_archive_ineligible_record_is_untouched() {
+        let env = make_env();
+        let mut tracker = make_failed_tracker(&env, 1);
+        let policy = RecoveryRetentionPolicy { max_age_seconds: 1_000_000, max_retry_count: 5 };
+
+        let archived = tracker.archive_recovery_metadata(1, &policy, &env).unwrap();
+        assert!(!archived);
+        assert!(tracker.get_recovery_metadata(1, &env).unwrap().is_some());
+        assert!(tracker.get_archived_recovery_metadata(1, &env).unwrap().is_none());
+    }
+
+    /// A batch sweep prunes only the records that are actually eligible,
+    /// leaving ineligible ones (and their metadata) alone.
+    #[test]
+    fn test_sweep_prunes_only_eligible_records() {
+        let env = make_env();
+        let mut tracker = TransactionStateTracker::new(true);
+
+        // tx 1 fails at t=1000 (will be old by the time we sweep at t=3000).
+        let initiator1 = soroban_sdk::Address::generate(&env);
+        tracker.create_transaction(1, initiator1, &env).unwrap();
+        tracker.start_transaction(1, &env).unwrap();
+        tracker.fail_transaction(1, String::from_str(&env, "old failure"), &env).unwrap();
+
+        env.ledger().set(LedgerInfo {
+            timestamp: 3_000,
+            protocol_version: 21,
+            sequence_number: 3,
+            network_id: Default::default(),
+            base_reserve: 0,
+            min_persistent_entry_ttl: 4096,
+            min_temp_entry_ttl: 16,
+            max_entry_ttl: 6_312_000,
+        });
+
+        // tx 2 fails at t=3000 — fresh relative to the sweep.
+        let initiator2 = soroban_sdk::Address::generate(&env);
+        tracker.create_transaction(2, initiator2, &env).unwrap();
+        tracker.start_transaction(2, &env).unwrap();
+        tracker.fail_transaction(2, String::from_str(&env, "fresh failure"), &env).unwrap();
+
+        // At now=3000: tx1 age = 3000-1000 = 2000 >= 1500 (eligible).
+        //              tx2 age = 3000-3000 = 0    <  1500 (not eligible).
+        let policy = RecoveryRetentionPolicy { max_age_seconds: 1_500, max_retry_count: 100 };
+        let processed = tracker.sweep_recovery_metadata(&policy, false, &env).unwrap();
+
+        assert_eq!(processed, 1, "only the aged-out record must be swept");
+        assert!(tracker.get_recovery_metadata(1, &env).unwrap().is_none());
+        assert!(tracker.get_recovery_metadata(2, &env).unwrap().is_some());
+    }
+
+    /// A batch sweep in archive mode moves eligible metadata into the
+    /// archive and leaves ineligible records' live metadata in place.
+    #[test]
+    fn test_sweep_archive_mode_archives_eligible_and_leaves_ineligible() {
+        let env = make_env();
+        let mut tracker = TransactionStateTracker::new(true);
+
+        let initiator1 = soroban_sdk::Address::generate(&env);
+        tracker.create_transaction(1, initiator1, &env).unwrap();
+        tracker.start_transaction(1, &env).unwrap();
+        tracker.fail_transaction(1, String::from_str(&env, "old failure"), &env).unwrap();
+
+        env.ledger().set(LedgerInfo {
+            timestamp: 3_000,
+            protocol_version: 21,
+            sequence_number: 3,
+            network_id: Default::default(),
+            base_reserve: 0,
+            min_persistent_entry_ttl: 4096,
+            min_temp_entry_ttl: 16,
+            max_entry_ttl: 6_312_000,
+        });
+
+        let initiator2 = soroban_sdk::Address::generate(&env);
+        tracker.create_transaction(2, initiator2, &env).unwrap();
+        tracker.start_transaction(2, &env).unwrap();
+        tracker.fail_transaction(2, String::from_str(&env, "fresh failure"), &env).unwrap();
+
+        let policy = RecoveryRetentionPolicy { max_age_seconds: 1_500, max_retry_count: 100 };
+        let processed = tracker.sweep_recovery_metadata(&policy, true, &env).unwrap();
+
+        assert_eq!(processed, 1);
+        assert!(tracker.get_archived_recovery_metadata(1, &env).unwrap().is_some());
+        assert!(tracker.get_recovery_metadata(1, &env).unwrap().is_none());
+
+        // tx2 is untouched: still live, not archived.
+        assert!(tracker.get_archived_recovery_metadata(2, &env).unwrap().is_none());
+        assert!(tracker.get_recovery_metadata(2, &env).unwrap().is_some());
     }
 }

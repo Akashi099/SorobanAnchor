@@ -95,6 +95,30 @@ pub struct BudgetAlert {
     pub threshold_bytes: u64,
 }
 
+/// On-chain storage budget usage report for the transaction state tracker
+/// (#627), returned by [`crate::contract::AnchorKitContract::get_storage_budget_report`].
+///
+/// Unlike [`StorageBudgetMonitor`] (an in-memory helper used by the dev/test
+/// harness), this type is a `#[contracttype]` so it can cross the contract
+/// ABI boundary and be queried by any caller before storage pressure causes
+/// failures.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorageBudgetReport {
+    /// Number of transaction records currently tracked in persistent storage.
+    pub entry_count: u64,
+    /// Approximate total bytes consumed by tracked transaction records.
+    pub approx_bytes: u64,
+    /// Configured warning threshold, in bytes.
+    pub warning_bytes: u64,
+    /// Configured critical threshold, in bytes.
+    pub critical_bytes: u64,
+    /// `true` once `approx_bytes` has reached `warning_bytes` (or higher).
+    pub warning: bool,
+    /// `true` once `approx_bytes` has reached `critical_bytes`.
+    pub critical: bool,
+}
+
 /// The lifecycle states a tracked transaction can occupy.
 ///
 /// Legal forward transitions are:
@@ -341,6 +365,100 @@ impl OptRecovery {
     }
 }
 
+// ── Recovery metadata pruning & archival (#628) ──────────────────────────────
+
+/// Configurable retention policy for [`RecoveryMetadata`] (#628).
+///
+/// Recovery metadata is only useful for a bounded window after a failure —
+/// long enough for an operator or automated process to retry or inspect it,
+/// but not forever. Without a retention policy, recovery metadata for very
+/// old or repeatedly-retried failures would accumulate indefinitely. A
+/// record's metadata becomes eligible for pruning/archival once *either*
+/// condition is met:
+///
+/// - it is older than `max_age_seconds` (measured from the record's
+///   `last_updated` timestamp, i.e. the time of the failure or the most
+///   recent recovery attempt), or
+/// - its `retry_count` has reached `max_retry_count`, indicating recovery
+///   has been abandoned or exhausted.
+///
+/// # Examples
+///
+/// ```rust
+/// use anchorkit::transaction_state_tracker::RecoveryRetentionPolicy;
+///
+/// // Prune/archive after 30 days or 5 failed recovery attempts, whichever
+/// // comes first.
+/// let policy = RecoveryRetentionPolicy { max_age_seconds: 30 * 24 * 3600, max_retry_count: 5 };
+/// ```
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryRetentionPolicy {
+    /// Recovery metadata older than this many seconds becomes eligible for
+    /// pruning/archival.
+    pub max_age_seconds: u64,
+    /// Recovery metadata whose `retry_count` is at or above this ceiling
+    /// becomes eligible for pruning/archival, regardless of age.
+    pub max_retry_count: u32,
+}
+
+impl RecoveryRetentionPolicy {
+    /// Default retention: 30 days or 5 retries, whichever comes first.
+    pub const DEFAULT_MAX_AGE_SECONDS: u64 = 30 * 24 * 3600;
+    /// Default maximum retry count before metadata is considered abandoned.
+    pub const DEFAULT_MAX_RETRY_COUNT: u32 = 5;
+
+    /// The default retention policy (30 days / 5 retries).
+    pub fn default_policy() -> Self {
+        RecoveryRetentionPolicy {
+            max_age_seconds: Self::DEFAULT_MAX_AGE_SECONDS,
+            max_retry_count: Self::DEFAULT_MAX_RETRY_COUNT,
+        }
+    }
+
+    /// Validate that the policy has sensible non-zero values.
+    pub fn validate(&self) -> Result<(), alloc::string::String> {
+        if self.max_age_seconds == 0 {
+            return Err(alloc::string::String::from("max_age_seconds must be > 0"));
+        }
+        if self.max_retry_count == 0 {
+            return Err(alloc::string::String::from("max_retry_count must be > 0"));
+        }
+        Ok(())
+    }
+
+    /// Returns `true` when `meta` is eligible for pruning/archival given
+    /// `record_last_updated` (the owning record's `last_updated` timestamp)
+    /// and the current ledger `now` timestamp.
+    pub fn is_eligible(&self, meta: &RecoveryMetadata, record_last_updated: u64, now: u64) -> bool {
+        let age = now.saturating_sub(record_last_updated);
+        age >= self.max_age_seconds || meta.retry_count >= self.max_retry_count
+    }
+}
+
+/// Compact archived form of [`RecoveryMetadata`], retained after the live
+/// metadata on a [`TransactionStateRecord`] has been pruned (#628).
+///
+/// Archival preserves the fields needed to answer "why did this transaction
+/// fail, and how many times was recovery attempted?" after the record's live
+/// `recovery_metadata` has been cleared — it is intentionally a strict subset
+/// of [`RecoveryMetadata`] plus the identifying `transaction_id` and the
+/// ledger at which archival occurred, rather than a full duplicate.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArchivedRecoveryMetadata {
+    /// The transaction this archived metadata belongs to.
+    pub transaction_id: u64,
+    /// Human-readable reason for the original failure.
+    pub failure_reason: String,
+    /// The state the transaction occupied immediately before failing.
+    pub failed_from_state: TransactionState,
+    /// Number of recovery attempts recorded before archival.
+    pub retry_count: u32,
+    /// Ledger sequence number at which this metadata was archived.
+    pub archived_at_ledger: u32,
+}
+
 /// A snapshot of a tracked transaction's current state.
 ///
 /// Stored in Soroban persistent storage (production) or an in-memory cache
@@ -428,6 +546,9 @@ pub struct TransactionStateTracker {
     pub max_evictions_per_call: u32,
     /// In-memory budget monitor (dev mode) — tracks entry count and byte usage.
     pub budget_monitor: StorageBudgetMonitor,
+    /// Archived recovery metadata (dev mode) — populated by
+    /// [`TransactionStateTracker::archive_recovery_metadata`] (#628).
+    archive: alloc::vec::Vec<ArchivedRecoveryMetadata>,
 }
 
 impl TransactionStateTracker {
@@ -460,6 +581,7 @@ impl TransactionStateTracker {
             eviction_enabled: false,
             max_evictions_per_call: 10,
             budget_monitor: StorageBudgetMonitor::new(),
+            archive: alloc::vec::Vec::new(),
         }
     }
 
@@ -1527,6 +1649,240 @@ impl TransactionStateTracker {
                 Ok(())
             }
         }
+    }
+
+    // ── Recovery metadata pruning & archival (#628) ─────────────────────────
+
+    /// Store the recovery-metadata retention policy in persistent storage so
+    /// it can be reused by [`Self::sweep_recovery_metadata`] without being
+    /// re-supplied by every caller. Production mode only — in dev mode, pass
+    /// a policy explicitly to the pruning/archival methods.
+    pub fn set_retention_policy(env: &Env, policy: RecoveryRetentionPolicy) {
+        let key = symbol_short!("RCVPOLCY");
+        env.storage().persistent().set(&key, &policy);
+        env.storage().persistent().extend_ttl(&key, TXSTATE_TTL, TXSTATE_TTL);
+    }
+
+    /// Retrieve the stored retention policy, or
+    /// [`RecoveryRetentionPolicy::default_policy`] if none has been set.
+    pub fn get_retention_policy(env: &Env) -> RecoveryRetentionPolicy {
+        let key = symbol_short!("RCVPOLCY");
+        env.storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(RecoveryRetentionPolicy::default_policy)
+    }
+
+    /// Permanently clear the recovery metadata on a failed transaction once
+    /// it is eligible for pruning under `policy`, without preserving any
+    /// archived copy.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(true)` if metadata was pruned, `Ok(false)` if the transaction does
+    /// not exist, has no recovery metadata, or is not yet eligible.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{Env, String};
+    /// # use soroban_sdk::testutils::Address as _;
+    /// # let env = Env::default();
+    /// # let initiator = soroban_sdk::Address::generate(&env);
+    /// use anchorkit::transaction_state_tracker::{TransactionStateTracker, RecoveryRetentionPolicy};
+    ///
+    /// let mut tracker = TransactionStateTracker::new(true);
+    /// tracker.create_transaction(1, initiator, &env).unwrap();
+    /// tracker.start_transaction(1, &env).unwrap();
+    /// tracker.fail_transaction(1, String::from_str(&env, "timeout"), &env).unwrap();
+    ///
+    /// let policy = RecoveryRetentionPolicy { max_age_seconds: 1, max_retry_count: 5 };
+    /// // Not yet eligible — no time has elapsed and retry_count is 0.
+    /// assert_eq!(tracker.prune_recovery_metadata(1, &policy, &env), Ok(false));
+    /// ```
+    pub fn prune_recovery_metadata(
+        &mut self,
+        transaction_id: u64,
+        policy: &RecoveryRetentionPolicy,
+        env: &Env,
+    ) -> Result<bool, String> {
+        let now = env.ledger().timestamp();
+
+        if self.is_dev_mode {
+            for record in self.cache.iter_mut() {
+                if record.transaction_id == transaction_id {
+                    return Ok(match record.recovery_metadata.clone().into_option() {
+                        Some(meta) if policy.is_eligible(&meta, record.last_updated, now) => {
+                            record.recovery_metadata = OptRecovery::None;
+                            true
+                        }
+                        _ => false,
+                    });
+                }
+            }
+            Ok(false)
+        } else {
+            let key = (symbol_short!("TXSTATE"), transaction_id);
+            let mut record: TransactionStateRecord = match env.storage().persistent().get(&key) {
+                Some(r) => r,
+                None => return Ok(false),
+            };
+            let eligible = match record.recovery_metadata.clone().into_option() {
+                Some(meta) => policy.is_eligible(&meta, record.last_updated, now),
+                None => false,
+            };
+            if !eligible {
+                return Ok(false);
+            }
+            record.recovery_metadata = OptRecovery::None;
+            env.storage().persistent().set(&key, &record);
+            env.storage().persistent().extend_ttl(&key, TXSTATE_TTL, TXSTATE_TTL);
+            Ok(true)
+        }
+    }
+
+    /// Archive the recovery metadata on a failed transaction once it is
+    /// eligible under `policy`: a compact [`ArchivedRecoveryMetadata`] is
+    /// preserved (retrievable via [`Self::get_archived_recovery_metadata`])
+    /// before the live `recovery_metadata` field is cleared.
+    ///
+    /// Unlike [`Self::prune_recovery_metadata`], this never loses the
+    /// required context (failure reason, prior state, retry count) — it only
+    /// moves it out of the live record.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(true)` if metadata was archived, `Ok(false)` if the transaction
+    /// does not exist, has no recovery metadata, or is not yet eligible.
+    pub fn archive_recovery_metadata(
+        &mut self,
+        transaction_id: u64,
+        policy: &RecoveryRetentionPolicy,
+        env: &Env,
+    ) -> Result<bool, String> {
+        let now = env.ledger().timestamp();
+        let current_ledger = env.ledger().sequence();
+
+        if self.is_dev_mode {
+            let mut to_archive: Option<ArchivedRecoveryMetadata> = None;
+            for record in self.cache.iter_mut() {
+                if record.transaction_id == transaction_id {
+                    if let Some(meta) = record.recovery_metadata.clone().into_option() {
+                        if policy.is_eligible(&meta, record.last_updated, now) {
+                            to_archive = Some(ArchivedRecoveryMetadata {
+                                transaction_id,
+                                failure_reason: meta.failure_reason,
+                                failed_from_state: meta.failed_from_state,
+                                retry_count: meta.retry_count,
+                                archived_at_ledger: current_ledger,
+                            });
+                            record.recovery_metadata = OptRecovery::None;
+                        }
+                    }
+                    break;
+                }
+            }
+            match to_archive {
+                Some(entry) => {
+                    self.archive.push(entry);
+                    Ok(true)
+                }
+                None => Ok(false),
+            }
+        } else {
+            let key = (symbol_short!("TXSTATE"), transaction_id);
+            let mut record: TransactionStateRecord = match env.storage().persistent().get(&key) {
+                Some(r) => r,
+                None => return Ok(false),
+            };
+            let meta = match record.recovery_metadata.clone().into_option() {
+                Some(m) => m,
+                None => return Ok(false),
+            };
+            if !policy.is_eligible(&meta, record.last_updated, now) {
+                return Ok(false);
+            }
+
+            let entry = ArchivedRecoveryMetadata {
+                transaction_id,
+                failure_reason: meta.failure_reason,
+                failed_from_state: meta.failed_from_state,
+                retry_count: meta.retry_count,
+                archived_at_ledger: current_ledger,
+            };
+            let archive_key = (symbol_short!("RCVARCH"), transaction_id);
+            env.storage().persistent().set(&archive_key, &entry);
+            env.storage().persistent().extend_ttl(&archive_key, TXSTATE_TTL, TXSTATE_TTL);
+
+            record.recovery_metadata = OptRecovery::None;
+            env.storage().persistent().set(&key, &record);
+            env.storage().persistent().extend_ttl(&key, TXSTATE_TTL, TXSTATE_TTL);
+            Ok(true)
+        }
+    }
+
+    /// Retrieve the archived recovery metadata for `transaction_id`, if any.
+    pub fn get_archived_recovery_metadata(
+        &self,
+        transaction_id: u64,
+        env: &Env,
+    ) -> Result<Option<ArchivedRecoveryMetadata>, String> {
+        if self.is_dev_mode {
+            Ok(self
+                .archive
+                .iter()
+                .find(|a| a.transaction_id == transaction_id)
+                .cloned())
+        } else {
+            let archive_key = (symbol_short!("RCVARCH"), transaction_id);
+            Ok(env.storage().persistent().get(&archive_key))
+        }
+    }
+
+    /// Sweep every known transaction and prune or archive recovery metadata
+    /// eligible under `policy`.
+    ///
+    /// # Arguments
+    ///
+    /// * `policy`  - The retention policy to apply.
+    /// * `archive` - When `true`, eligible metadata is archived (preserving
+    ///   required context); when `false`, it is pruned outright.
+    /// * `env`     - The Soroban execution environment.
+    ///
+    /// # Returns
+    ///
+    /// The number of transactions whose recovery metadata was processed
+    /// (pruned or archived).
+    pub fn sweep_recovery_metadata(
+        &mut self,
+        policy: &RecoveryRetentionPolicy,
+        archive: bool,
+        env: &Env,
+    ) -> Result<u32, String> {
+        let ids: alloc::vec::Vec<u64> = if self.is_dev_mode {
+            self.known_ids.clone()
+        } else {
+            let ids_key = symbol_short!("TXIDS");
+            let stored: Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&ids_key)
+                .unwrap_or_else(|| Vec::new(env));
+            stored.iter().collect()
+        };
+
+        let mut processed = 0u32;
+        for id in ids {
+            let did_process = if archive {
+                self.archive_recovery_metadata(id, policy, env)?
+            } else {
+                self.prune_recovery_metadata(id, policy, env)?
+            };
+            if did_process {
+                processed += 1;
+            }
+        }
+        Ok(processed)
     }
 
     // ── Batch query helpers ──────────────────────────────────────────────────

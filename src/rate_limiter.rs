@@ -53,6 +53,97 @@ pub struct RateLimitState {
     pub window_start_ledger: u32,
 }
 
+/// Burst-control configuration: a token bucket layered on top of the base
+/// sliding-window limit (#630).
+///
+/// The base [`RateLimitConfig`] window is a blunt instrument — a client that
+/// sends `max_submissions` requests in the first ledger of a window and then
+/// falls silent is indistinguishable from one that sends them evenly spread
+/// out. A token bucket smooths that: it allows a short burst up to
+/// `burst_capacity` tokens, then throttles back to a steady `refill_per_ledger`
+/// rate once the bucket is drained. This lets legitimate bursty traffic
+/// (e.g. a client catching up after a network blip) through, while still
+/// bounding the *sustained* rate an abusive client can achieve.
+///
+/// Burst control is opt-in and orthogonal to the base rate limit: when no
+/// [`BurstControlConfig`] has been stored for an attestor's context,
+/// [`RateLimiter::check_and_increment`] behaves exactly as before.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use anchorkit::rate_limiter::BurstControlConfig;
+///
+/// // Allow bursts of up to 20 requests, refilling 2 tokens per ledger.
+/// let config = BurstControlConfig { burst_capacity: 20, refill_per_ledger: 2 };
+/// ```
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BurstControlConfig {
+    /// Maximum number of tokens the bucket can hold — the largest burst size
+    /// allowed before requests start being throttled.
+    pub burst_capacity: u32,
+    /// Tokens replenished per elapsed ledger since the last refill.
+    pub refill_per_ledger: u32,
+}
+
+/// Per-attestor token-bucket state for [`BurstControlConfig`] enforcement.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BurstState {
+    /// Tokens currently available in the bucket.
+    pub tokens: u32,
+    /// Ledger sequence number at which tokens were last refilled.
+    pub last_refill_ledger: u32,
+}
+
+/// Fairness configuration: caps the share of a shared rate-limit window that
+/// any single attestor may consume (#630).
+///
+/// Without fairness control, a shared/global [`RateLimitConfig`] can be
+/// monopolised by one high-volume attestor, starving everyone else out of
+/// the same window's budget. When a [`FairnessConfig`] is set, each
+/// submission also checks that the calling attestor's share of the window's
+/// *total* submissions (across all attestors) does not exceed
+/// `max_share_percent`, once at least `min_total_for_enforcement`
+/// submissions have been recorded in the window (so the very first
+/// requests, before there is any contention, are never penalised).
+///
+/// Fairness control is opt-in: when no [`FairnessConfig`] has been stored,
+/// [`RateLimiter::check_and_increment`] behaves exactly as before.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use anchorkit::rate_limiter::FairnessConfig;
+///
+/// // No single attestor may account for more than 50% of a window's
+/// // submissions, once at least 4 submissions have been made.
+/// let config = FairnessConfig { max_share_percent: 50, min_total_for_enforcement: 4 };
+/// ```
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FairnessConfig {
+    /// Maximum percentage (1-100) of the window's total submissions a single
+    /// attestor may account for.
+    pub max_share_percent: u32,
+    /// Minimum total submissions recorded in the window before fairness is
+    /// enforced.
+    pub min_total_for_enforcement: u32,
+}
+
+/// Tracks total submissions across all attestors in the current shared
+/// window, used by [`RateLimiter`] to compute each attestor's share for
+/// [`FairnessConfig`] enforcement.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GlobalRateWindowState {
+    /// Total submissions recorded (by any attestor) in the current window.
+    pub total_count: u32,
+    /// Ledger number when the current global window started.
+    pub window_start_ledger: u32,
+}
+
 /// Per-attestor sliding-window rate limiter for attestation submissions.
 ///
 /// All methods are associated functions that operate directly on Soroban
@@ -185,11 +276,204 @@ impl RateLimiter {
         if state.submission_count >= config.max_submissions {
             return Err(AnchorKitError::rate_limit_exceeded());
         }
-        
+
+        // Opt-in burst-control gate (#630). A no-op when no BurstControlConfig
+        // has been stored — existing callers are unaffected.
+        if let Some(burst_config) = Self::get_burst_config(env) {
+            Self::check_and_consume_burst(env, attestor, &burst_config, current_ledger)?;
+        }
+
+        // Opt-in fairness gate (#630). A no-op when no FairnessConfig has been
+        // stored — existing callers are unaffected. Runs after the burst gate
+        // so a rejected request never gets counted toward the shared window.
+        if let Some(fairness_config) = Self::get_fairness_config(env) {
+            Self::check_fairness(env, config, &state, &fairness_config, current_ledger)?;
+        }
+
         // Increment counter and save state
         state.submission_count += 1;
         env.storage().persistent().set(&state_key, &state);
-        
+
+        Ok(())
+    }
+
+    // ── Burst control (#630) ─────────────────────────────────────────────────
+
+    /// Store the global burst-control configuration (admin only in practice;
+    /// access control is enforced by the contract layer via `require_admin`).
+    pub fn set_burst_config(env: &Env, config: BurstControlConfig) {
+        env.storage().persistent().set(&Self::burst_config_key(env), &config);
+    }
+
+    /// Retrieve the stored burst-control configuration, or `None` if burst
+    /// control has not been enabled.
+    pub fn get_burst_config(env: &Env) -> Option<BurstControlConfig> {
+        env.storage().persistent().get::<_, BurstControlConfig>(&Self::burst_config_key(env))
+    }
+
+    /// Validate a [`BurstControlConfig`] has sensible non-zero values.
+    pub fn validate_burst_config(config: &BurstControlConfig) -> Result<(), AnchorKitError> {
+        if config.burst_capacity == 0 {
+            return Err(AnchorKitError::validation_error("burst_capacity must be > 0"));
+        }
+        if config.refill_per_ledger == 0 {
+            return Err(AnchorKitError::validation_error("refill_per_ledger must be > 0"));
+        }
+        Ok(())
+    }
+
+    /// Update the burst-control configuration (admin only).
+    pub fn update_burst_config(
+        env: &Env,
+        admin: &Address,
+        config: &BurstControlConfig,
+    ) -> Result<(), AnchorKitError> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&make_storage_key(env, &[b"ADMIN"]))
+            .ok_or_else(AnchorKitError::not_initialized)?;
+        if *admin != stored_admin {
+            return Err(AnchorKitError::unauthorized_attestor());
+        }
+        Self::validate_burst_config(config)?;
+        Self::set_burst_config(env, config.clone());
+        Ok(())
+    }
+
+    /// Return the current [`BurstState`] for an attestor, defaulting to a
+    /// full bucket (`burst_capacity` tokens) if no state has been stored yet.
+    pub fn get_burst_state(env: &Env, attestor: &Address, config: &BurstControlConfig) -> BurstState {
+        let key = Self::burst_state_key(env, attestor);
+        env.storage().persistent().get::<_, BurstState>(&key).unwrap_or(BurstState {
+            tokens: config.burst_capacity,
+            last_refill_ledger: env.ledger().sequence(),
+        })
+    }
+
+    /// Refill and consume one token from an attestor's burst bucket.
+    ///
+    /// Tokens are replenished at `config.refill_per_ledger` per elapsed
+    /// ledger since the last refill, capped at `config.burst_capacity`. When
+    /// the bucket has no tokens available the request is rejected — this is
+    /// the mechanism that smooths bursts: a client can spend its whole bucket
+    /// at once, but must then wait for it to refill before spending more.
+    fn check_and_consume_burst(
+        env: &Env,
+        attestor: &Address,
+        config: &BurstControlConfig,
+        current_ledger: u32,
+    ) -> Result<(), AnchorKitError> {
+        let mut state = Self::get_burst_state(env, attestor, config);
+
+        let elapsed = current_ledger.saturating_sub(state.last_refill_ledger);
+        if elapsed > 0 {
+            let refill = elapsed.saturating_mul(config.refill_per_ledger);
+            state.tokens = state.tokens.saturating_add(refill).min(config.burst_capacity);
+            state.last_refill_ledger = current_ledger;
+        }
+
+        if state.tokens == 0 {
+            // Persist the refill even on rejection so future calls see accurate state.
+            env.storage().persistent().set(&Self::burst_state_key(env, attestor), &state);
+            return Err(AnchorKitError::rate_limit_exceeded());
+        }
+
+        state.tokens -= 1;
+        env.storage().persistent().set(&Self::burst_state_key(env, attestor), &state);
+        Ok(())
+    }
+
+    // ── Fairness control (#630) ──────────────────────────────────────────────
+
+    /// Store the global fairness configuration (admin only in practice).
+    pub fn set_fairness_config(env: &Env, config: FairnessConfig) {
+        env.storage().persistent().set(&Self::fairness_config_key(env), &config);
+    }
+
+    /// Retrieve the stored fairness configuration, or `None` if fairness
+    /// control has not been enabled.
+    pub fn get_fairness_config(env: &Env) -> Option<FairnessConfig> {
+        env.storage().persistent().get::<_, FairnessConfig>(&Self::fairness_config_key(env))
+    }
+
+    /// Validate a [`FairnessConfig`] has sensible values.
+    ///
+    /// `max_share_percent` must be in `1..=100`.
+    pub fn validate_fairness_config(config: &FairnessConfig) -> Result<(), AnchorKitError> {
+        if config.max_share_percent == 0 || config.max_share_percent > 100 {
+            return Err(AnchorKitError::validation_error("max_share_percent must be in 1..=100"));
+        }
+        Ok(())
+    }
+
+    /// Update the fairness configuration (admin only).
+    pub fn update_fairness_config(
+        env: &Env,
+        admin: &Address,
+        config: &FairnessConfig,
+    ) -> Result<(), AnchorKitError> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&make_storage_key(env, &[b"ADMIN"]))
+            .ok_or_else(AnchorKitError::not_initialized)?;
+        if *admin != stored_admin {
+            return Err(AnchorKitError::unauthorized_attestor());
+        }
+        Self::validate_fairness_config(config)?;
+        Self::set_fairness_config(env, config.clone());
+        Ok(())
+    }
+
+    /// Return the current [`GlobalRateWindowState`], resetting it if the
+    /// shared window (aligned to `window_length`) has expired.
+    pub fn get_global_window_state(env: &Env, window_length: u32, current_ledger: u32) -> GlobalRateWindowState {
+        let key = Self::global_window_key(env);
+        let state = env.storage().persistent().get::<_, GlobalRateWindowState>(&key)
+            .unwrap_or(GlobalRateWindowState {
+                total_count: 0,
+                window_start_ledger: current_ledger,
+            });
+        if Self::is_window_expired(current_ledger, state.window_start_ledger, window_length) {
+            GlobalRateWindowState { total_count: 0, window_start_ledger: current_ledger }
+        } else {
+            state
+        }
+    }
+
+    /// Enforce that a single attestor cannot exceed `max_share_percent` of
+    /// the shared window's total submissions, once `min_total_for_enforcement`
+    /// submissions have been recorded.
+    ///
+    /// Compares the attestor's *prospective* count (their current count in
+    /// the window, plus this submission) against `max_share_percent` of the
+    /// window's prospective total (current total, plus this submission), so
+    /// the very submission being checked is included in the fairness math.
+    fn check_fairness(
+        env: &Env,
+        config: &RateLimitConfig,
+        attestor_state: &RateLimitState,
+        fairness_config: &FairnessConfig,
+        current_ledger: u32,
+    ) -> Result<(), AnchorKitError> {
+        let mut global = Self::get_global_window_state(env, config.window_length, current_ledger);
+
+        let prospective_total = global.total_count + 1;
+        let prospective_attestor_count = attestor_state.submission_count + 1;
+
+        if prospective_total >= fairness_config.min_total_for_enforcement {
+            // attestor_share_pct = prospective_attestor_count / prospective_total * 100
+            // Compared without floating point: attestor * 100 > max_share * total
+            let attestor_share_scaled = (prospective_attestor_count as u64) * 100;
+            let allowed_share_scaled = (fairness_config.max_share_percent as u64) * (prospective_total as u64);
+            if attestor_share_scaled > allowed_share_scaled {
+                return Err(AnchorKitError::rate_limit_exceeded());
+            }
+        }
+
+        global.total_count = prospective_total;
+        env.storage().persistent().set(&Self::global_window_key(env), &global);
         Ok(())
     }
     
@@ -370,6 +654,32 @@ impl RateLimiter {
             raw.push(addr_xdr.get(i).unwrap_or(0));
         }
         make_storage_key(env, &[b"RL_ADDR", &raw])
+    }
+
+    /// Storage key for the global burst-control configuration.
+    fn burst_config_key(env: &Env) -> soroban_sdk::BytesN<32> {
+        make_storage_key(env, &[b"RL_BST_CFG"])
+    }
+
+    /// Storage key for a per-attestor burst-control token-bucket state.
+    fn burst_state_key(env: &Env, attestor: &Address) -> soroban_sdk::BytesN<32> {
+        use soroban_sdk::xdr::ToXdr;
+        let addr_xdr = attestor.clone().to_xdr(env);
+        let mut raw = alloc::vec::Vec::with_capacity(addr_xdr.len() as usize);
+        for i in 0..addr_xdr.len() {
+            raw.push(addr_xdr.get(i).unwrap_or(0));
+        }
+        make_storage_key(env, &[b"RL_BST_ST", &raw])
+    }
+
+    /// Storage key for the global fairness configuration.
+    fn fairness_config_key(env: &Env) -> soroban_sdk::BytesN<32> {
+        make_storage_key(env, &[b"RL_FAIR_CFG"])
+    }
+
+    /// Storage key for the shared global rate-limit window state.
+    fn global_window_key(env: &Env) -> soroban_sdk::BytesN<32> {
+        make_storage_key(env, &[b"RL_GLOBAL"])
     }
 }
 
@@ -864,5 +1174,320 @@ mod tests {
         // State must still show exactly max_submissions
         let state = env.as_contract(&contract_id, &|| RateLimiter::get_state(&env, &attestor));
         assert_eq!(state.submission_count, 2);
+    }
+
+    // -------------------------------------------------------------------------
+    // #630 — burst control (token bucket)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_burst_control_disabled_by_default() {
+        let env = Env::default();
+        let attestor = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+        let contract_address = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+        let contract_id = env.register_contract(&contract_address, crate::contract::AnchorKitContract);
+
+        assert!(env.as_contract(&contract_id, &|| RateLimiter::get_burst_config(&env)).is_none());
+
+        let config = RateLimitConfig { max_submissions: 50, window_length: 1000 };
+        for _ in 0..10 {
+            assert!(env.as_contract(&contract_id, &|| {
+                RateLimiter::check_and_increment(&env, &attestor, &config)
+            }).is_ok());
+        }
+    }
+
+    #[test]
+    fn test_burst_allows_up_to_capacity_then_rejects() {
+        let env = Env::default();
+        let attestor = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+        let contract_address = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+        let contract_id = env.register_contract(&contract_address, crate::contract::AnchorKitContract);
+
+        // Base window is generous — the burst bucket is the binding constraint.
+        let config = RateLimitConfig { max_submissions: 100, window_length: 1000 };
+        let burst = BurstControlConfig { burst_capacity: 3, refill_per_ledger: 1 };
+        env.as_contract(&contract_id, &|| RateLimiter::set_burst_config(&env, burst.clone()));
+
+        for i in 0..3 {
+            assert!(env.as_contract(&contract_id, &|| {
+                RateLimiter::check_and_increment(&env, &attestor, &config)
+            }).is_ok(), "submission {i} within burst capacity must succeed");
+        }
+
+        // The 4th submission in the same ledger drains an empty bucket.
+        let result = env.as_contract(&contract_id, &|| {
+            RateLimiter::check_and_increment(&env, &attestor, &config)
+        });
+        assert!(result.is_err(), "submission beyond burst capacity must be rejected");
+        assert_eq!(result.unwrap_err().code, ErrorCode::RateLimitExceeded);
+    }
+
+    #[test]
+    fn test_burst_refills_over_elapsed_ledgers() {
+        let env = Env::default();
+        let attestor = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+        let contract_address = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+        let contract_id = env.register_contract(&contract_address, crate::contract::AnchorKitContract);
+
+        let config = RateLimitConfig { max_submissions: 100, window_length: 1000 };
+        let burst = BurstControlConfig { burst_capacity: 2, refill_per_ledger: 1 };
+        env.as_contract(&contract_id, &|| RateLimiter::set_burst_config(&env, burst.clone()));
+
+        // Drain the bucket completely.
+        for _ in 0..2 {
+            assert!(env.as_contract(&contract_id, &|| {
+                RateLimiter::check_and_increment(&env, &attestor, &config)
+            }).is_ok());
+        }
+        assert!(env.as_contract(&contract_id, &|| {
+            RateLimiter::check_and_increment(&env, &attestor, &config)
+        }).is_err());
+
+        // Advance 2 ledgers — refill_per_ledger=1 means 2 tokens become available.
+        env.ledger().set(soroban_sdk::testutils::LedgerInfo {
+            sequence_number: 2,
+            timestamp: 1000,
+            protocol_version: 21,
+            network_id: Default::default(),
+            base_reserve: 0,
+            min_persistent_entry_ttl: 4096,
+            min_temp_entry_ttl: 16,
+            max_entry_ttl: 6312000,
+        });
+
+        assert!(env.as_contract(&contract_id, &|| {
+            RateLimiter::check_and_increment(&env, &attestor, &config)
+        }).is_ok(), "bucket must have refilled after elapsed ledgers");
+        assert!(env.as_contract(&contract_id, &|| {
+            RateLimiter::check_and_increment(&env, &attestor, &config)
+        }).is_ok());
+        // Bucket is drained again (capacity 2, both refilled tokens spent).
+        assert!(env.as_contract(&contract_id, &|| {
+            RateLimiter::check_and_increment(&env, &attestor, &config)
+        }).is_err());
+    }
+
+    #[test]
+    fn test_burst_refill_caps_at_capacity() {
+        let env = Env::default();
+        let attestor = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+        let contract_address = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+        let contract_id = env.register_contract(&contract_address, crate::contract::AnchorKitContract);
+
+        let config = RateLimitConfig { max_submissions: 100, window_length: 1000 };
+        let burst = BurstControlConfig { burst_capacity: 2, refill_per_ledger: 10 };
+        env.as_contract(&contract_id, &|| RateLimiter::set_burst_config(&env, burst.clone()));
+
+        // Consume one token (bucket starts full at capacity=2).
+        assert!(env.as_contract(&contract_id, &|| {
+            RateLimiter::check_and_increment(&env, &attestor, &config)
+        }).is_ok());
+
+        // Advance far enough that an uncapped refill would hugely overshoot capacity.
+        env.ledger().set(soroban_sdk::testutils::LedgerInfo {
+            sequence_number: 100,
+            timestamp: 1000,
+            protocol_version: 21,
+            network_id: Default::default(),
+            base_reserve: 0,
+            min_persistent_entry_ttl: 4096,
+            min_temp_entry_ttl: 16,
+            max_entry_ttl: 6312000,
+        });
+
+        // Only 2 submissions should be possible (capacity), not more.
+        assert!(env.as_contract(&contract_id, &|| {
+            RateLimiter::check_and_increment(&env, &attestor, &config)
+        }).is_ok());
+        assert!(env.as_contract(&contract_id, &|| {
+            RateLimiter::check_and_increment(&env, &attestor, &config)
+        }).is_ok());
+        assert!(env.as_contract(&contract_id, &|| {
+            RateLimiter::check_and_increment(&env, &attestor, &config)
+        }).is_err(), "refill must be capped at burst_capacity");
+    }
+
+    #[test]
+    fn test_validate_burst_config_rejects_zero_values() {
+        assert!(RateLimiter::validate_burst_config(&BurstControlConfig {
+            burst_capacity: 0,
+            refill_per_ledger: 1,
+        }).is_err());
+        assert!(RateLimiter::validate_burst_config(&BurstControlConfig {
+            burst_capacity: 1,
+            refill_per_ledger: 0,
+        }).is_err());
+        assert!(RateLimiter::validate_burst_config(&BurstControlConfig {
+            burst_capacity: 1,
+            refill_per_ledger: 1,
+        }).is_ok());
+    }
+
+    #[test]
+    fn test_update_burst_config_requires_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+        let non_admin = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+        let contract_address = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+        let contract_id = env.register_contract(&contract_address, crate::contract::AnchorKitContract);
+
+        env.as_contract(&contract_id, &|| {
+            env.storage().instance().set(&make_storage_key(&env, &[b"ADMIN"]), &admin);
+        });
+
+        let cfg = BurstControlConfig { burst_capacity: 5, refill_per_ledger: 1 };
+        let result = env.as_contract(&contract_id, &|| {
+            RateLimiter::update_burst_config(&env, &non_admin, &cfg)
+        });
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, ErrorCode::UnauthorizedAttestor);
+
+        assert!(env.as_contract(&contract_id, &|| {
+            RateLimiter::update_burst_config(&env, &admin, &cfg)
+        }).is_ok());
+        let stored = env.as_contract(&contract_id, &|| RateLimiter::get_burst_config(&env));
+        assert_eq!(stored, Some(cfg));
+    }
+
+    // -------------------------------------------------------------------------
+    // #630 — fairness control (per-client share cap)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_fairness_disabled_by_default() {
+        let env = Env::default();
+        let attestor = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+        let contract_address = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+        let contract_id = env.register_contract(&contract_address, crate::contract::AnchorKitContract);
+
+        assert!(env.as_contract(&contract_id, &|| RateLimiter::get_fairness_config(&env)).is_none());
+
+        let config = RateLimitConfig { max_submissions: 50, window_length: 1000 };
+        for _ in 0..10 {
+            assert!(env.as_contract(&contract_id, &|| {
+                RateLimiter::check_and_increment(&env, &attestor, &config)
+            }).is_ok());
+        }
+    }
+
+    #[test]
+    fn test_fairness_allows_evenly_distributed_clients() {
+        let env = Env::default();
+        let a = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+        let b = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+        let contract_address = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+        let contract_id = env.register_contract(&contract_address, crate::contract::AnchorKitContract);
+
+        let config = RateLimitConfig { max_submissions: 100, window_length: 1000 };
+        let fairness = FairnessConfig { max_share_percent: 50, min_total_for_enforcement: 4 };
+        env.as_contract(&contract_id, &|| RateLimiter::set_fairness_config(&env, fairness.clone()));
+
+        // Two clients alternating stay within their fair 50% share and must
+        // both be allowed even after fairness enforcement kicks in.
+        for (i, attestor) in [&a, &b, &a, &b].into_iter().enumerate() {
+            let result = env.as_contract(&contract_id, &|| {
+                RateLimiter::check_and_increment(&env, attestor, &config)
+            });
+            assert!(result.is_ok(), "alternating call {i} must be allowed under fair distribution");
+        }
+    }
+
+    #[test]
+    fn test_fairness_rejects_client_exceeding_share() {
+        let env = Env::default();
+        let a = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+        let b = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+        let contract_address = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+        let contract_id = env.register_contract(&contract_address, crate::contract::AnchorKitContract);
+
+        let config = RateLimitConfig { max_submissions: 100, window_length: 1000 };
+        let fairness = FairnessConfig { max_share_percent: 50, min_total_for_enforcement: 3 };
+        env.as_contract(&contract_id, &|| RateLimiter::set_fairness_config(&env, fairness.clone()));
+
+        // A, A, B — A now holds 2/3 of the shared window's submissions.
+        for attestor in [&a, &a, &b] {
+            assert!(env.as_contract(&contract_id, &|| {
+                RateLimiter::check_and_increment(&env, attestor, &config)
+            }).is_ok());
+        }
+
+        // A tries a 3rd submission, which would push it to 3/4 = 75% of the
+        // shared window — over its 50% fair share — and must be rejected.
+        let result = env.as_contract(&contract_id, &|| {
+            RateLimiter::check_and_increment(&env, &a, &config)
+        });
+        assert!(result.is_err(), "client exceeding its fair share must be rejected");
+        assert_eq!(result.unwrap_err().code, ErrorCode::RateLimitExceeded);
+
+        // B, meanwhile, is behind (1/3) — its next submission brings the
+        // window to a balanced 2/4 = 50% and must be allowed.
+        assert!(env.as_contract(&contract_id, &|| {
+            RateLimiter::check_and_increment(&env, &b, &config)
+        }).is_ok(), "a client below its fair share must still be allowed");
+    }
+
+    #[test]
+    fn test_fairness_not_enforced_below_minimum_total() {
+        let env = Env::default();
+        let a = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+        let contract_address = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+        let contract_id = env.register_contract(&contract_address, crate::contract::AnchorKitContract);
+
+        let config = RateLimitConfig { max_submissions: 100, window_length: 1000 };
+        // A single client would normally dominate the share, but enforcement
+        // only begins once min_total_for_enforcement submissions exist.
+        let fairness = FairnessConfig { max_share_percent: 50, min_total_for_enforcement: 10 };
+        env.as_contract(&contract_id, &|| RateLimiter::set_fairness_config(&env, fairness.clone()));
+
+        for i in 0..9 {
+            assert!(env.as_contract(&contract_id, &|| {
+                RateLimiter::check_and_increment(&env, &a, &config)
+            }).is_ok(), "submission {i} below the enforcement threshold must be allowed");
+        }
+    }
+
+    #[test]
+    fn test_validate_fairness_config_rejects_out_of_range() {
+        assert!(RateLimiter::validate_fairness_config(&FairnessConfig {
+            max_share_percent: 0,
+            min_total_for_enforcement: 1,
+        }).is_err());
+        assert!(RateLimiter::validate_fairness_config(&FairnessConfig {
+            max_share_percent: 101,
+            min_total_for_enforcement: 1,
+        }).is_err());
+        assert!(RateLimiter::validate_fairness_config(&FairnessConfig {
+            max_share_percent: 100,
+            min_total_for_enforcement: 1,
+        }).is_ok());
+    }
+
+    #[test]
+    fn test_update_fairness_config_requires_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+        let non_admin = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+        let contract_address = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+        let contract_id = env.register_contract(&contract_address, crate::contract::AnchorKitContract);
+
+        env.as_contract(&contract_id, &|| {
+            env.storage().instance().set(&make_storage_key(&env, &[b"ADMIN"]), &admin);
+        });
+
+        let cfg = FairnessConfig { max_share_percent: 60, min_total_for_enforcement: 5 };
+        let result = env.as_contract(&contract_id, &|| {
+            RateLimiter::update_fairness_config(&env, &non_admin, &cfg)
+        });
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, ErrorCode::UnauthorizedAttestor);
+
+        assert!(env.as_contract(&contract_id, &|| {
+            RateLimiter::update_fairness_config(&env, &admin, &cfg)
+        }).is_ok());
+        let stored = env.as_contract(&contract_id, &|| RateLimiter::get_fairness_config(&env));
+        assert_eq!(stored, Some(cfg));
     }
 }
