@@ -142,6 +142,13 @@ pub mod session_state_machine;
 pub mod migration;
 #[cfg(not(feature = "wasm"))]
 pub mod url_normalizer;
+// Issue #679: configurable request record retention policies
+// Issue #680: request record export and archival support
+#[cfg(not(feature = "wasm"))]
+pub mod request_record;
+// Issue #678: host-boundary replay prevention
+#[cfg(not(feature = "wasm"))]
+pub mod host_replay_prevention;
 
 // ── std-only modules (filesystem, runtime config) ─────────────────────────────
 #[cfg(feature = "std")]
@@ -275,8 +282,7 @@ pub use admin_audit_log::{AdminAuditLog, AdminConfigChangeEvent, AdminAuditLogCo
 pub use contract::{HealthStatus, MetadataFreshnessReport, RateLimiterHealth};
 pub use contract::{AnchorHealthMetrics, AnchorProofRecord};
 pub use transaction_state_tracker::{BudgetStatus, BudgetAlert};
-// Issue #657: multi-anchor reputation weighting
-pub use contract::{AnchorReputationRecord, ReputationWeights};
+// Issue #657: multi-anchor reputation weightingpub use contract::{AnchorReputationRecord, ReputationWeights};
 // Issue #658: time-based routing policies
 pub use contract::{RoutingTimeWindow, TimedRoutingPolicy};
 // Issue #659: per-network routing profiles
