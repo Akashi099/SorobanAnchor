@@ -612,6 +612,159 @@ impl HealthWindowBuilder {
 }
 
 // ---------------------------------------------------------------------------
+// Issue #664: Health report export
+// ---------------------------------------------------------------------------
+
+/// Supported serialization formats for [`export_health_report`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HealthReportFormat {
+    /// Structured text with `key: value` pairs — easy to grep and human-readable.
+    Text,
+    /// JSON object — suitable for ingestion by dashboards and incident tooling.
+    Json,
+}
+
+/// A complete exportable health report for a single anchor.
+///
+/// Contains the current composite score, sub-scores, trend, window statistics,
+/// and an overall label suitable for use in dashboards and alerting pipelines.
+///
+/// Obtain one via [`build_health_report`] and serialise it with
+/// [`export_health_report`].
+#[derive(Clone, Debug)]
+pub struct AnchorHealthReport {
+    /// Identifier for the anchor (e.g. domain or contract address).
+    pub anchor_id: String,
+    /// How many observation windows were included.
+    pub window_count: usize,
+    /// Composite score (0–100) for the most recent window.
+    pub composite_score: f64,
+    /// Sub-score derived from the success rate (0–100).
+    pub success_rate_score: f64,
+    /// Sub-score derived from p50 latency (0–100).
+    pub latency_score: f64,
+    /// Sub-score derived from routing failure rate (0–100).
+    pub routing_score: f64,
+    /// Sub-score derived from recovery behaviour (0–100).
+    pub recovery_score: f64,
+    /// Qualitative label: `"healthy"`, `"degraded"`, or `"critical"`.
+    pub label: String,
+    /// Trend direction: `"improving"`, `"stable"`, or `"degrading"`.
+    pub trend: String,
+    /// Composite score from the previous window, if available.
+    pub previous_composite: Option<f64>,
+}
+
+/// Build an [`AnchorHealthReport`] for a named anchor from its observation windows.
+///
+/// # Examples
+///
+/// ```rust
+/// use anchorkit::anchor_health::{HealthWindow, build_health_report, export_health_report, HealthReportFormat};
+///
+/// let w = HealthWindow {
+///     started_at: 0, ended_at: 300,
+///     success_count: 99, failure_count: 1,
+///     p50_latency_ms: 100.0,
+///     routing_failure_count: 0, routing_attempt_count: 10,
+///     recovery_time_seconds: 0,
+/// };
+/// let report = build_health_report("anchor.example.com", &[w]);
+/// assert_eq!(report.label, "healthy");
+/// let text = export_health_report(&report, HealthReportFormat::Text);
+/// assert!(text.contains("anchor_id: anchor.example.com"));
+/// let json = export_health_report(&report, HealthReportFormat::Json);
+/// assert!(json.contains("\"anchor_id\""));
+/// ```
+pub fn build_health_report(anchor_id: &str, windows: &[HealthWindow]) -> AnchorHealthReport {
+    let snapshot = build_health_snapshot(windows);
+    let score = &snapshot.current_score;
+    AnchorHealthReport {
+        anchor_id: anchor_id.into(),
+        window_count: snapshot.window_count,
+        composite_score: score.composite,
+        success_rate_score: score.success_rate_score,
+        latency_score: score.latency_score,
+        routing_score: score.routing_score,
+        recovery_score: score.recovery_score,
+        label: score.label().into(),
+        trend: snapshot.trend.label().into(),
+        previous_composite: snapshot.previous_score,
+    }
+}
+
+/// Serialize an [`AnchorHealthReport`] into the requested [`HealthReportFormat`].
+///
+/// - `HealthReportFormat::Text` — produces a multi-line `key: value` string.
+/// - `HealthReportFormat::Json` — produces a compact JSON object.
+pub fn export_health_report(report: &AnchorHealthReport, format: HealthReportFormat) -> String {
+    match format {
+        HealthReportFormat::Text => export_health_report_text(report),
+        HealthReportFormat::Json => export_health_report_json(report),
+    }
+}
+
+fn export_health_report_text(r: &AnchorHealthReport) -> String {
+    let prev = match r.previous_composite {
+        Some(p) => alloc::format!("{p:.2}"),
+        None => "n/a".into(),
+    };
+    alloc::format!(
+        "anchor_id: {}\n\
+         window_count: {}\n\
+         composite_score: {:.2}\n\
+         success_rate_score: {:.2}\n\
+         latency_score: {:.2}\n\
+         routing_score: {:.2}\n\
+         recovery_score: {:.2}\n\
+         label: {}\n\
+         trend: {}\n\
+         previous_composite: {}\n",
+        r.anchor_id,
+        r.window_count,
+        r.composite_score,
+        r.success_rate_score,
+        r.latency_score,
+        r.routing_score,
+        r.recovery_score,
+        r.label,
+        r.trend,
+        prev,
+    )
+}
+
+fn export_health_report_json(r: &AnchorHealthReport) -> String {
+    let prev = match r.previous_composite {
+        Some(p) => alloc::format!("{p:.2}"),
+        None => "null".into(),
+    };
+    alloc::format!(
+        "{{\
+\"anchor_id\":\"{}\",\
+\"window_count\":{},\
+\"composite_score\":{:.2},\
+\"success_rate_score\":{:.2},\
+\"latency_score\":{:.2},\
+\"routing_score\":{:.2},\
+\"recovery_score\":{:.2},\
+\"label\":\"{}\",\
+\"trend\":\"{}\",\
+\"previous_composite\":{}\
+}}",
+        r.anchor_id,
+        r.window_count,
+        r.composite_score,
+        r.success_rate_score,
+        r.latency_score,
+        r.routing_score,
+        r.recovery_score,
+        r.label,
+        r.trend,
+        prev,
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

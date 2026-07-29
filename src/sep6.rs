@@ -61,6 +61,131 @@ pub fn classify_status_str(s: &str) -> StatusCategory {
     }
 }
 
+// ── Vendor-specific status mapping (#660) ────────────────────────────────────
+
+/// A single entry in a vendor-specific status map.
+///
+/// Maps a raw vendor string to a canonical [`TransactionStatus`]. The original
+/// raw value is always preserved alongside the canonical classification so
+/// callers never lose vendor detail.
+#[derive(Clone, Debug)]
+pub struct VendorStatusEntry {
+    /// The raw vendor string exactly as supplied in the anchor's response.
+    pub vendor_status: String,
+    /// The canonical SEP-6 status this vendor string maps to.
+    pub canonical: TransactionStatus,
+}
+
+/// A collection of vendor-specific status mappings for a single anchor.
+///
+/// Anchors may return proprietary status strings (e.g. `"ach_processing"`,
+/// `"kyc_required"`, `"fx_pending"`) that have no direct SEP-6 equivalent.
+/// A `VendorStatusMap` lets you register these values once and then resolve
+/// any raw string against them, falling back to the standard
+/// [`TransactionStatus::from_str`] parser for unregistered values.
+///
+/// # Examples
+///
+/// ```rust
+/// use anchorkit::sep6::{VendorStatusMap, TransactionStatus};
+///
+/// let mut map = VendorStatusMap::new();
+/// map.register("ach_processing", TransactionStatus::PendingExternal);
+/// map.register("kyc_required",   TransactionStatus::PendingUser);
+///
+/// // Known vendor value → canonical + raw preserved.
+/// let r = map.resolve("ach_processing");
+/// assert_eq!(r.canonical, TransactionStatus::PendingExternal);
+/// assert_eq!(r.vendor_status, "ach_processing");
+///
+/// // Unknown vendor value → falls back to SEP-6 parser.
+/// let r2 = map.resolve("completed");
+/// assert_eq!(r2.canonical, TransactionStatus::Completed);
+///
+/// // Truly unknown value → Error.
+/// let r3 = map.resolve("totally_unknown");
+/// assert_eq!(r3.canonical, TransactionStatus::Error);
+/// assert_eq!(r3.vendor_status, "totally_unknown");
+/// ```
+#[derive(Clone, Debug, Default)]
+pub struct VendorStatusMap {
+    entries: alloc::vec::Vec<VendorStatusEntry>,
+}
+
+impl VendorStatusMap {
+    /// Create an empty vendor status map.
+    pub fn new() -> Self {
+        VendorStatusMap {
+            entries: alloc::vec::Vec::new(),
+        }
+    }
+
+    /// Register a vendor-specific status string and its canonical equivalent.
+    ///
+    /// If `vendor_status` is already registered the existing mapping is
+    /// replaced.
+    pub fn register(&mut self, vendor_status: &str, canonical: TransactionStatus) {
+        let key = vendor_status.trim().to_ascii_lowercase();
+        if let Some(pos) = self.entries.iter().position(|e| e.vendor_status == key) {
+            self.entries[pos].canonical = canonical;
+        } else {
+            self.entries.push(VendorStatusEntry {
+                vendor_status: key,
+                canonical,
+            });
+        }
+    }
+
+    /// Resolve a raw anchor status string.
+    ///
+    /// Resolution order:
+    /// 1. Look up the trimmed, lowercased value in the vendor map.
+    /// 2. If not found, fall back to [`TransactionStatus::from_str`].
+    ///
+    /// The returned [`VendorStatusEntry`] always carries the original
+    /// (trimmed) raw string so callers can log or forward vendor detail.
+    pub fn resolve(&self, raw: &str) -> VendorStatusEntry {
+        let key = raw.trim().to_ascii_lowercase();
+        if let Some(entry) = self.entries.iter().find(|e| e.vendor_status == key) {
+            return VendorStatusEntry {
+                vendor_status: raw.trim().into(),
+                canonical: entry.canonical.clone(),
+            };
+        }
+        VendorStatusEntry {
+            vendor_status: raw.trim().into(),
+            canonical: TransactionStatus::from_str(raw),
+        }
+    }
+
+    /// Returns `true` if the map contains a custom mapping for `vendor_status`.
+    pub fn contains(&self, vendor_status: &str) -> bool {
+        let key = vendor_status.trim().to_ascii_lowercase();
+        self.entries.iter().any(|e| e.vendor_status == key)
+    }
+
+    /// Remove the mapping for `vendor_status`. Returns `true` if it existed.
+    pub fn remove(&mut self, vendor_status: &str) -> bool {
+        let key = vendor_status.trim().to_ascii_lowercase();
+        if let Some(pos) = self.entries.iter().position(|e| e.vendor_status == key) {
+            self.entries.remove(pos);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Return the number of registered vendor mappings.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns `true` when no vendor mappings are registered.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
 // ── Normalized response types ────────────────────────────────────────────────
 
 /// Normalized status values across all SEP-6 anchors.

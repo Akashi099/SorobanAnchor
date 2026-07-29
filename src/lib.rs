@@ -138,6 +138,8 @@ pub mod admin_audit_log;
 pub mod cache_governance;
 pub mod session_state_machine;
 pub mod migration;
+#[cfg(not(feature = "wasm"))]
+pub mod url_normalizer;
 
 // ── std-only modules (filesystem, runtime config) ─────────────────────────────
 #[cfg(feature = "std")]
@@ -238,6 +240,7 @@ pub use sep6::{
     TransactionStatus, TransactionStatusResponse, WithdrawalResponse,
     poll_transaction_status, PollConfig, PollResult,
     StatusCategory, classify_status_str,
+    VendorStatusMap, VendorStatusEntry,
 };
 #[cfg(not(feature = "wasm"))]
 pub use sep31::{
@@ -254,6 +257,9 @@ pub use sep24::{
 };
 pub use contract::{ServiceRetirementInfo, AnchorServices};
 pub use contract::{AttestationFilter, AttestationPage};
+pub use contract::{AttestationSortOrder};
+#[cfg(not(feature = "wasm"))]
+pub use contract::sort_attestations;
 pub use service_management::{ServiceManager, ServiceToggleState, ServiceConfigSnapshot};
 pub use admin_audit_log::{AdminAuditLog, AdminConfigChangeEvent, AdminAuditLogConfig};
 pub use contract::{HealthStatus, MetadataFreshnessReport, RateLimiterHealth};
@@ -266,7 +272,17 @@ pub use contract::{RoutingTimeWindow, TimedRoutingPolicy};
 // Issue #659: per-network routing profiles
 pub use contract::NetworkRoutingProfile;
 #[cfg(not(feature = "wasm"))]
+pub use anchor_health::{
+    AnchorHealthReport, HealthReportFormat,
+    build_health_report, export_health_report,
+};
+#[cfg(not(feature = "wasm"))]
 pub use sep38::{CrossAnchorFeeAggregator, FeeAnomalyReport};
+#[cfg(not(feature = "wasm"))]
+pub use sep38::{
+    RawPartialFirmQuote, PartialFirmQuote, parse_partial_quote,
+    sort_quotes, QuoteSortOrder,
+};
 #[cfg(not(feature = "wasm"))]
 pub use streaming_monitor::{StreamingTransactionMonitor, TransactionStatusUpdate, StateTransition, BackpressureConfig};
 #[cfg(not(feature = "wasm"))]

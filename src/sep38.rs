@@ -101,6 +101,208 @@ pub struct RawFirmQuote {
     pub buy_asset: String,
 }
 
+// ── Partial quote support (#662) ─────────────────────────────────────────────
+
+/// A raw quote response where every field is optional.
+///
+/// Some anchors return partial quote payloads — for example when they are
+/// rate-limited or their upstream pricing source is unavailable.  Rather than
+/// rejecting the entire response, [`parse_partial_quote`] stores whatever
+/// fields were present and records which ones are missing in
+/// [`PartialFirmQuote::missing_fields`].
+///
+/// # Examples
+///
+/// ```rust
+/// use anchorkit::sep38::{RawPartialFirmQuote, parse_partial_quote};
+///
+/// let raw = RawPartialFirmQuote {
+///     id: Some("q-partial".into()),
+///     expires_at: None,          // missing
+///     price: Some("0.15".into()),
+///     sell_amount: None,         // missing
+///     buy_amount: Some("15".into()),
+///     sell_asset: Some("XLM".into()),
+///     buy_asset: Some("USDC".into()),
+/// };
+/// let partial = parse_partial_quote(raw);
+/// assert_eq!(partial.id, Some("q-partial".into()));
+/// assert!(partial.missing_fields.contains(&"expires_at"));
+/// assert!(partial.missing_fields.contains(&"sell_amount"));
+/// assert!(!partial.is_complete());
+/// ```
+#[derive(Clone, Debug, Default)]
+pub struct RawPartialFirmQuote {
+    pub id: Option<String>,
+    pub expires_at: Option<String>,
+    pub price: Option<String>,
+    pub sell_amount: Option<String>,
+    pub buy_amount: Option<String>,
+    pub sell_asset: Option<String>,
+    pub buy_asset: Option<String>,
+}
+
+/// A firm quote where some fields may be absent due to a partial response.
+///
+/// All value fields mirror [`FirmQuote`] but are wrapped in `Option`.
+/// The `missing_fields` vec names every field that was absent in the raw
+/// response so downstream code can surface the gaps clearly.
+#[derive(Clone, Debug)]
+pub struct PartialFirmQuote {
+    pub id: Option<String>,
+    /// Unix timestamp (seconds) when this quote expires, if present.
+    pub expires_at: Option<u64>,
+    pub price: Option<String>,
+    pub sell_amount: Option<String>,
+    pub buy_amount: Option<String>,
+    /// Normalized (uppercase) asset code being sold, if present.
+    pub sell_asset: Option<String>,
+    /// Normalized (uppercase) asset code being bought, if present.
+    pub buy_asset: Option<String>,
+    /// Names of fields that were absent or unparseable in the raw response.
+    pub missing_fields: AllocVec<&'static str>,
+}
+
+impl PartialFirmQuote {
+    /// Returns `true` when all required fields are present and the quote can
+    /// be promoted to a full [`FirmQuote`] via [`PartialFirmQuote::into_full`].
+    pub fn is_complete(&self) -> bool {
+        self.missing_fields.is_empty()
+    }
+
+    /// Attempt to convert this partial quote into a complete [`FirmQuote`].
+    ///
+    /// Returns `Err(Error::invalid_quote())` when any required field is still
+    /// absent.
+    pub fn into_full(self) -> Result<FirmQuote, Error> {
+        if !self.is_complete() {
+            return Err(Error::invalid_quote());
+        }
+        Ok(FirmQuote {
+            id: self.id.ok_or_else(Error::invalid_quote)?,
+            expires_at: self.expires_at.ok_or_else(Error::invalid_quote)?,
+            price: self.price.ok_or_else(Error::invalid_quote)?,
+            sell_amount: self.sell_amount.ok_or_else(Error::invalid_quote)?,
+            buy_amount: self.buy_amount.ok_or_else(Error::invalid_quote)?,
+            sell_asset: self.sell_asset.ok_or_else(Error::invalid_quote)?,
+            buy_asset: self.buy_asset.ok_or_else(Error::invalid_quote)?,
+            routing_reason: None,
+        })
+    }
+}
+
+/// Parse a [`RawPartialFirmQuote`] into a [`PartialFirmQuote`], recording
+/// which fields were absent or contained invalid values in
+/// [`PartialFirmQuote::missing_fields`].
+///
+/// Unlike [`request_firm_quote`], this function never returns an error for
+/// missing fields — it only fails when a field is present but its value
+/// cannot be parsed at all (e.g. a timestamp string containing letters).
+/// Invalid *values* for present fields are treated as missing and the field
+/// name is appended to `missing_fields`.
+///
+/// Stale quotes (expired `expires_at`) are accepted; callers should check
+/// expiry themselves when they need a fresh quote.
+pub fn parse_partial_quote(raw: RawPartialFirmQuote) -> PartialFirmQuote {
+    let mut missing: AllocVec<&'static str> = AllocVec::new();
+
+    // id
+    let id = match raw.id {
+        Some(ref s) if !s.is_empty() => Some(s.clone()),
+        _ => {
+            missing.push("id");
+            None
+        }
+    };
+
+    // expires_at — parse but do not reject for staleness
+    let expires_at = match raw.expires_at {
+        Some(ref s) if !s.is_empty() => match s.parse::<u64>() {
+            Ok(v) if v > 0 => Some(v),
+            _ => {
+                missing.push("expires_at");
+                None
+            }
+        },
+        _ => {
+            missing.push("expires_at");
+            None
+        }
+    };
+
+    // price
+    let price = match raw.price {
+        Some(ref s) if is_valid_positive_decimal(s) => Some(s.clone()),
+        _ => {
+            missing.push("price");
+            None
+        }
+    };
+
+    // sell_amount
+    let sell_amount = match raw.sell_amount {
+        Some(ref s) if is_valid_positive_decimal(s) => Some(s.clone()),
+        _ => {
+            missing.push("sell_amount");
+            None
+        }
+    };
+
+    // buy_amount
+    let buy_amount = match raw.buy_amount {
+        Some(ref s) if is_valid_positive_decimal(s) => Some(s.clone()),
+        _ => {
+            missing.push("buy_amount");
+            None
+        }
+    };
+
+    // sell_asset
+    let sell_asset = match raw.sell_asset {
+        Some(ref s) if !s.is_empty() => {
+            match normalize_asset_code(s) {
+                Ok(code) => Some(code),
+                Err(_) => {
+                    missing.push("sell_asset");
+                    None
+                }
+            }
+        }
+        _ => {
+            missing.push("sell_asset");
+            None
+        }
+    };
+
+    // buy_asset
+    let buy_asset = match raw.buy_asset {
+        Some(ref s) if !s.is_empty() => {
+            match normalize_asset_code(s) {
+                Ok(code) => Some(code),
+                Err(_) => {
+                    missing.push("buy_asset");
+                    None
+                }
+            }
+        }
+        _ => {
+            missing.push("buy_asset");
+            None
+        }
+    };
+
+    PartialFirmQuote {
+        id,
+        expires_at,
+        price,
+        sell_amount,
+        buy_amount,
+        sell_asset,
+        buy_asset,
+        missing_fields: missing,
+    }
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Returns `true` if `price_str` is a non-empty, positive decimal string.
@@ -1054,6 +1256,85 @@ impl CrossAnchorFeeAggregator {
             anchor_volatilities,
         }
     }
+}
+
+// ── Issue #663: Deterministic ordering for quote results ─────────────────────
+
+/// Criteria for deterministically ordering a list of [`FirmQuote`] values.
+///
+/// When multiple quotes tie on the primary criterion, the `id` field is used
+/// as the final tiebreaker so results are always fully deterministic regardless
+/// of insertion order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QuoteSortOrder {
+    /// Sort by `expires_at` ascending (soonest-expiring first), then by `id`
+    /// ascending on ties.
+    ExpiresAtAsc,
+    /// Sort by `expires_at` descending (latest-expiring first), then by `id`
+    /// ascending on ties.
+    ExpiresAtDesc,
+    /// Sort by the numeric value of `price` ascending (cheapest first), then
+    /// by `id` ascending on ties.
+    PriceAsc,
+    /// Sort by the numeric value of `price` descending (most expensive first),
+    /// then by `id` ascending on ties.
+    PriceDesc,
+    /// Sort by `id` ascending (lexicographic).
+    IdAsc,
+}
+
+/// Return a new `Vec` containing the same quotes sorted according to `order`.
+///
+/// The sort is stable with respect to non-tiebreaker criteria and the `id`
+/// tiebreaker always produces a fully deterministic result.
+///
+/// # Examples
+///
+/// ```rust
+/// use anchorkit::sep38::{FirmQuote, sort_quotes, QuoteSortOrder};
+///
+/// let a = FirmQuote {
+///     id: "b".into(), expires_at: 2000, price: "0.10".into(),
+///     sell_amount: "100".into(), buy_amount: "10".into(),
+///     sell_asset: "XLM".into(), buy_asset: "USDC".into(),
+///     routing_reason: None,
+/// };
+/// let b = FirmQuote {
+///     id: "a".into(), expires_at: 1000, price: "0.20".into(),
+///     sell_amount: "100".into(), buy_amount: "20".into(),
+///     sell_asset: "XLM".into(), buy_asset: "USDC".into(),
+///     routing_reason: None,
+/// };
+/// let sorted = sort_quotes(&[a, b], QuoteSortOrder::PriceAsc);
+/// assert_eq!(sorted[0].price, "0.10");
+/// assert_eq!(sorted[1].price, "0.20");
+/// ```
+pub fn sort_quotes(quotes: &[FirmQuote], order: QuoteSortOrder) -> AllocVec<FirmQuote> {
+    let mut result: AllocVec<FirmQuote> = quotes.to_vec();
+    result.sort_by(|a, b| {
+        let primary = match order {
+            QuoteSortOrder::ExpiresAtAsc  => a.expires_at.cmp(&b.expires_at),
+            QuoteSortOrder::ExpiresAtDesc => b.expires_at.cmp(&a.expires_at),
+            QuoteSortOrder::PriceAsc => {
+                let pa = a.price.parse::<f64>().unwrap_or(f64::MAX);
+                let pb = b.price.parse::<f64>().unwrap_or(f64::MAX);
+                pa.partial_cmp(&pb).unwrap_or(core::cmp::Ordering::Equal)
+            }
+            QuoteSortOrder::PriceDesc => {
+                let pa = a.price.parse::<f64>().unwrap_or(0.0);
+                let pb = b.price.parse::<f64>().unwrap_or(0.0);
+                pb.partial_cmp(&pa).unwrap_or(core::cmp::Ordering::Equal)
+            }
+            QuoteSortOrder::IdAsc => a.id.cmp(&b.id),
+        };
+        // Tiebreak on `id` ascending for full determinism.
+        if primary == core::cmp::Ordering::Equal && order != QuoteSortOrder::IdAsc {
+            a.id.cmp(&b.id)
+        } else {
+            primary
+        }
+    });
+    result
 }
 
 #[cfg(test)]
