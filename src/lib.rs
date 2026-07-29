@@ -153,6 +153,8 @@ mod response_validator;
 #[cfg(not(feature = "wasm"))]
 pub mod http_client;
 #[cfg(not(feature = "wasm"))]
+pub mod metrics;
+#[cfg(not(feature = "wasm"))]
 pub mod webhook;
 #[cfg(not(feature = "wasm"))]
 pub mod sep6;

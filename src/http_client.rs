@@ -287,6 +287,43 @@ where
     http_post(url, body, &headers)
 }
 
+/// Like [`post_with_options`], additionally recording request metrics.
+///
+/// Emitted counters (see [`crate::metrics::names`]):
+///
+/// * [`names::HTTP_REQUESTS`] — one per call.
+/// * [`names::HTTP_SUCCESSES`] — status below 400.
+/// * [`names::HTTP_ERROR_RESPONSES`] — status 400 or above.
+/// * [`names::HTTP_TRANSPORT_ERRORS`] — transport failure, no status received.
+///
+/// Delegates to [`post_with_options`] so request semantics stay identical.
+///
+/// [`names::HTTP_REQUESTS`]: crate::metrics::names::HTTP_REQUESTS
+/// [`names::HTTP_SUCCESSES`]: crate::metrics::names::HTTP_SUCCESSES
+/// [`names::HTTP_ERROR_RESPONSES`]: crate::metrics::names::HTTP_ERROR_RESPONSES
+/// [`names::HTTP_TRANSPORT_ERRORS`]: crate::metrics::names::HTTP_TRANSPORT_ERRORS
+pub fn post_with_options_metered<H>(
+    url: &str,
+    body: &str,
+    opts: Option<&OutboundRequestOptions>,
+    http_post: H,
+    metrics: &crate::metrics::MetricsRegistry,
+) -> Result<u16, String>
+where
+    H: FnMut(&str, &str, &[(String, String)]) -> Result<u16, String>,
+{
+    use crate::metrics::names;
+
+    metrics.incr(names::HTTP_REQUESTS);
+    let result = post_with_options(url, body, opts, http_post);
+    match &result {
+        Ok(status) if *status < 400 => metrics.incr(names::HTTP_SUCCESSES),
+        Ok(_) => metrics.incr(names::HTTP_ERROR_RESPONSES),
+        Err(_) => metrics.incr(names::HTTP_TRANSPORT_ERRORS),
+    }
+    result
+}
+
 // ---------------------------------------------------------------------------
 // ConnectionPolicy — timeout and failure classification
 // ---------------------------------------------------------------------------
