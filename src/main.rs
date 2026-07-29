@@ -562,6 +562,9 @@ enum Commands {
         /// Path to a JSON or plain-text keypair file (used when --secret-key is absent)
         #[arg(long)]
         keypair_file: Option<String>,
+        /// Skip the interactive mainnet confirmation prompt
+        #[arg(long)]
+        yes: bool,
     },
     /// Register an attestor
     Register {
@@ -923,7 +926,51 @@ fn upgrade_contract(contract_id: &str, network: &str, source: &SecretKey) {
     println!("   New WASM    : {new_wasm_hash}");
 }
 
-fn deploy(network: &str, source: &str, admin: Option<&str>, dry_run: bool, list: bool) {
+/// Validate an optional `--admin` argument for `deploy`.
+///
+/// `None` (no admin flag) and the literal alias `"default"` are always
+/// accepted; any other value must be a well-formed Stellar public address
+/// (`G...`). Kept as a pure function (no process exit) so it is unit-testable.
+fn validate_admin_arg(admin: Option<&str>) -> Result<(), String> {
+    match admin {
+        None | Some("default") => Ok(()),
+        Some(addr) => normalize_stellar_account_id(addr)
+            .map(|_| ())
+            .map_err(|err| format!("invalid --admin address '{addr}': {}", err.message)),
+    }
+}
+
+/// Validate that `--services` names at least one known service.
+/// Kept as a pure function (no process exit) so it is unit-testable.
+fn validate_services_arg(services: &[String]) -> Result<(), String> {
+    if services.is_empty() {
+        return Err(
+            "--services must name at least one service: deposits, withdrawals, quotes, kyc"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Prompt the operator to confirm a mainnet deployment.
+///
+/// Returns `true` when the deployment should proceed: either the user typed
+/// `y`/`yes`, or the prompt was skipped via `--yes` / `--no-interactive`.
+fn confirm_mainnet_deploy(network: &str, yes: bool, no_interactive: bool) -> bool {
+    if network != "mainnet" || yes || no_interactive {
+        return true;
+    }
+    eprint!("⚠️  You are about to deploy to MAINNET. Continue? [y/N]: ");
+    use std::io::Write;
+    let _ = std::io::stderr().flush();
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        return false;
+    }
+    matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
+}
+
+fn deploy(network: &str, source: &str, admin: Option<&str>, dry_run: bool, list: bool, yes: bool, no_interactive: bool) {
     // --list: print deployment history and exit
     if list {
         let records = load_deployments();
@@ -933,6 +980,18 @@ fn deploy(network: &str, source: &str, admin: Option<&str>, dry_run: bool, list:
             println!("{}", serde_json::to_string_pretty(&records).unwrap_or_default());
         }
         return;
+    }
+
+    if let Err(e) = validate_admin_arg(admin) {
+        eprintln!("error: {e}");
+        eprintln!("hint: pass --admin <STELLAR_PUBLIC_ADDRESS> (starts with 'G'), or omit --admin to use the source key");
+        std::process::exit(1);
+    }
+
+    if !dry_run && !confirm_mainnet_deploy(network, yes, no_interactive) {
+        eprintln!("Aborted: mainnet deployment not confirmed.");
+        eprintln!("hint: re-run with --yes to skip this prompt in scripted/CI environments.");
+        std::process::exit(1);
     }
 
     println!("\n🔍 Pre-deployment validation ({network})...");
@@ -1087,6 +1146,11 @@ fn register(
     address: &str, services: &[String], contract_id: &str,
     network: &str, source: &SecretKey, sep10_token: &str, sep10_issuer: &str,
 ) {
+    if let Err(e) = validate_services_arg(services) {
+        eprintln!("error: {e}");
+        eprintln!("hint: anchorkit register --address <ADDR> --services deposits,withdrawals ...");
+        std::process::exit(1);
+    }
     let address = normalize_stellar_public_address("attestor address", address);
     let sep10_issuer = normalize_stellar_public_address("SEP-10 issuer address", sep10_issuer);
     let service_ids = parse_services(services)
@@ -2050,7 +2114,7 @@ fn main() {
         n
     });
     match cli.command {
-        Commands::Deploy { network: cmd_net, source, admin, dry_run, list, upgrade, secret_key, keypair_file } => {
+        Commands::Deploy { network: cmd_net, source, admin, dry_run, list, upgrade, secret_key, keypair_file, yes } => {
             let net = cmd_net;
             if upgrade {
                 let contract_id = require_contract_id(global_contract_id, None, "deploy --upgrade");
@@ -2060,7 +2124,7 @@ fn main() {
                 );
                 upgrade_contract(&contract_id, &net, &signing_source);
             } else {
-                deploy(&net, &source, admin.as_deref(), dry_run, list);
+                deploy(&net, &source, admin.as_deref(), dry_run, list, yes, no_interactive);
             }
         }
         Commands::Register { address, services, contract_id, network: cmd_net, secret_key, keypair_file, credential_name, sep10_token, sep10_issuer } => {
@@ -2294,4 +2358,75 @@ mod offline_tests {
         assert!(!result, "invalid JSON should fail validation");
     }
 
+}
+
+#[cfg(test)]
+mod cli_validation_tests {
+    use super::*;
+
+    const SAMPLE_SECRET_KEY: &str = "SCZANGBA5IIPMEFXBI5LZU7RVJZOLBYHJYFJ2KYN3CQPUOVFRDPCNTY";
+
+    // ── validate_admin_arg ──────────────────────────────────────────────
+
+    #[test]
+    fn test_validate_admin_arg_accepts_none() {
+        assert!(validate_admin_arg(None).is_ok());
+    }
+
+    #[test]
+    fn test_validate_admin_arg_accepts_default_alias() {
+        assert!(validate_admin_arg(Some("default")).is_ok());
+    }
+
+    #[test]
+    fn test_validate_admin_arg_accepts_valid_public_address() {
+        // A syntactically valid Stellar public address (G... + valid checksum).
+        let valid = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+        let result = validate_admin_arg(Some(valid));
+        assert!(result.is_ok(), "expected valid address to pass, got: {result:?}");
+    }
+
+    #[test]
+    fn test_validate_admin_arg_rejects_malformed_address() {
+        let err = validate_admin_arg(Some("not-an-address")).unwrap_err();
+        assert!(err.contains("invalid --admin address"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_admin_arg_rejects_secret_key_instead_of_public() {
+        // A secret key (S...) is not a valid public admin address.
+        let err = validate_admin_arg(Some(SAMPLE_SECRET_KEY)).unwrap_err();
+        assert!(err.contains("invalid --admin address"), "got: {err}");
+    }
+
+    // ── validate_services_arg ───────────────────────────────────────────
+
+    #[test]
+    fn test_validate_services_arg_rejects_empty() {
+        let err = validate_services_arg(&[]).unwrap_err();
+        assert!(err.contains("at least one service"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_services_arg_accepts_non_empty() {
+        let services = vec!["deposits".to_string()];
+        assert!(validate_services_arg(&services).is_ok());
+    }
+
+    // ── confirm_mainnet_deploy ───────────────────────────────────────────
+
+    #[test]
+    fn test_confirm_mainnet_deploy_skips_prompt_for_non_mainnet() {
+        assert!(confirm_mainnet_deploy("testnet", false, false));
+    }
+
+    #[test]
+    fn test_confirm_mainnet_deploy_skips_prompt_with_yes_flag() {
+        assert!(confirm_mainnet_deploy("mainnet", true, false));
+    }
+
+    #[test]
+    fn test_confirm_mainnet_deploy_skips_prompt_with_no_interactive() {
+        assert!(confirm_mainnet_deploy("mainnet", false, true));
+    }
 }

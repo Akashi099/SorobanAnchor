@@ -140,8 +140,17 @@ assert!(!quote.id.is_empty());
 ## CLI
 
 ```bash
+# Check environment setup before doing anything else
+anchorkit doctor
+
+# Validate config files offline (no network access required)
+anchorkit offline validate
+
 # Deploy to testnet
 anchorkit deploy --network testnet
+
+# Deploy to mainnet (prompts for confirmation unless --yes is passed)
+anchorkit deploy --network mainnet --yes
 
 # Register an attestor
 anchorkit register --address GANCHOR123... --services deposits,withdrawals,kyc
@@ -149,9 +158,28 @@ anchorkit register --address GANCHOR123... --services deposits,withdrawals,kyc
 # Submit an attestation
 anchorkit attest --subject GUSER123... --payload-hash abc123...
 
-# Check environment setup
-anchorkit doctor
+# Verify an attestation and check contract/rate-limiter health
+anchorkit verify --id 42
+anchorkit health --contract-id $ANCHOR_CONTRACT_ID --attestor GANCHOR123...
 ```
+
+**Walkthroughs and troubleshooting:** see [`examples/full_deployment_walkthrough.sh`](examples/full_deployment_walkthrough.sh)
+for an end-to-end operator tour (doctor → validate → deploy → register →
+attest → verify → health) with a troubleshooting section for common errors.
+Other scenario walkthroughs live in [`examples/`](examples/):
+
+| Example | Covers |
+|---|---|
+| `full_deployment_walkthrough.sh` | End-to-end deploy → register → attest → verify, plus troubleshooting |
+| `attestation_workflow.sh` | Registration, plain/session/traced attestations, replay protection |
+| `rate_limit_override_example.sh` | Per-role and per-attestor rate limit overrides |
+| `config_hot_reload_example.rs` | Reloading runtime config without restarting the process |
+| `credential_management.sh` | Encrypted keystore vs. env var vs. keypair file |
+| `mock_mode_example.sh` | Testing CLI flows without a live anchor |
+| `offline_mode_example.sh` | Config validation and workflow simulation with no network |
+| `anchor_info_discovery.sh` | Fetching and interpreting a `stellar.toml` |
+| `kyc_workflow.sh` | KYC-gated attestation flow |
+| `role_usage_example.sh` | Admin roles and capability delegation |
 
 ## Supported SEP Versions
 
@@ -211,6 +239,29 @@ Anchor configs live in `configs/` as JSON or TOML. Validate them with:
 ```
 
 Schema reference: `config_schema.json`
+
+### Runtime config hot-reload
+
+Long-running host processes (not the on-chain contract, which already
+applies admin updates immediately) can pick up config file changes without
+restarting, via `RuntimeConfigManager`:
+
+```rust
+use anchorkit::config::RuntimeConfigManager;
+
+let manager = RuntimeConfigManager::new("configs/remittance-anchor.toml")?;
+// ... later, on a timer or file-watch event ...
+match manager.reload_if_changed() {
+    Ok(true)  => println!("config reloaded"),
+    Ok(false) => {} // unchanged
+    Err(e)    => eprintln!("reload rejected, previous config kept: {e}"),
+}
+let current = manager.current();
+```
+
+A reload that fails to parse or fails shape validation is rejected and the
+previously loaded configuration stays active. See
+[`examples/config_hot_reload_example.rs`](examples/config_hot_reload_example.rs).
 
 ## Integration Testing
 

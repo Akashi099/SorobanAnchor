@@ -210,7 +210,7 @@ pub use cache_governance::{CachePolicy, CachePolicySet, CacheEntryType, CacheGov
 
 // ── std-only re-exports ───────────────────────────────────────────────────────
 #[cfg(feature = "std")]
-pub use config::{load_runtime_config_file, parse_runtime_config_str, ConfigFormat, RuntimeConfig};
+pub use config::{load_runtime_config_file, parse_runtime_config_str, ConfigFormat, RuntimeConfig, RuntimeConfigManager};
 
 // ── Host-only re-exports ──────────────────────────────────────────────────────
 #[cfg(not(feature = "wasm"))]
