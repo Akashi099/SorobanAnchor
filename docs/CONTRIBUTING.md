@@ -140,6 +140,16 @@ pub fn my_function(param1: Type1, param2: Type2) -> ReturnType {
 }
 ```
 
+## Architecture Decision Records
+
+Important architectural decisions are captured as Architecture Decision Records
+(ADRs) in [`docs/adr/`](adr/). Before making a significant design change, review
+the existing ADRs and consider whether a new ADR is needed.
+
+- [ADR-0001](adr/ADR-0001-record-architecture-decisions.md): Record Architecture Decisions
+- [ADR-0002](adr/ADR-0002-dual-build-strategy.md): Dual-Build Strategy
+- [ADR-0003](adr/ADR-0003-contract-lifecycle-and-schema-versioning.md): Contract Lifecycle and Schema Versioning
+
 ## Git Workflow
 
 1. **Create a feature branch:**
