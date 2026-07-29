@@ -139,9 +139,11 @@ pub mod cache_governance;
 pub mod session_state_machine;
 pub mod migration;
 
-// ── std-only modules (filesystem, runtime config) ─────────────────────────────
+// ── std-only modules (filesystem, runtime config, env fingerprinting) ─────────
 #[cfg(feature = "std")]
 pub mod config;
+#[cfg(feature = "std")]
+pub mod env_fingerprint;
 
 // ── Host-only modules (HTTP, threading) ───────────────────────────────────────
 // Excluded from `wasm` builds: on-chain Soroban contracts have no network access.
@@ -201,6 +203,8 @@ pub use cache_governance::{CachePolicy, CachePolicySet, CacheEntryType, CacheGov
 // ── std-only re-exports ───────────────────────────────────────────────────────
 #[cfg(feature = "std")]
 pub use config::{load_runtime_config_file, parse_runtime_config_str, ConfigFormat, RuntimeConfig};
+#[cfg(feature = "std")]
+pub use env_fingerprint::{EnvironmentFingerprint, ToolVersions, ConfigMetadata, BuildMetadata, DriftItem};
 
 // ── Host-only re-exports ──────────────────────────────────────────────────────
 #[cfg(not(feature = "wasm"))]
@@ -255,6 +259,7 @@ pub use sep24::{
 pub use contract::{ServiceRetirementInfo, AnchorServices};
 pub use contract::{AttestationFilter, AttestationPage};
 pub use service_management::{ServiceManager, ServiceToggleState, ServiceConfigSnapshot};
+pub use service_management::{ServiceRetirementState, ServiceRetirementRecord};
 pub use admin_audit_log::{AdminAuditLog, AdminConfigChangeEvent, AdminAuditLogConfig};
 pub use contract::{HealthStatus, MetadataFreshnessReport, RateLimiterHealth};
 pub use contract::{AnchorHealthMetrics, AnchorProofRecord};

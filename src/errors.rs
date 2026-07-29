@@ -137,6 +137,13 @@ pub enum ErrorCode {
     InvalidAssetPair          = 63,
     /// Amount is zero or otherwise invalid for routing.
     InvalidAmount             = 64,
+
+    // Service retirement errors (65–66)
+    /// Requested service retirement state transition is not permitted.
+    /// (e.g. Retired → Active, or Deprecated → Retired without going through Disabled)
+    InvalidRetirementTransition = 65,
+    /// Environment fingerprint collection encountered a failure.
+    FingerprintCollectionFailed = 66,
 }
 
 impl ErrorCode {
@@ -207,6 +214,8 @@ impl ErrorCode {
             ErrorCode::QuoteExpired              => "Quote has passed its validity deadline",
             ErrorCode::SignatureVerificationFailed => "Attestation signature verification failed",
             ErrorCode::BatchSizeExceeded         => "Batch size exceeds the per-call maximum",
+            ErrorCode::InvalidRetirementTransition => "Invalid service retirement state transition",
+            ErrorCode::FingerprintCollectionFailed => "Environment fingerprint collection failed",
         }
     }
 }
@@ -387,6 +396,15 @@ impl AnchorKitError {
     pub fn attestor_revoked() -> Self { Self::from_code(ErrorCode::AttestorRevoked) }
     pub fn quote_expired() -> Self { Self::from_code(ErrorCode::QuoteExpired) }
     pub fn signature_verification_failed() -> Self { Self::from_code(ErrorCode::SignatureVerificationFailed) }
+    pub fn fingerprint_collection_failed() -> Self { Self::from_code(ErrorCode::FingerprintCollectionFailed) }
+    /// Build an invalid retirement transition error with from/to state labels.
+    pub fn invalid_retirement_transition(from: &str, to: &str) -> Self {
+        Self::with_context(
+            ErrorCode::InvalidRetirementTransition,
+            ErrorCode::InvalidRetirementTransition.default_message(),
+            &alloc::format!("[E65] {} -> {}", from, to),
+        )
+    }
     pub fn batch_size_exceeded(limit: usize, given: usize) -> Self {
         Self::with_context(
             ErrorCode::BatchSizeExceeded,
@@ -587,6 +605,8 @@ mod tests {
             ErrorCode::QuoteExpired,
             ErrorCode::SignatureVerificationFailed,
             ErrorCode::BatchSizeExceeded,
+            ErrorCode::InvalidRetirementTransition,
+            ErrorCode::FingerprintCollectionFailed,
         ];
         for code in codes {
             assert!(!code.default_message().is_empty());
@@ -624,6 +644,8 @@ mod tests {
         assert_eq!(ErrorCode::QuoteExpired          as u32, 60);
         assert_eq!(ErrorCode::SignatureVerificationFailed as u32, 61);
         assert_eq!(ErrorCode::BatchSizeExceeded     as u32, 62);
+        assert_eq!(ErrorCode::InvalidRetirementTransition as u32, 65);
+        assert_eq!(ErrorCode::FingerprintCollectionFailed as u32, 66);
     }
 
     #[test]
