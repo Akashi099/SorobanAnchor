@@ -271,6 +271,12 @@ pub use contract::{AttestationSortOrder};
 #[cfg(not(feature = "wasm"))]
 pub use contract::sort_attestations;
 pub use service_management::{ServiceManager, ServiceToggleState, ServiceConfigSnapshot};
+pub use service_management::{MaintenanceWindow, MaintenanceManager};
+pub use service_management::{ServiceDependency, ServiceDependencyGraph, DependencyManager};
+pub use service_management::{
+    ServiceTemplate, TemplateApplication, TemplateManager,
+    TEMPLATE_FIAT_ON_RAMP, TEMPLATE_REMITTANCE, TEMPLATE_STABLECOIN_ISSUER,
+};
 pub use admin_audit_log::{AdminAuditLog, AdminConfigChangeEvent, AdminAuditLogConfig};
 pub use contract::{HealthStatus, MetadataFreshnessReport, RateLimiterHealth};
 pub use contract::{AnchorHealthMetrics, AnchorProofRecord};
@@ -285,6 +291,9 @@ pub use contract::NetworkRoutingProfile;
 pub use anchor_health::{
     AnchorHealthReport, HealthReportFormat,
     build_health_report, export_health_report,
+    build_health_report_with_maintenance, should_suppress_alert,
+    SloTarget, SloEvaluation, SloViolationDetail, SloHealthReport,
+    evaluate_slo, evaluate_slo_for_report, build_slo_report,
 };
 #[cfg(not(feature = "wasm"))]
 pub use sep38::{CrossAnchorFeeAggregator, FeeAnomalyReport};
