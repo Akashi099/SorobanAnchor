@@ -119,6 +119,21 @@ pub struct OutboundRequestOptions {
     /// `X-Trace-Id` and `X-Span-Id` headers so the anchor's logs can be
     /// correlated with ours.
     pub trace: Option<TraceContext>,
+    /// Endpoint authentication credentials. When `Some`, adds an
+    /// `Authorization` (or custom) header computed via
+    /// [`RequestCredentials::to_header`].
+    pub credentials: Option<RequestCredentials>,
+}
+
+impl core::fmt::Debug for OutboundRequestOptions {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("OutboundRequestOptions")
+            .field("idempotency_key", &self.idempotency_key)
+            .field("signing_key", &self.signing_key.as_ref().map(|_| "<redacted>"))
+            .field("trace", &self.trace)
+            .field("credentials", &self.credentials)
+            .finish()
+    }
 }
 
 impl OutboundRequestOptions {
@@ -128,12 +143,37 @@ impl OutboundRequestOptions {
             idempotency_key: Some(key.into()),
             signing_key: None,
             trace: None,
+            credentials: None,
         }
     }
 
     /// Attach an HMAC-SHA256 signing key to this options set.
     pub fn with_signing_key(mut self, key: &[u8]) -> Self {
         self.signing_key = Some(key.to_vec());
+        self
+    }
+
+    /// Attach a bearer-token credential to this options set.
+    pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
+        self.credentials = Some(RequestCredentials::Bearer(token.into()));
+        self
+    }
+
+    /// Attach an HTTP Basic-auth credential to this options set.
+    pub fn with_basic_auth(mut self, username: impl Into<String>, password: impl Into<String>) -> Self {
+        self.credentials = Some(RequestCredentials::Basic {
+            username: username.into(),
+            password: password.into(),
+        });
+        self
+    }
+
+    /// Attach an arbitrary header credential (e.g. `X-Api-Key`) to this options set.
+    pub fn with_header_credential(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.credentials = Some(RequestCredentials::Header {
+            name: name.into(),
+            value: value.into(),
+        });
         self
     }
 
@@ -178,6 +218,7 @@ impl OutboundRequestOptions {
             idempotency_key: Some(hex),
             signing_key: None,
             trace: None,
+            credentials: None,
         }
     }
 
@@ -200,6 +241,9 @@ impl OutboundRequestOptions {
         }
         if let Some(ref trace) = self.trace {
             headers.extend(trace.header_pairs());
+        }
+        if let Some(ref creds) = self.credentials {
+            headers.push(creds.to_header());
         }
         headers
     }

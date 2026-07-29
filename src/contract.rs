@@ -12,7 +12,9 @@ use crate::errors::ErrorCode;
 use crate::rate_limiter::RateLimiter;
 use crate::rate_limiter::RateLimitConfig;
 use crate::sep10_jwt;
-use crate::transaction_state_tracker::{OptRecovery, TransactionState, TransactionStateRecord};
+use crate::transaction_state_tracker::{
+    OptRecovery, StorageBudgetReport, TransactionState, TransactionStateRecord,
+};
 use crate::replay_detection::{self, ReplayMetrics};
 use crate::admin_audit_log::AdminAuditLog;
 use crate::service_management::ServiceManager;
@@ -1680,6 +1682,15 @@ pub struct ServicesConfiguredEvent {
 const PERSISTENT_TTL: u32 = 1_555_200;
 const SPAN_TTL: u32 = 1_555_200;
 const INSTANCE_TTL: u32 = 518_400;
+
+/// Approximate on-chain byte footprint of one persisted [`TransactionStateRecord`],
+/// used by the storage budget monitor (#627) to estimate total usage without
+/// having to deserialize every record on every check.
+const APPROX_TXSTATE_RECORD_BYTES: u64 = 256;
+/// Default storage-budget warning threshold, in bytes (~1 953 tracked records).
+const DEFAULT_TXBUDGET_WARNING_BYTES: u64 = 500_000;
+/// Default storage-budget critical threshold, in bytes (~3 906 tracked records).
+const DEFAULT_TXBUDGET_CRITICAL_BYTES: u64 = 1_000_000;
 
 /// Default session lifetime in seconds (1 hour). Used when session_ttl_seconds is zero.
 pub const DEFAULT_SESSION_TTL: u64 = 3600;
@@ -8470,6 +8481,72 @@ impl AnchorKitContract {
         env.storage().instance().extend_ttl(INSTANCE_TTL, INSTANCE_TTL);
     }
 
+    /// Admin-only: configure the storage-budget warning/critical thresholds
+    /// (in approximate bytes) used by [`Self::get_storage_budget_report`] and
+    /// by auto-eviction to decide when storage pressure warrants action (#627).
+    ///
+    /// # Panics
+    ///
+    /// Panics with [`ErrorCode::ValidationError`] unless
+    /// `0 < warning_bytes < critical_bytes`.
+    pub fn set_storage_budget_thresholds(env: Env, warning_bytes: u64, critical_bytes: u64) {
+        Self::require_admin(&env);
+        if warning_bytes == 0 || warning_bytes >= critical_bytes {
+            panic_with_error!(&env, ErrorCode::ValidationError);
+        }
+        env.storage().instance().set(&symbol_short!("TXBUDWRN"), &warning_bytes);
+        env.storage().instance().set(&symbol_short!("TXBUDCRT"), &critical_bytes);
+        env.storage().instance().extend_ttl(INSTANCE_TTL, INSTANCE_TTL);
+    }
+
+    /// Read the configured storage-budget thresholds, falling back to the
+    /// crate defaults when the admin has not set any.
+    fn storage_budget_thresholds(env: &Env) -> (u64, u64) {
+        let warning: u64 = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("TXBUDWRN"))
+            .unwrap_or(DEFAULT_TXBUDGET_WARNING_BYTES);
+        let critical: u64 = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("TXBUDCRT"))
+            .unwrap_or(DEFAULT_TXBUDGET_CRITICAL_BYTES);
+        (warning, critical)
+    }
+
+    /// Return a live [`StorageBudgetReport`] for the transaction state
+    /// tracker's persistent storage usage (#627).
+    ///
+    /// `entry_count` is read directly from the live transaction-ID index, so
+    /// it always reflects storage as it stands after any eviction — it can
+    /// never drift out of sync with what is actually persisted. `approx_bytes`
+    /// is a cheap, deterministic estimate (`entry_count *`
+    /// [`APPROX_TXSTATE_RECORD_BYTES`]) rather than an exact on-chain size, so
+    /// operators can check usage pressure without deserializing every record.
+    ///
+    /// Read-only: any caller may query this, no authentication required.
+    pub fn get_storage_budget_report(env: Env) -> StorageBudgetReport {
+        let ids_key = symbol_short!("TXIDS");
+        let entry_count: u64 = env
+            .storage()
+            .persistent()
+            .get::<_, soroban_sdk::Vec<u64>>(&ids_key)
+            .map(|ids| ids.len() as u64)
+            .unwrap_or(0);
+        let approx_bytes = entry_count.saturating_mul(APPROX_TXSTATE_RECORD_BYTES);
+        let (warning_bytes, critical_bytes) = Self::storage_budget_thresholds(&env);
+
+        StorageBudgetReport {
+            entry_count,
+            approx_bytes,
+            warning_bytes,
+            critical_bytes,
+            warning: approx_bytes >= warning_bytes,
+            critical: approx_bytes >= critical_bytes,
+        }
+    }
+
     pub fn create_transaction_record(
         env: Env,
         transaction_id: u64,
@@ -8507,18 +8584,24 @@ impl AnchorKitContract {
         routing_reason: Option<String>,
     ) -> TransactionStateRecord {
         // Apply eviction policy from storage before inserting a new record.
+        // Eviction only actually runs once the storage-budget monitor (#627)
+        // reports Warning/Critical pressure — this is what makes eviction a
+        // response to real pressure rather than an unconditional per-call cost.
         let eviction_enabled: bool = env
             .storage()
             .instance()
             .get(&symbol_short!("EVICTEN"))
             .unwrap_or(false);
         if eviction_enabled {
-            let max_per_call: u32 = env
-                .storage()
-                .instance()
-                .get(&symbol_short!("EVICTMAX"))
-                .unwrap_or(10u32);
-            Self::run_auto_eviction(env, max_per_call);
+            let report = Self::get_storage_budget_report(env.clone());
+            if report.warning || report.critical {
+                let max_per_call: u32 = env
+                    .storage()
+                    .instance()
+                    .get(&symbol_short!("EVICTMAX"))
+                    .unwrap_or(10u32);
+                Self::run_auto_eviction(env, max_per_call);
+            }
         }
 
         let now = env.ledger().timestamp();
@@ -8548,6 +8631,23 @@ impl AnchorKitContract {
         ids.push_back(transaction_id);
         env.storage().persistent().set(&ids_key, &ids);
         env.storage().persistent().extend_ttl(&ids_key, PERSISTENT_TTL, PERSISTENT_TTL);
+
+        // Storage-budget monitoring hook (#627): emit a warning event as soon
+        // as usage crosses a configured threshold, independent of whether
+        // auto-eviction is enabled, so operators can act before failures occur.
+        let report = Self::get_storage_budget_report(env.clone());
+        if report.critical {
+            env.events().publish(
+                (symbol_short!("TXBUDGET"), symbol_short!("critical")),
+                (report.entry_count, report.approx_bytes),
+            );
+        } else if report.warning {
+            env.events().publish(
+                (symbol_short!("TXBUDGET"), symbol_short!("warning")),
+                (report.entry_count, report.approx_bytes),
+            );
+        }
+
         record
     }
 
@@ -11020,5 +11120,152 @@ mod session_migration_tests {
         let env = Env::default();
         env.mock_all_auths();
         AnchorKitContract::migrate(env, migration::SCHEMA_V2, 10);
+    }
+}
+
+// -----------------------------------------------------------------------
+// Storage budget monitoring (#627)
+// -----------------------------------------------------------------------
+
+#[cfg(test)]
+mod storage_budget_tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::{Address, Env};
+
+    fn init_env() -> (Env, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        AnchorKitContract::initialize(env.clone(), admin.clone());
+        (env, admin)
+    }
+
+    #[test]
+    fn test_default_budget_report_starts_empty() {
+        let (env, _admin) = init_env();
+        let report = AnchorKitContract::get_storage_budget_report(env);
+        assert_eq!(report.entry_count, 0);
+        assert_eq!(report.approx_bytes, 0);
+        assert_eq!(report.warning_bytes, DEFAULT_TXBUDGET_WARNING_BYTES);
+        assert_eq!(report.critical_bytes, DEFAULT_TXBUDGET_CRITICAL_BYTES);
+        assert!(!report.warning);
+        assert!(!report.critical);
+    }
+
+    #[test]
+    fn test_budget_report_tracks_entry_count_and_bytes() {
+        let (env, _admin) = init_env();
+        let initiator = Address::generate(&env);
+
+        for i in 1..=3u64 {
+            AnchorKitContract::create_transaction_record(env.clone(), i, initiator.clone());
+        }
+
+        let report = AnchorKitContract::get_storage_budget_report(env);
+        assert_eq!(report.entry_count, 3);
+        assert_eq!(report.approx_bytes, 3 * APPROX_TXSTATE_RECORD_BYTES);
+    }
+
+    #[test]
+    fn test_set_storage_budget_thresholds_updates_report() {
+        let (env, _admin) = init_env();
+        let initiator = Address::generate(&env);
+
+        // 2 entries * 256 bytes = 512 >= warning(500), < critical(1000).
+        AnchorKitContract::set_storage_budget_thresholds(env.clone(), 500, 1000);
+        AnchorKitContract::create_transaction_record(env.clone(), 1, initiator.clone());
+        AnchorKitContract::create_transaction_record(env.clone(), 2, initiator.clone());
+
+        let report = AnchorKitContract::get_storage_budget_report(env.clone());
+        assert_eq!(report.warning_bytes, 500);
+        assert_eq!(report.critical_bytes, 1000);
+        assert!(report.warning, "512 bytes must cross the 500-byte warning threshold");
+        assert!(!report.critical, "512 bytes must not cross the 1000-byte critical threshold");
+
+        // 4 entries * 256 bytes = 1024 >= critical(1000).
+        AnchorKitContract::create_transaction_record(env.clone(), 3, initiator.clone());
+        AnchorKitContract::create_transaction_record(env.clone(), 4, initiator.clone());
+        let report2 = AnchorKitContract::get_storage_budget_report(env);
+        assert!(report2.critical, "1024 bytes must cross the 1000-byte critical threshold");
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_set_storage_budget_thresholds_rejects_zero_warning() {
+        let (env, _admin) = init_env();
+        AnchorKitContract::set_storage_budget_thresholds(env, 0, 1000);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_set_storage_budget_thresholds_rejects_warning_not_below_critical() {
+        let (env, _admin) = init_env();
+        AnchorKitContract::set_storage_budget_thresholds(env, 1000, 1000);
+    }
+
+    #[test]
+    fn test_eviction_ignored_when_no_pressure() {
+        let (env, _admin) = init_env();
+        let initiator = Address::generate(&env);
+
+        // Thresholds stay at the generous defaults — nowhere near tripped by
+        // a handful of small test records.
+        AnchorKitContract::set_eviction_policy(env.clone(), true, 10);
+
+        for i in 1..=3u64 {
+            AnchorKitContract::create_transaction_record(env.clone(), i, initiator.clone());
+            AnchorKitContract::start_transaction_record(env.clone(), i);
+            AnchorKitContract::complete_transaction_record(env.clone(), i);
+        }
+
+        // A further create call must not have evicted anything: all terminal
+        // records from before are still present, plus the new one.
+        AnchorKitContract::create_transaction_record(env.clone(), 4, initiator);
+        let report = AnchorKitContract::get_storage_budget_report(env);
+        assert_eq!(report.entry_count, 4, "no eviction should occur without budget pressure");
+    }
+
+    #[test]
+    fn test_eviction_triggers_under_pressure() {
+        let (env, _admin) = init_env();
+        let initiator = Address::generate(&env);
+
+        // A 1-byte warning threshold means any tracked record trips pressure.
+        AnchorKitContract::set_storage_budget_thresholds(env.clone(), 1, 1_000_000);
+        AnchorKitContract::set_eviction_policy(env.clone(), true, 10);
+
+        for i in 1..=3u64 {
+            AnchorKitContract::create_transaction_record(env.clone(), i, initiator.clone());
+            AnchorKitContract::start_transaction_record(env.clone(), i);
+            AnchorKitContract::complete_transaction_record(env.clone(), i);
+        }
+
+        // This call detects budget pressure and evicts the terminal records
+        // created above before inserting the new one, so only the new record
+        // (still Pending, not eviction-eligible) should remain.
+        AnchorKitContract::create_transaction_record(env.clone(), 4, initiator);
+        let report = AnchorKitContract::get_storage_budget_report(env);
+        assert_eq!(report.entry_count, 1, "terminal records must be evicted under pressure");
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_eviction_removes_lookup_for_evicted_record() {
+        let (env, _admin) = init_env();
+        let initiator = Address::generate(&env);
+
+        AnchorKitContract::set_storage_budget_thresholds(env.clone(), 1, 1_000_000);
+        AnchorKitContract::set_eviction_policy(env.clone(), true, 10);
+
+        AnchorKitContract::create_transaction_record(env.clone(), 1, initiator.clone());
+        AnchorKitContract::start_transaction_record(env.clone(), 1);
+        AnchorKitContract::complete_transaction_record(env.clone(), 1);
+
+        // Triggers eviction of the now-terminal record 1.
+        AnchorKitContract::create_transaction_record(env.clone(), 2, initiator);
+
+        // Record 1 no longer exists — must panic.
+        AnchorKitContract::get_txn_state_history(env, 1);
     }
 }

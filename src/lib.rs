@@ -138,6 +138,7 @@ pub mod anchor_health;
 pub mod service_management;
 pub mod admin_audit_log;
 pub mod cache_governance;
+pub mod compliance_policy;
 pub mod session_state_machine;
 pub mod migration;
 #[cfg(not(feature = "wasm"))]
@@ -194,7 +195,9 @@ pub use retry::{retry_with_backoff, is_retryable, RetryConfig, JitterSource, Led
 pub use retry::{BackoffStrategy, JitterPolicy};
 pub use retry::retry_with_backoff_traced;
 pub use trace_context::{TraceContext, TraceError, TRACEPARENT_HEADER, TRACE_ID_HEADER, SPAN_ID_HEADER};
-pub use deterministic_hash::{compute_payload_hash, verify_payload_hash};
+pub use deterministic_hash::{
+    compute_canonical_hash, compute_payload_hash, verify_payload_hash, CanonicalField,
+};
 pub use contract::{AnchorKitContract, AnchorTomlProvenance, EndpointUpdated, CacheConfig};
 pub use contract::{AttestorRevocationRecord};
 pub use contract::{
@@ -275,6 +278,9 @@ pub use admin_audit_log::{AdminAuditLog, AdminConfigChangeEvent, AdminAuditLogCo
 pub use contract::{HealthStatus, MetadataFreshnessReport, RateLimiterHealth};
 pub use contract::{AnchorHealthMetrics, AnchorProofRecord};
 pub use transaction_state_tracker::{BudgetStatus, BudgetAlert};
+pub use transaction_state_tracker::{
+    ArchivedRecoveryMetadata, RecoveryRetentionPolicy, StorageBudgetReport,
+};
 // Issue #657: multi-anchor reputation weighting
 pub use contract::{AnchorReputationRecord, ReputationWeights};
 // Issue #658: time-based routing policies
