@@ -145,6 +145,12 @@ risk category present in this codebase.
 
 - All attestation submission paths are protected by the `RateLimiter` module.
   Do not remove or weaken rate-limit checks without a security review.
+- Per-role and per-attestor overrides (`set_role_rate_limit` /
+  `set_address_rate_limit`) let high-value or low-volume attestors run under
+  a different policy than the global default. Resolution order is
+  address override → role override → global default. Both setters require
+  the contract admin or a delegate holding `AdminCapability::SetRateLimits`,
+  and reject zero-valued configs. See `examples/rate_limit_override_example.sh`.
 
 ---
 

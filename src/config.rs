@@ -18,7 +18,7 @@ use serde_json::Value;
 #[cfg(feature = "std")]
 use std::{fs, path::Path};
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
     pub contract: ContractConfig,
@@ -65,7 +65,7 @@ pub struct RuntimeConfig {
 /// share a single type.
 pub use crate::http_client::{ProxyConfig, ProxyCredentials};
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ContractConfig {
     pub name: String,
@@ -75,13 +75,13 @@ pub struct ContractConfig {
     pub admin_address: Option<String>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AttestorsConfig {
     pub registry: Vec<AttestorConfig>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AttestorConfig {
     pub name: String,
@@ -93,7 +93,7 @@ pub struct AttestorConfig {
     pub enabled: bool,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SessionsConfig {
     pub enable_session_tracking: Option<bool>,
@@ -102,13 +102,13 @@ pub struct SessionsConfig {
     pub audit_log_retention_days: Option<u64>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct OperationsConfig {
     pub templates: Option<Vec<OperationTemplateConfig>>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct OperationTemplateConfig {
     pub id: String,
@@ -121,7 +121,7 @@ pub struct OperationTemplateConfig {
     pub payload_schema: Option<Value>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RemittanceConfig {
     pub corridors: Option<Vec<RemittanceCorridorConfig>>,
@@ -129,7 +129,7 @@ pub struct RemittanceConfig {
     pub fee_structure: Option<Vec<FeeStructureConfig>>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RemittanceCorridorConfig {
     pub source: String,
@@ -141,7 +141,7 @@ pub struct RemittanceCorridorConfig {
     pub maximum_amount: Option<f64>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ExchangeRateConfig {
     pub enable_live_rates: Option<bool>,
@@ -149,7 +149,7 @@ pub struct ExchangeRateConfig {
     pub rate_variance_tolerance_percent: Option<f64>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct FeeStructureConfig {
     pub corridor: String,
@@ -157,7 +157,7 @@ pub struct FeeStructureConfig {
     pub fee_value: f64,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct StablecoinConfig {
     pub name: String,
@@ -169,7 +169,7 @@ pub struct StablecoinConfig {
     pub collateral_types: Option<Vec<CollateralTypeConfig>>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ReserveCompositionConfig {
     pub asset: String,
@@ -177,7 +177,7 @@ pub struct ReserveCompositionConfig {
     pub minimum_percentage: f64,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SupplyCapsConfig {
     pub maximum_supply_cap: Option<u64>,
@@ -185,7 +185,7 @@ pub struct SupplyCapsConfig {
     pub emergency_threshold_percent: Option<f64>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct CollateralTypeConfig {
     pub name: String,
@@ -196,7 +196,7 @@ pub struct CollateralTypeConfig {
     pub minimum_deposit: Option<f64>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct StorageConfig {
     pub instance_ttl_days: Option<u64>,
@@ -206,7 +206,7 @@ pub struct StorageConfig {
     pub audit_log_compression: Option<String>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SecurityConfig {
     pub require_signature_verification: Option<bool>,
@@ -219,14 +219,14 @@ pub struct SecurityConfig {
     pub multisig_requirements: Option<Vec<MultisigRequirementConfig>>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct EndpointPinConfig {
     pub endpoint: String,
     pub pin_sha256: String,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RateLimitConfig {
     pub attestor: String,
@@ -234,7 +234,7 @@ pub struct RateLimitConfig {
     pub requests_per_hour: u64,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MultisigRequirementConfig {
     pub operation: String,
@@ -242,7 +242,7 @@ pub struct MultisigRequirementConfig {
     pub signatory_attestors: Vec<String>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MonitoringConfig {
     pub enable_metrics: Option<bool>,
@@ -253,7 +253,7 @@ pub struct MonitoringConfig {
     pub alerts: Option<Vec<AlertConfig>>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct AlertConfig {
     pub condition: String,
     pub severity: String,
@@ -277,6 +277,116 @@ pub fn load_runtime_config_file(path: impl AsRef<Path>) -> Result<RuntimeConfig,
     let input = fs::read_to_string(path).map_err(|err| err.to_string())?;
     let format = ConfigFormat::from_path(path)?;
     parse_runtime_config_str(&input, format)
+}
+
+/// Thread-safe runtime configuration holder supporting hot-reload.
+///
+/// Wraps a [`RuntimeConfig`] loaded from disk so a long-running process can
+/// pick up configuration changes without restarting. [`RuntimeConfigManager::reload`]
+/// re-reads and re-validates the backing file; a file that fails to parse or
+/// fails shape validation is rejected and the previously loaded configuration
+/// is left in place untouched.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use anchorkit::config::RuntimeConfigManager;
+///
+/// let manager = RuntimeConfigManager::new("configs/remittance-anchor.toml").unwrap();
+/// // ... time passes, an operator edits the file on disk ...
+/// match manager.reload() {
+///     Ok(()) => println!("config reloaded"),
+///     Err(e) => eprintln!("reload rejected, keeping previous config: {e}"),
+/// }
+/// let current = manager.current();
+/// ```
+#[cfg(feature = "std")]
+pub struct RuntimeConfigManager {
+    path: std::path::PathBuf,
+    config: std::sync::RwLock<RuntimeConfig>,
+    last_modified: std::sync::RwLock<Option<std::time::SystemTime>>,
+}
+
+#[cfg(feature = "std")]
+impl RuntimeConfigManager {
+    /// Load and validate the configuration at `path`, keeping it in memory for hot-reload.
+    pub fn new(path: impl AsRef<Path>) -> Result<Self, String> {
+        let path = path.as_ref().to_path_buf();
+        let config = load_runtime_config_file(&path)?;
+        let last_modified = Self::file_modified_time(&path);
+        Ok(Self {
+            path,
+            config: std::sync::RwLock::new(config),
+            last_modified: std::sync::RwLock::new(last_modified),
+        })
+    }
+
+    /// Return a clone of the currently loaded configuration.
+    pub fn current(&self) -> RuntimeConfig {
+        self.config
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Path to the config file backing this manager.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Re-read and re-validate the config file, swapping it in on success.
+    ///
+    /// On failure (I/O error, malformed input, or shape-validation failure) the
+    /// previously loaded configuration is left untouched and the error is
+    /// returned so the caller can log/alert on the rejected reload.
+    pub fn reload(&self) -> Result<(), String> {
+        let new_config = load_runtime_config_file(&self.path)?;
+        let mut guard = self
+            .config
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = new_config;
+        drop(guard);
+        let mut mtime_guard = self
+            .last_modified
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *mtime_guard = Self::file_modified_time(&self.path);
+        Ok(())
+    }
+
+    /// Check whether the on-disk file has a newer modification time than the
+    /// last successful load/reload, without reading or reloading it.
+    pub fn has_changed(&self) -> bool {
+        let current_mtime = Self::file_modified_time(&self.path);
+        let last = *self
+            .last_modified
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match (current_mtime, last) {
+            (Some(cur), Some(last)) => cur > last,
+            (Some(_), None) => true,
+            _ => false,
+        }
+    }
+
+    /// Reload only if the file's modification time changed since the last load.
+    ///
+    /// Returns `Ok(true)` if a reload happened, `Ok(false)` if the file was
+    /// unchanged (no I/O beyond a metadata stat), or `Err` if a reload was
+    /// attempted but rejected — in which case the previous configuration
+    /// remains active.
+    pub fn reload_if_changed(&self) -> Result<bool, String> {
+        if !self.has_changed() {
+            return Ok(false);
+        }
+        self.reload()?;
+        Ok(true)
+    }
+
+    fn file_modified_time(path: &Path) -> Option<std::time::SystemTime> {
+        fs::metadata(path).and_then(|m| m.modified()).ok()
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -568,5 +678,183 @@ password = "s3cret"
         let json = base_config_json(proxy_section);
         let err = parse_runtime_config_str(&json, ConfigFormat::Json).unwrap_err();
         assert!(err.contains("username cannot be empty"), "got: {err}");
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod hot_reload_tests {
+    use super::*;
+
+    const VALID_CONFIG: &str = r#"{
+        "contract": {
+            "name": "TestAnchor",
+            "version": "1.0.0",
+            "network": "testnet"
+        },
+        "attestors": {
+            "registry": [{
+                "name": "attestor-1",
+                "address": "GABC123",
+                "role": "primary",
+                "enabled": true
+            }]
+        }
+    }"#;
+
+    const VALID_CONFIG_V2: &str = r#"{
+        "contract": {
+            "name": "TestAnchorV2",
+            "version": "2.0.0",
+            "network": "testnet"
+        },
+        "attestors": {
+            "registry": [{
+                "name": "attestor-1",
+                "address": "GABC123",
+                "role": "primary",
+                "enabled": true
+            }]
+        }
+    }"#;
+
+    const INVALID_CONFIG: &str = r#"{
+        "contract": {
+            "name": "",
+            "version": "1.0.0",
+            "network": "testnet"
+        },
+        "attestors": {
+            "registry": []
+        }
+    }"#;
+
+    /// Create a unique scratch file path under the OS temp dir for this test process.
+    fn scratch_path(label: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "anchorkit_hot_reload_{label}_{}_{}.json",
+            std::process::id(),
+            nanos
+        ))
+    }
+
+    /// Write `content`, sleeping briefly beforehand so the resulting mtime is
+    /// observably later than any previous write to the same path (guards
+    /// against flakiness from coarse filesystem mtime resolution).
+    fn write_with_advanced_mtime(path: &std::path::Path, content: &str) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(path, content).expect("write scratch config");
+    }
+
+    #[test]
+    fn test_manager_new_loads_valid_config() {
+        let path = scratch_path("new_valid");
+        fs::write(&path, VALID_CONFIG).unwrap();
+
+        let manager = RuntimeConfigManager::new(&path).expect("valid config should load");
+        assert_eq!(manager.current().contract.name, "TestAnchor");
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_manager_new_rejects_invalid_config() {
+        let path = scratch_path("new_invalid");
+        fs::write(&path, INVALID_CONFIG).unwrap();
+
+        let result = RuntimeConfigManager::new(&path);
+        assert!(result.is_err(), "empty contract.name must be rejected");
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_reload_picks_up_valid_change() {
+        let path = scratch_path("reload_valid");
+        fs::write(&path, VALID_CONFIG).unwrap();
+        let manager = RuntimeConfigManager::new(&path).unwrap();
+        assert_eq!(manager.current().contract.name, "TestAnchor");
+
+        fs::write(&path, VALID_CONFIG_V2).unwrap();
+        manager.reload().expect("reload of a valid config must succeed");
+        assert_eq!(manager.current().contract.name, "TestAnchorV2");
+        assert_eq!(manager.current().contract.version, "2.0.0");
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_reload_rejects_invalid_change_and_keeps_previous_config() {
+        let path = scratch_path("reload_invalid");
+        fs::write(&path, VALID_CONFIG).unwrap();
+        let manager = RuntimeConfigManager::new(&path).unwrap();
+        assert_eq!(manager.current().contract.name, "TestAnchor");
+
+        fs::write(&path, INVALID_CONFIG).unwrap();
+        let result = manager.reload();
+        assert!(result.is_err(), "invalid reload input must be rejected");
+
+        // Previous valid configuration must still be active.
+        assert_eq!(
+            manager.current().contract.name,
+            "TestAnchor",
+            "a rejected reload must not mutate the active configuration"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_reload_rejects_malformed_json() {
+        let path = scratch_path("reload_malformed");
+        fs::write(&path, VALID_CONFIG).unwrap();
+        let manager = RuntimeConfigManager::new(&path).unwrap();
+
+        fs::write(&path, "{ this is not valid json").unwrap();
+        let result = manager.reload();
+        assert!(result.is_err(), "malformed JSON must be rejected");
+        assert_eq!(manager.current().contract.name, "TestAnchor");
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_reload_if_changed_skips_when_file_untouched() {
+        let path = scratch_path("reload_if_unchanged");
+        fs::write(&path, VALID_CONFIG).unwrap();
+        let manager = RuntimeConfigManager::new(&path).unwrap();
+
+        // No modification since load: has_changed() must report false and
+        // reload_if_changed() must be a no-op returning Ok(false).
+        assert!(!manager.has_changed());
+        let result = manager.reload_if_changed();
+        assert_eq!(result, Ok(false));
+        assert_eq!(manager.current().contract.name, "TestAnchor");
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_reload_if_changed_reloads_when_file_modified() {
+        let path = scratch_path("reload_if_changed");
+        write_with_advanced_mtime(&path, VALID_CONFIG);
+        let manager = RuntimeConfigManager::new(&path).unwrap();
+
+        write_with_advanced_mtime(&path, VALID_CONFIG_V2);
+        let result = manager.reload_if_changed();
+        assert_eq!(result, Ok(true));
+        assert_eq!(manager.current().contract.name, "TestAnchorV2");
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_manager_new_reports_missing_file() {
+        let path = scratch_path("does_not_exist");
+        let result = RuntimeConfigManager::new(&path);
+        assert!(result.is_err());
     }
 }
