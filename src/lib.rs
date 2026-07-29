@@ -131,6 +131,10 @@ pub mod rate_limiter;
 pub mod retry;
 pub mod trace_context;
 pub mod replay_detection;
+pub mod request_deduplication;
+pub mod retry_budget;
+pub mod distributed_correlation;
+pub mod request_provenance;
 pub mod transaction_state_tracker;
 pub mod contract;
 #[cfg(not(feature = "wasm"))]
@@ -143,10 +147,19 @@ pub mod session_state_machine;
 pub mod migration;
 #[cfg(not(feature = "wasm"))]
 pub mod url_normalizer;
+// Issue #679: configurable request record retention policies
+// Issue #680: request record export and archival support
+#[cfg(not(feature = "wasm"))]
+pub mod request_record;
+// Issue #678: host-boundary replay prevention
+#[cfg(not(feature = "wasm"))]
+pub mod host_replay_prevention;
 
-// ── std-only modules (filesystem, runtime config) ─────────────────────────────
+// ── std-only modules (filesystem, runtime config, env fingerprinting) ─────────
 #[cfg(feature = "std")]
 pub mod config;
+#[cfg(feature = "std")]
+pub mod env_fingerprint;
 
 // ── Host-only modules (HTTP, threading) ───────────────────────────────────────
 // Excluded from `wasm` builds: on-chain Soroban contracts have no network access.
@@ -173,11 +186,35 @@ pub mod streaming_monitor;
 #[cfg(not(feature = "wasm"))]
 pub mod structured_log;
 
+// ── Transaction archive (#675), compaction (#676) ────────────────────────────
+#[cfg(not(feature = "wasm"))]
+pub mod transaction_archive;
+#[cfg(not(feature = "wasm"))]
+pub mod transaction_compaction;
+
+// ── Artifact provenance tracking (#674) ──────────────────────────────────────
+#[cfg(not(feature = "wasm"))]
+pub mod artifact_provenance;
+
+// ── Deployment drift detection (#673) ────────────────────────────────────────
+#[cfg(not(feature = "wasm"))]
+pub mod deployment_drift;
+
 // ── Multi-asset quote routing (#656) ─────────────────────────────────────────
 // Available in host (non-WASM) builds. Provides asset-pair routing across
 // multiple corridors in a single pass.
 #[cfg(not(feature = "wasm"))]
 pub mod multi_asset_routing;
+
+// ── Alert routing, deduplication, and synthetic probes (#685, #686, #687) ───
+// Host-only: alert routing decisions, dedup/suppression logic, and synthetic
+// endpoint probes all require `alloc` and run off-chain.
+#[cfg(not(feature = "wasm"))]
+pub mod alert_routing;
+#[cfg(not(feature = "wasm"))]
+pub mod alert_dedup;
+#[cfg(not(feature = "wasm"))]
+pub mod synthetic_probe;
 
 // ── Mock helpers (test / CI without live anchor) ──────────────────────────────
 #[cfg(feature = "mock-only")]
@@ -195,9 +232,11 @@ pub use retry::{retry_with_backoff, is_retryable, RetryConfig, JitterSource, Led
 pub use retry::{BackoffStrategy, JitterPolicy};
 pub use retry::retry_with_backoff_traced;
 pub use trace_context::{TraceContext, TraceError, TRACEPARENT_HEADER, TRACE_ID_HEADER, SPAN_ID_HEADER};
-pub use deterministic_hash::{
-    compute_canonical_hash, compute_payload_hash, verify_payload_hash, CanonicalField,
-};
+pub use request_deduplication::{DeduplicationStore, DeduplicationKey, DeduplicationResult, DeduplicationStats, execute_deduplicated};
+pub use retry_budget::{RetryBudget, RetryBudgetConfig, BudgetExhaustedError, execute_with_budget};
+pub use distributed_correlation::{CorrelationContext, CorrelationError, CORRELATION_ID_HEADER, ORIGIN_SERVICE_HEADER, HOP_COUNT_HEADER, BAGGAGE_HEADER};
+pub use request_provenance::{ProvenanceRecord, PROVENANCE_ID_HEADER, PARENT_ID_HEADER, DEPTH_HEADER, ORIGIN_HEADER, OPERATION_HEADER};
+pub use deterministic_hash::{compute_payload_hash, verify_payload_hash};
 pub use contract::{AnchorKitContract, AnchorTomlProvenance, EndpointUpdated, CacheConfig};
 pub use contract::{AttestorRevocationRecord};
 pub use contract::{
@@ -274,15 +313,17 @@ pub use contract::{AttestationSortOrder};
 #[cfg(not(feature = "wasm"))]
 pub use contract::sort_attestations;
 pub use service_management::{ServiceManager, ServiceToggleState, ServiceConfigSnapshot};
+pub use service_management::{MaintenanceWindow, MaintenanceManager};
+pub use service_management::{ServiceDependency, ServiceDependencyGraph, DependencyManager};
+pub use service_management::{
+    ServiceTemplate, TemplateApplication, TemplateManager,
+    TEMPLATE_FIAT_ON_RAMP, TEMPLATE_REMITTANCE, TEMPLATE_STABLECOIN_ISSUER,
+};
 pub use admin_audit_log::{AdminAuditLog, AdminConfigChangeEvent, AdminAuditLogConfig};
 pub use contract::{HealthStatus, MetadataFreshnessReport, RateLimiterHealth};
 pub use contract::{AnchorHealthMetrics, AnchorProofRecord};
 pub use transaction_state_tracker::{BudgetStatus, BudgetAlert};
-pub use transaction_state_tracker::{
-    ArchivedRecoveryMetadata, RecoveryRetentionPolicy, StorageBudgetReport,
-};
-// Issue #657: multi-anchor reputation weighting
-pub use contract::{AnchorReputationRecord, ReputationWeights};
+// Issue #657: multi-anchor reputation weightingpub use contract::{AnchorReputationRecord, ReputationWeights};
 // Issue #658: time-based routing policies
 pub use contract::{RoutingTimeWindow, TimedRoutingPolicy};
 // Issue #659: per-network routing profiles
@@ -291,6 +332,9 @@ pub use contract::NetworkRoutingProfile;
 pub use anchor_health::{
     AnchorHealthReport, HealthReportFormat,
     build_health_report, export_health_report,
+    build_health_report_with_maintenance, should_suppress_alert,
+    SloTarget, SloEvaluation, SloViolationDetail, SloHealthReport,
+    evaluate_slo, evaluate_slo_for_report, build_slo_report,
 };
 #[cfg(not(feature = "wasm"))]
 pub use sep38::{CrossAnchorFeeAggregator, FeeAnomalyReport};
@@ -309,6 +353,43 @@ pub use multi_asset_routing::{
 };
 #[cfg(not(feature = "wasm"))]
 pub use structured_log::{StructuredLogger, LogLevel, LogRecord, FieldValue, log_attestor_registration};
+#[cfg(not(feature = "wasm"))]
+pub use alert_routing::{AlertRouter, AlertRouterConfig, AlertRule, AlertRoute, AlertSeverity};
+#[cfg(not(feature = "wasm"))]
+pub use alert_dedup::{AlertDeduplicator, AlertFilter, AlertSuppressor, DedupConfig, SuppressedEntry};
+#[cfg(not(feature = "wasm"))]
+pub use synthetic_probe::{
+    SyntheticProbeRunner, ProbeConfig, ProbeKind, ProbeResult, ProbeOutcome,
+    ProbeReport, probe_results_to_health_window,
+};
+
+// ── Issue #675: archived transaction histories ────────────────────────────────
+#[cfg(not(feature = "wasm"))]
+pub use transaction_archive::{
+    TransactionArchive, TransactionArchiveManager, ArchiveRetrievalStatus,
+    compute_archive_commitment, verify_archive_commitment,
+};
+
+// ── Issue #676: transaction history compaction ────────────────────────────────
+#[cfg(not(feature = "wasm"))]
+pub use transaction_compaction::{
+    compact_history, CompactionConfig, RawTransactionRecord,
+    TransactionSummaryRecord, CompactionResult, CompactionAggregate,
+};
+
+// ── Issue #674: artifact provenance tracking ──────────────────────────────────
+#[cfg(not(feature = "wasm"))]
+pub use artifact_provenance::{
+    ArtifactProvenance, ProvenanceStore, ProvenanceVerifier,
+    VerificationReport, FieldVerdict,
+};
+
+// ── Issue #673: deployment drift detection ────────────────────────────────────
+#[cfg(not(feature = "wasm"))]
+pub use deployment_drift::{
+    detect_drift, ConfigEntry, DeploymentSpec, DeploymentSnapshot,
+    DriftReport, DriftItem, DriftSeverity,
+};
 
 #[cfg(all(test, not(feature = "wasm")))]
 mod stellar_toml_tests;

@@ -2163,6 +2163,217 @@ impl TransactionStateTracker {
         }
         removed
     }
+
+    // ── Partial recovery (#677) ───────────────────────────────────────────────
+
+    /// Resume a failed transaction from its last known intermediate state.
+    ///
+    /// "Partial recovery" allows a transaction that failed mid-flight to re-enter
+    /// processing from the state it had *before* it failed, rather than requiring
+    /// a full restart from [`Pending`](TransactionState::Pending).
+    ///
+    /// # Behaviour
+    ///
+    /// 1. Looks up the transaction; returns an error if not found or not `Failed`.
+    /// 2. Reads `recovery_metadata.failed_from_state` to determine the resume point.
+    /// 3. Resets the transaction state to `failed_from_state` and appends a
+    ///    `"partial_recovery"` note to the state history.
+    /// 4. Clears `error_message` so downstream callers see a clean slate.
+    /// 5. Increments `retry_count` on the existing [`RecoveryMetadata`].
+    ///
+    /// After calling this method the transaction is back in its intermediate state
+    /// and the normal transition path (e.g. `→ Completed` or `→ Failed` again) can
+    /// proceed.
+    ///
+    /// # Arguments
+    ///
+    /// * `transaction_id` – The ID of the failed transaction to resume.
+    /// * `env`            – The Soroban execution environment.
+    ///
+    /// # Returns
+    ///
+    /// The updated [`TransactionStateRecord`] with the resumed state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `String` error if:
+    /// - the transaction is not found,
+    /// - it is not in the [`Failed`](TransactionState::Failed) state,
+    /// - it has no [`RecoveryMetadata`] (legacy record), or
+    /// - `failed_from_state` is itself a terminal state (should never happen in
+    ///   practice but guarded defensively).
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{Env, String};
+    /// # use soroban_sdk::testutils::Address as _;
+    /// # let env = Env::default();
+    /// # let initiator = soroban_sdk::Address::generate(&env);
+    /// use anchorkit::transaction_state_tracker::{TransactionStateTracker, TransactionState};
+    ///
+    /// let mut tracker = TransactionStateTracker::new(true);
+    /// tracker.create_transaction(1, initiator, &env).unwrap();
+    /// tracker.start_transaction(1, &env).unwrap();
+    /// tracker.fail_transaction(1, String::from_str(&env, "timeout"), &env).unwrap();
+    ///
+    /// // Resume from InProgress (the state before failure).
+    /// let record = tracker.resume_partial_recovery(1, &env).unwrap();
+    /// assert_eq!(record.state, TransactionState::InProgress);
+    /// ```
+    pub fn resume_partial_recovery(
+        &mut self,
+        transaction_id: u64,
+        env: &Env,
+    ) -> Result<TransactionStateRecord, String> {
+        let current_time = env.ledger().timestamp();
+        let current_ledger = env.ledger().sequence();
+
+        if self.is_dev_mode {
+            let pos = self
+                .cache
+                .iter()
+                .position(|r| r.transaction_id == transaction_id)
+                .ok_or_else(|| String::from_str(env, "Transaction not found in cache"))?;
+
+            let record = &self.cache[pos];
+
+            if record.state != TransactionState::Failed {
+                return Err(String::from_str(
+                    env,
+                    "resume_partial_recovery requires a Failed transaction",
+                ));
+            }
+
+            let (resume_state, new_retry_count) = match &record.recovery_metadata {
+                OptRecovery::None => {
+                    return Err(String::from_str(
+                        env,
+                        "Transaction has no recovery metadata; cannot resume",
+                    ));
+                }
+                OptRecovery::Some(meta) => {
+                    let rs = meta.failed_from_state;
+                    if rs.is_terminal() {
+                        return Err(String::from_str(
+                            env,
+                            "failed_from_state is terminal; cannot resume",
+                        ));
+                    }
+                    (rs, meta.retry_count + 1)
+                }
+            };
+
+            let record = &mut self.cache[pos];
+            record.state = resume_state;
+            record.last_updated = current_time;
+            record.last_updated_ledger = current_ledger;
+            record.error_message = None;
+            record.state_history.push_back((resume_state, current_time));
+
+            // Update retry count in recovery metadata.
+            if let OptRecovery::Some(ref mut meta) = record.recovery_metadata {
+                meta.retry_count = new_retry_count;
+            }
+
+            self.audit_log.push(TransitionAuditEntry {
+                transaction_id,
+                from_state: TransactionState::Failed,
+                to_state: resume_state,
+                timestamp: current_time,
+                success: true,
+            });
+
+            Ok(record.clone())
+        } else {
+            let key = (symbol_short!("TXSTATE"), transaction_id);
+            let mut record: TransactionStateRecord = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .ok_or_else(|| String::from_str(env, "Transaction not found"))?;
+
+            if record.state != TransactionState::Failed {
+                return Err(String::from_str(
+                    env,
+                    "resume_partial_recovery requires a Failed transaction",
+                ));
+            }
+
+            let (resume_state, new_retry_count) = match &record.recovery_metadata {
+                OptRecovery::None => {
+                    return Err(String::from_str(
+                        env,
+                        "Transaction has no recovery metadata; cannot resume",
+                    ));
+                }
+                OptRecovery::Some(meta) => {
+                    let rs = meta.failed_from_state;
+                    if rs.is_terminal() {
+                        return Err(String::from_str(
+                            env,
+                            "failed_from_state is terminal; cannot resume",
+                        ));
+                    }
+                    (rs, meta.retry_count + 1)
+                }
+            };
+
+            record.state = resume_state;
+            record.last_updated = current_time;
+            record.last_updated_ledger = current_ledger;
+            record.error_message = None;
+            record.state_history.push_back((resume_state, current_time));
+
+            if let OptRecovery::Some(ref mut meta) = record.recovery_metadata {
+                meta.retry_count = new_retry_count;
+            }
+
+            env.storage().persistent().set(&key, &record);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, TXSTATE_TTL, TXSTATE_TTL);
+
+            Ok(record)
+        }
+    }
+
+    /// Return `true` when the transaction can be partially recovered.
+    ///
+    /// A transaction is partially recoverable when it:
+    /// 1. Exists and is in the [`Failed`](TransactionState::Failed) state.
+    /// 2. Has [`RecoveryMetadata`] with a non-terminal `failed_from_state`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{Env, String};
+    /// # use soroban_sdk::testutils::Address as _;
+    /// # let env = Env::default();
+    /// # let initiator = soroban_sdk::Address::generate(&env);
+    /// use anchorkit::transaction_state_tracker::TransactionStateTracker;
+    ///
+    /// let mut tracker = TransactionStateTracker::new(true);
+    /// tracker.create_transaction(1, initiator, &env).unwrap();
+    /// tracker.start_transaction(1, &env).unwrap();
+    /// tracker.fail_transaction(1, String::from_str(&env, "err"), &env).unwrap();
+    ///
+    /// assert!(tracker.is_partially_recoverable(1, &env).unwrap());
+    /// ```
+    pub fn is_partially_recoverable(
+        &self,
+        transaction_id: u64,
+        env: &Env,
+    ) -> Result<bool, String> {
+        let record = self.get_transaction_state(transaction_id, env)?;
+        Ok(record.map(|r| {
+            r.state == TransactionState::Failed
+                && match &r.recovery_metadata {
+                    OptRecovery::Some(meta) => !meta.failed_from_state.is_terminal(),
+                    OptRecovery::None => false,
+                }
+        }).unwrap_or(false))
+    }
 }
 
 #[cfg(test)]
@@ -2911,5 +3122,153 @@ mod tests {
         assert_eq!(meta.failure_reason, soroban_sdk::String::from_str(&env, "round-trip error"));
         assert_eq!(meta.failed_from_state, TransactionState::InProgress);
         assert_eq!(meta.retry_count, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #677 — partial transaction recovery tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resume_partial_recovery_from_in_progress() {
+        let env = Env::default();
+        let mut tracker = TransactionStateTracker::new(true);
+        let initiator = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+
+        tracker.create_transaction(1, initiator, &env).unwrap();
+        tracker.start_transaction(1, &env).unwrap(); // Pending → InProgress
+        tracker.fail_transaction(1, String::from_str(&env, "timeout"), &env).unwrap();
+
+        // Resume from InProgress (the state the transaction was in before failing).
+        let record = tracker.resume_partial_recovery(1, &env).unwrap();
+        assert_eq!(record.state, TransactionState::InProgress);
+        assert!(record.error_message.is_none(), "error_message must be cleared on resume");
+
+        // Retry count should be 1.
+        let meta = record.recovery_metadata.unwrap();
+        assert_eq!(meta.retry_count, 1);
+    }
+
+    #[test]
+    fn test_resume_partial_recovery_from_pending() {
+        let env = Env::default();
+        let mut tracker = TransactionStateTracker::new(true);
+        let initiator = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+
+        tracker.create_transaction(1, initiator, &env).unwrap();
+        // Fail immediately from Pending (pre-processing failure).
+        tracker.fail_transaction(1, String::from_str(&env, "pre-check failed"), &env).unwrap();
+
+        let record = tracker.resume_partial_recovery(1, &env).unwrap();
+        assert_eq!(record.state, TransactionState::Pending);
+    }
+
+    #[test]
+    fn test_resume_partial_recovery_then_complete() {
+        let env = Env::default();
+        let mut tracker = TransactionStateTracker::new(true);
+        let initiator = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+
+        tracker.create_transaction(1, initiator, &env).unwrap();
+        tracker.start_transaction(1, &env).unwrap();
+        tracker.fail_transaction(1, String::from_str(&env, "err"), &env).unwrap();
+        tracker.resume_partial_recovery(1, &env).unwrap();
+
+        // After resuming to InProgress, completing should succeed.
+        let record = tracker.complete_transaction(1, &env).unwrap();
+        assert_eq!(record.state, TransactionState::Completed);
+    }
+
+    #[test]
+    fn test_resume_partial_recovery_increments_retry_count_on_repeated_failures() {
+        let env = Env::default();
+        let mut tracker = TransactionStateTracker::new(true);
+        let initiator = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+
+        tracker.create_transaction(1, initiator, &env).unwrap();
+        tracker.start_transaction(1, &env).unwrap();
+
+        for expected_retry in 1..=3u32 {
+            tracker.fail_transaction(1, String::from_str(&env, "err"), &env).unwrap();
+            let record = tracker.resume_partial_recovery(1, &env).unwrap();
+            let meta = record.recovery_metadata.unwrap();
+            assert_eq!(meta.retry_count, expected_retry);
+        }
+    }
+
+    #[test]
+    fn test_resume_partial_recovery_requires_failed_state() {
+        let env = Env::default();
+        let mut tracker = TransactionStateTracker::new(true);
+        let initiator = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+
+        tracker.create_transaction(1, initiator, &env).unwrap();
+        tracker.start_transaction(1, &env).unwrap();
+        // Transaction is InProgress, not Failed.
+        let result = tracker.resume_partial_recovery(1, &env);
+        assert!(result.is_err(), "resume must fail for non-Failed transactions");
+    }
+
+    #[test]
+    fn test_resume_partial_recovery_missing_transaction_returns_error() {
+        let env = Env::default();
+        let mut tracker = TransactionStateTracker::new(true);
+        let result = tracker.resume_partial_recovery(99, &env);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_is_partially_recoverable_true_for_failed_with_metadata() {
+        let env = Env::default();
+        let mut tracker = TransactionStateTracker::new(true);
+        let initiator = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+
+        tracker.create_transaction(1, initiator, &env).unwrap();
+        tracker.start_transaction(1, &env).unwrap();
+        tracker.fail_transaction(1, String::from_str(&env, "err"), &env).unwrap();
+
+        assert!(tracker.is_partially_recoverable(1, &env).unwrap());
+    }
+
+    #[test]
+    fn test_is_partially_recoverable_false_for_pending() {
+        let env = Env::default();
+        let mut tracker = TransactionStateTracker::new(true);
+        let initiator = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+
+        tracker.create_transaction(1, initiator, &env).unwrap();
+        assert!(!tracker.is_partially_recoverable(1, &env).unwrap());
+    }
+
+    #[test]
+    fn test_is_partially_recoverable_false_for_completed() {
+        let env = Env::default();
+        let mut tracker = TransactionStateTracker::new(true);
+        let initiator = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+
+        tracker.create_transaction(1, initiator, &env).unwrap();
+        tracker.start_transaction(1, &env).unwrap();
+        tracker.complete_transaction(1, &env).unwrap();
+
+        assert!(!tracker.is_partially_recoverable(1, &env).unwrap());
+    }
+
+    #[test]
+    fn test_resume_partial_recovery_audit_log_entry() {
+        let env = Env::default();
+        let mut tracker = TransactionStateTracker::new(true);
+        let initiator = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+
+        tracker.create_transaction(1, initiator, &env).unwrap();
+        tracker.start_transaction(1, &env).unwrap();
+        tracker.fail_transaction(1, String::from_str(&env, "err"), &env).unwrap();
+
+        let audit_before = tracker.audit_log.len();
+        tracker.resume_partial_recovery(1, &env).unwrap();
+
+        assert_eq!(tracker.audit_log.len(), audit_before + 1);
+        let last = tracker.audit_log.last().unwrap();
+        assert_eq!(last.from_state, TransactionState::Failed);
+        assert_eq!(last.to_state, TransactionState::InProgress);
+        assert!(last.success);
     }
 }
