@@ -180,6 +180,16 @@ pub mod structured_log;
 #[cfg(not(feature = "wasm"))]
 pub mod multi_asset_routing;
 
+// ── Alert routing, deduplication, and synthetic probes (#685, #686, #687) ───
+// Host-only: alert routing decisions, dedup/suppression logic, and synthetic
+// endpoint probes all require `alloc` and run off-chain.
+#[cfg(not(feature = "wasm"))]
+pub mod alert_routing;
+#[cfg(not(feature = "wasm"))]
+pub mod alert_dedup;
+#[cfg(not(feature = "wasm"))]
+pub mod synthetic_probe;
+
 // ── Mock helpers (test / CI without live anchor) ──────────────────────────────
 #[cfg(feature = "mock-only")]
 pub mod mock;
@@ -314,6 +324,15 @@ pub use multi_asset_routing::{
 };
 #[cfg(not(feature = "wasm"))]
 pub use structured_log::{StructuredLogger, LogLevel, LogRecord, FieldValue, log_attestor_registration};
+#[cfg(not(feature = "wasm"))]
+pub use alert_routing::{AlertRouter, AlertRouterConfig, AlertRule, AlertRoute, AlertSeverity};
+#[cfg(not(feature = "wasm"))]
+pub use alert_dedup::{AlertDeduplicator, AlertFilter, AlertSuppressor, DedupConfig, SuppressedEntry};
+#[cfg(not(feature = "wasm"))]
+pub use synthetic_probe::{
+    SyntheticProbeRunner, ProbeConfig, ProbeKind, ProbeResult, ProbeOutcome,
+    ProbeReport, probe_results_to_health_window,
+};
 
 #[cfg(all(test, not(feature = "wasm")))]
 mod stellar_toml_tests;
