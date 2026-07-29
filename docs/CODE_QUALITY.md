@@ -9,6 +9,7 @@ AnchorKit maintains high code quality through automated formatting, linting, and
 | **rustfmt** | Code formatting | `rustfmt.toml` | `cargo fmt --all` |
 | **clippy** | Linting & best practices | `.clippy.toml` | `cargo clippy --all-targets --all-features` |
 | **cargo test** | Unit & integration tests | `Cargo.toml` | `cargo test` |
+| **markdownlint-cli** | Documentation lint | `.markdownlint.json` | `make doc-lint` |
 
 ## Quick Start
 
@@ -19,6 +20,14 @@ make check
 ```
 
 This runs all checks (formatting, linting, tests) and ensures your code meets project standards.
+
+### Before committing documentation:
+
+```bash
+make doc-lint
+```
+
+This checks all markdown files for broken links, heading consistency, formatting issues, and stale placeholder text.
 
 ### Individual commands:
 
@@ -144,6 +153,7 @@ GitHub Actions automatically runs code quality checks on every push and pull req
 2. **Linting** — `cargo clippy -- -D warnings`
 3. **Tests** — `cargo test --all-features`
 4. **WASM build** — `cargo build --target wasm32-unknown-unknown`
+5. **Documentation lint** — markdownlint + broken link + heading checks
 
 All checks must pass before merging to `main`.
 
@@ -174,6 +184,7 @@ The hook will run:
 1. Formatting check
 2. Clippy linting
 3. Tests
+4. Documentation lint (only when `.md` files are staged)
 
 If any check fails, the commit is blocked. Fix the issues and try again.
 
@@ -225,6 +236,84 @@ Update Rust if needed:
 ```bash
 rustup update
 ```
+
+## Documentation Linting
+
+AnchorKit lints all markdown documentation to keep docs accurate, navigable, and consistent.
+
+**Configuration:** `.markdownlint.json`
+
+**Script:** `scripts/validate-docs.sh`
+
+### What is checked
+
+| Check | What it catches |
+|-------|----------------|
+| **Markdown lint** | Heading hierarchy, fenced code blocks, trailing spaces, blank lines |
+| **Broken internal links** | Relative links that point to non-existent files |
+| **Heading consistency** | Missing H1, multiple H1s, heading level skips (H1 → H3) |
+| **Command hygiene** | `$` prompt prefixes in copy-paste examples, unfenced commands |
+| **Stale placeholders** | `TODO:`, `FIXME:`, `TBD`, `<YOUR_VALUE>` patterns |
+
+### Running doc lint locally
+
+```bash
+# Lint all docs
+make doc-lint
+
+# Auto-fix markdownlint formatting issues
+make doc-lint-fix
+
+# Check a single file
+bash scripts/validate-docs.sh --file docs/MY_DOC.md
+
+# Run all quality checks together (code + docs)
+make doc-check
+```
+
+### Interpreting output
+
+Each check prints a `✓` (pass) or `✗` (error) / `⚠` (warning) per file. A final summary shows
+total file count, errors, and warnings. The script exits with code `1` on any error, making it
+safe for CI gating.
+
+**Example output:**
+
+```
+AnchorKit Documentation Lint
+Files to check: 26
+
+── Markdown Lint (markdownlint-cli) ──
+  ✓ All markdown files pass lint checks
+
+── Broken Internal Links ──
+  ✓ No broken internal links found
+
+── Heading Consistency ──
+  ✓ Heading structure looks consistent
+
+── Command Example Hygiene ──
+  ✓ Command examples look well-formed
+
+── Stale Placeholder Text ──
+  ✓ No stale placeholder text found
+
+── Summary ──────────────────────────────────────────────────────────
+  Files checked : 26
+  Errors        : 0
+  Warnings      : 0
+
+✓ Documentation lint passed
+```
+
+### Writing good documentation
+
+- Use `atx`-style headings (`# H1`, `## H2`, not underline-style)
+- Every file must start with a single `# Title` H1
+- Do not skip heading levels — go H1 → H2 → H3 in order
+- Wrap all command examples in fenced code blocks with a language tag (` ```bash `)
+- Do not prefix commands with a `$` prompt — examples should be copy-pasteable as-is
+- Remove all `TODO:`, `FIXME:`, and `<YOUR_VALUE>` placeholders before merging
 
 ## Documentation Standards
 

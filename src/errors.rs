@@ -141,12 +141,37 @@ pub enum ErrorCode {
     /// Amount is zero or otherwise invalid for routing.
     InvalidAmount             = 64,
 
-    // Service retirement errors (65–66)
-    /// Requested service retirement state transition is not permitted.
-    /// (e.g. Retired → Active, or Deprecated → Retired without going through Disabled)
-    InvalidRetirementTransition = 65,
-    /// Environment fingerprint collection encountered a failure.
-    FingerprintCollectionFailed = 66,
+    // Maintenance window errors (65–67)
+    /// No maintenance window exists for the requested ID.
+    MaintenanceWindowNotFound = 65,
+    /// A new maintenance window conflicts with an existing one for the same anchor.
+    MaintenanceWindowConflict = 66,
+    /// The requested operation is blocked because the anchor is in a maintenance window.
+    ServiceInMaintenance      = 67,
+
+    // Dependency graph errors (68–70)
+    /// A required service dependency is not present or not enabled.
+    DependencyNotMet          = 68,
+    /// The dependency graph contains a cycle (circular dependency).
+    DependencyCycleDetected   = 69,
+    /// A referenced dependency service code does not exist.
+    DependencyNotFound        = 70,
+
+    // Service template errors (71–73)
+    /// No template exists with the requested name.
+    TemplateNotFound          = 71,
+    /// A template contains an invalid or inconsistent service configuration.
+    InvalidTemplate           = 72,
+    /// Template has already been applied to this anchor and cannot be re-applied.
+    TemplateAlreadyApplied    = 73,
+
+    // SLO errors (74–76)
+    /// An SLO target was violated (composite score fell below the configured threshold).
+    SloViolation              = 74,
+    /// The SLO configuration is invalid (e.g. threshold out of range).
+    InvalidSloConfig          = 75,
+    /// No SLO has been configured for this anchor.
+    SloNotConfigured          = 76,
 }
 
 impl ErrorCode {
@@ -219,6 +244,18 @@ impl ErrorCode {
             ErrorCode::BatchSizeExceeded         => "Batch size exceeds the per-call maximum",
             ErrorCode::InvalidAssetPair          => "Base and quote asset must differ",
             ErrorCode::InvalidAmount             => "Amount is zero or otherwise invalid",
+            ErrorCode::MaintenanceWindowNotFound => "Maintenance window not found",
+            ErrorCode::MaintenanceWindowConflict => "Maintenance window conflicts with an existing window",
+            ErrorCode::ServiceInMaintenance      => "Service is currently in a maintenance window",
+            ErrorCode::DependencyNotMet          => "A required service dependency is not enabled",
+            ErrorCode::DependencyCycleDetected   => "Circular dependency detected in service graph",
+            ErrorCode::DependencyNotFound        => "Referenced dependency service does not exist",
+            ErrorCode::TemplateNotFound          => "Service template not found",
+            ErrorCode::InvalidTemplate           => "Service template configuration is invalid",
+            ErrorCode::TemplateAlreadyApplied    => "Template has already been applied to this anchor",
+            ErrorCode::SloViolation              => "Service level objective was violated",
+            ErrorCode::InvalidSloConfig          => "SLO configuration is invalid",
+            ErrorCode::SloNotConfigured          => "No SLO has been configured for this anchor",
         }
     }
 }
@@ -448,6 +485,74 @@ impl AnchorKitError {
             &alloc::format!("{} -> {}", from, to),
         )
     }
+
+    // Maintenance window constructors
+    pub fn maintenance_window_not_found() -> Self { Self::from_code(ErrorCode::MaintenanceWindowNotFound) }
+    pub fn maintenance_window_conflict() -> Self { Self::from_code(ErrorCode::MaintenanceWindowConflict) }
+    pub fn service_in_maintenance(service_code: u32) -> Self {
+        Self::with_context(
+            ErrorCode::ServiceInMaintenance,
+            ErrorCode::ServiceInMaintenance.default_message(),
+            &alloc::format!("service_code={service_code}"),
+        )
+    }
+
+    // Dependency graph constructors
+    pub fn dependency_not_met(service_code: u32, dependency_code: u32) -> Self {
+        Self::with_context(
+            ErrorCode::DependencyNotMet,
+            ErrorCode::DependencyNotMet.default_message(),
+            &alloc::format!("service={service_code} requires={dependency_code}"),
+        )
+    }
+    pub fn dependency_cycle_detected() -> Self { Self::from_code(ErrorCode::DependencyCycleDetected) }
+    pub fn dependency_not_found(service_code: u32) -> Self {
+        Self::with_context(
+            ErrorCode::DependencyNotFound,
+            ErrorCode::DependencyNotFound.default_message(),
+            &alloc::format!("service_code={service_code}"),
+        )
+    }
+
+    // Template constructors
+    pub fn template_not_found(name: &str) -> Self {
+        Self::with_context(
+            ErrorCode::TemplateNotFound,
+            ErrorCode::TemplateNotFound.default_message(),
+            name,
+        )
+    }
+    pub fn invalid_template(reason: &str) -> Self {
+        Self::with_context(
+            ErrorCode::InvalidTemplate,
+            ErrorCode::InvalidTemplate.default_message(),
+            reason,
+        )
+    }
+    pub fn template_already_applied(name: &str) -> Self {
+        Self::with_context(
+            ErrorCode::TemplateAlreadyApplied,
+            ErrorCode::TemplateAlreadyApplied.default_message(),
+            name,
+        )
+    }
+
+    // SLO constructors
+    pub fn slo_violation(anchor_id: &str, composite: f64, threshold: f64) -> Self {
+        Self::with_context(
+            ErrorCode::SloViolation,
+            ErrorCode::SloViolation.default_message(),
+            &alloc::format!("anchor={anchor_id} score={composite:.2} threshold={threshold:.2}"),
+        )
+    }
+    pub fn invalid_slo_config(reason: &str) -> Self {
+        Self::with_context(
+            ErrorCode::InvalidSloConfig,
+            ErrorCode::InvalidSloConfig.default_message(),
+            reason,
+        )
+    }
+    pub fn slo_not_configured() -> Self { Self::from_code(ErrorCode::SloNotConfigured) }
 }
 
 // ---------------------------------------------------------------------------

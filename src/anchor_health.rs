@@ -629,8 +629,12 @@ pub enum HealthReportFormat {
 /// Contains the current composite score, sub-scores, trend, window statistics,
 /// and an overall label suitable for use in dashboards and alerting pipelines.
 ///
-/// Obtain one via [`build_health_report`] and serialise it with
-/// [`export_health_report`].
+/// The `maintenance_active` flag indicates whether a scheduled maintenance
+/// window is in effect for this anchor.  When `true`, health degradation
+/// alerts should be suppressed because the outage is planned.
+///
+/// Obtain one via [`build_health_report`] or [`build_health_report_with_maintenance`]
+/// and serialise it with [`export_health_report`].
 #[derive(Clone, Debug)]
 pub struct AnchorHealthReport {
     /// Identifier for the anchor (e.g. domain or contract address).
@@ -653,6 +657,20 @@ pub struct AnchorHealthReport {
     pub trend: String,
     /// Composite score from the previous window, if available.
     pub previous_composite: Option<f64>,
+    /// Whether the anchor is currently inside a scheduled maintenance window.
+    ///
+    /// When `true`, degraded or critical scores should **not** trigger alerts
+    /// because the service disruption is intentional and planned.
+    pub maintenance_active: bool,
+}
+
+impl AnchorHealthReport {
+    /// Returns `true` when the composite score is ≥ 80 (healthy range).
+    pub fn is_healthy(&self) -> bool { self.composite_score >= 80.0 }
+    /// Returns `true` when the composite score is in [50, 80) (degraded range).
+    pub fn is_degraded(&self) -> bool { self.composite_score >= 50.0 && self.composite_score < 80.0 }
+    /// Returns `true` when the composite score is < 50 (critical range).
+    pub fn is_critical(&self) -> bool { self.composite_score < 50.0 }
 }
 
 /// Build an [`AnchorHealthReport`] for a named anchor from its observation windows.
@@ -690,7 +708,54 @@ pub fn build_health_report(anchor_id: &str, windows: &[HealthWindow]) -> AnchorH
         label: score.label().into(),
         trend: snapshot.trend.label().into(),
         previous_composite: snapshot.previous_score,
+        maintenance_active: false,
     }
+}
+
+/// Build an [`AnchorHealthReport`] with an explicit maintenance-window flag.
+///
+/// Pass `maintenance_active = true` when the anchor is known to be inside a
+/// scheduled maintenance window.  Consumers should suppress degradation alerts
+/// whenever this flag is set, because the service disruption is intentional.
+///
+/// # Examples
+///
+/// ```rust
+/// use anchorkit::anchor_health::{
+///     HealthWindow, build_health_report_with_maintenance,
+///     export_health_report, HealthReportFormat,
+/// };
+///
+/// let bad = HealthWindow {
+///     started_at: 0, ended_at: 300,
+///     success_count: 10, failure_count: 90,
+///     p50_latency_ms: 9000.0,
+///     routing_failure_count: 9, routing_attempt_count: 10,
+///     recovery_time_seconds: 3600,
+/// };
+/// // Score is critical but the outage is planned
+/// let report = build_health_report_with_maintenance("anchor.example.com", &[bad], true);
+/// assert!(report.maintenance_active);
+/// assert_eq!(report.label, "critical");
+/// let text = export_health_report(&report, HealthReportFormat::Text);
+/// assert!(text.contains("maintenance_active: true"));
+/// ```
+pub fn build_health_report_with_maintenance(
+    anchor_id: &str,
+    windows: &[HealthWindow],
+    maintenance_active: bool,
+) -> AnchorHealthReport {
+    let mut report = build_health_report(anchor_id, windows);
+    report.maintenance_active = maintenance_active;
+    report
+}
+
+/// Returns `true` when the report should suppress degradation alerts.
+///
+/// Alerts are suppressed when the anchor is currently inside a maintenance
+/// window, regardless of the raw health score.
+pub fn should_suppress_alert(report: &AnchorHealthReport) -> bool {
+    report.maintenance_active
 }
 
 /// Serialize an [`AnchorHealthReport`] into the requested [`HealthReportFormat`].
@@ -719,7 +784,8 @@ fn export_health_report_text(r: &AnchorHealthReport) -> String {
          recovery_score: {:.2}\n\
          label: {}\n\
          trend: {}\n\
-         previous_composite: {}\n",
+         previous_composite: {}\n\
+         maintenance_active: {}\n",
         r.anchor_id,
         r.window_count,
         r.composite_score,
@@ -730,6 +796,7 @@ fn export_health_report_text(r: &AnchorHealthReport) -> String {
         r.label,
         r.trend,
         prev,
+        r.maintenance_active,
     )
 }
 
@@ -749,7 +816,8 @@ fn export_health_report_json(r: &AnchorHealthReport) -> String {
 \"recovery_score\":{:.2},\
 \"label\":\"{}\",\
 \"trend\":\"{}\",\
-\"previous_composite\":{}\
+\"previous_composite\":{},\
+\"maintenance_active\":{}\
 }}",
         r.anchor_id,
         r.window_count,
@@ -761,6 +829,7 @@ fn export_health_report_json(r: &AnchorHealthReport) -> String {
         r.label,
         r.trend,
         prev,
+        r.maintenance_active,
     )
 }
 
@@ -1163,5 +1232,581 @@ mod tests {
     fn scoring_weights_sum_to_one() {
         let sum = WEIGHT_SUCCESS_RATE + WEIGHT_LATENCY + WEIGHT_ROUTING_FAILURES + WEIGHT_RECOVERY;
         assert!((sum - 1.0).abs() < 1e-10, "weights sum to {sum}");
+    }
+
+    // ── Maintenance-aware health reporting ───────────────────────────────────
+
+    #[test]
+    fn build_health_report_default_maintenance_active_is_false() {
+        let w = HealthWindowBuilder::new(0, 300)
+            .successes(99).failures(1).p50_latency(100.0).routing(10, 0).recovery(0).build();
+        let report = build_health_report("anchor.example.com", &[w]);
+        assert!(!report.maintenance_active);
+    }
+
+    #[test]
+    fn build_health_report_with_maintenance_sets_flag_true() {
+        let w = HealthWindowBuilder::new(0, 300)
+            .successes(99).failures(1).p50_latency(100.0).routing(10, 0).recovery(0).build();
+        let report = build_health_report_with_maintenance("anchor.example.com", &[w], true);
+        assert!(report.maintenance_active);
+    }
+
+    #[test]
+    fn build_health_report_with_maintenance_false_matches_default() {
+        let w = HealthWindowBuilder::new(0, 300)
+            .successes(99).failures(1).p50_latency(100.0).routing(10, 0).recovery(0).build();
+        let default_report = build_health_report("anchor.example.com", &[w.clone()]);
+        let explicit_report = build_health_report_with_maintenance("anchor.example.com", &[w], false);
+        assert_eq!(default_report.maintenance_active, explicit_report.maintenance_active);
+        assert_eq!(default_report.composite_score, explicit_report.composite_score);
+    }
+
+    #[test]
+    fn should_suppress_alert_returns_true_during_maintenance() {
+        let w = HealthWindowBuilder::new(0, 300)
+            .successes(10).failures(90).p50_latency(9000.0).routing(10, 9).recovery(3600).build();
+        let report = build_health_report_with_maintenance("anchor.example.com", &[w], true);
+        assert!(report.is_critical()); // score is bad…
+        assert!(should_suppress_alert(&report)); // …but alert is suppressed
+    }
+
+    #[test]
+    fn should_suppress_alert_returns_false_outside_maintenance() {
+        let w = HealthWindowBuilder::new(0, 300)
+            .successes(10).failures(90).p50_latency(9000.0).routing(10, 9).recovery(3600).build();
+        let report = build_health_report_with_maintenance("anchor.example.com", &[w], false);
+        assert!(report.is_critical());
+        assert!(!should_suppress_alert(&report)); // not suppressed — real incident
+    }
+
+    #[test]
+    fn export_text_includes_maintenance_active_true() {
+        let w = HealthWindowBuilder::new(0, 300).successes(80).failures(20).build();
+        let report = build_health_report_with_maintenance("anc", &[w], true);
+        let text = export_health_report(&report, HealthReportFormat::Text);
+        assert!(text.contains("maintenance_active: true"), "text={text}");
+    }
+
+    #[test]
+    fn export_text_includes_maintenance_active_false() {
+        let w = HealthWindowBuilder::new(0, 300).successes(80).failures(20).build();
+        let report = build_health_report_with_maintenance("anc", &[w], false);
+        let text = export_health_report(&report, HealthReportFormat::Text);
+        assert!(text.contains("maintenance_active: false"), "text={text}");
+    }
+
+    #[test]
+    fn export_json_includes_maintenance_active_true() {
+        let w = HealthWindowBuilder::new(0, 300).successes(80).failures(20).build();
+        let report = build_health_report_with_maintenance("anc", &[w], true);
+        let json = export_health_report(&report, HealthReportFormat::Json);
+        assert!(json.contains("\"maintenance_active\":true"), "json={json}");
+    }
+
+    #[test]
+    fn export_json_includes_maintenance_active_false() {
+        let w = HealthWindowBuilder::new(0, 300).successes(80).failures(20).build();
+        let report = build_health_report_with_maintenance("anc", &[w], false);
+        let json = export_health_report(&report, HealthReportFormat::Json);
+        assert!(json.contains("\"maintenance_active\":false"), "json={json}");
+    }
+
+    #[test]
+    fn maintenance_active_does_not_alter_scores() {
+        let w = HealthWindowBuilder::new(0, 300)
+            .successes(99).failures(1).p50_latency(150.0).routing(10, 0).recovery(0).build();
+        let normal = build_health_report("anc", &[w.clone()]);
+        let maint  = build_health_report_with_maintenance("anc", &[w], true);
+        assert!((normal.composite_score - maint.composite_score).abs() < 1e-9);
+        assert_eq!(normal.label, maint.label);
+        assert_eq!(normal.trend, maint.trend);
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Service-Level Objectives (SLOs)
+// ---------------------------------------------------------------------------
+
+/// A configurable SLO target for a single anchor.
+///
+/// Each threshold is a value in [0.0, 100.0] that represents the *minimum
+/// acceptable* score on the corresponding dimension.  A value of `None` means
+/// that dimension is not included in SLO evaluation.
+///
+/// At least one threshold must be set; constructing an all-`None` target
+/// returns an error from [`SloTarget::validate`].
+#[derive(Clone, Debug)]
+pub struct SloTarget {
+    /// Minimum acceptable composite health score (0–100).
+    pub min_composite: Option<f64>,
+    /// Minimum acceptable success-rate sub-score (0–100).
+    pub min_success_rate_score: Option<f64>,
+    /// Minimum acceptable latency sub-score (0–100).
+    pub min_latency_score: Option<f64>,
+    /// Minimum acceptable routing sub-score (0–100).
+    pub min_routing_score: Option<f64>,
+    /// Minimum acceptable recovery sub-score (0–100).
+    pub min_recovery_score: Option<f64>,
+}
+
+impl SloTarget {
+    /// Construct a simple SLO that only checks the composite score.
+    pub fn composite_only(min_composite: f64) -> Self {
+        SloTarget {
+            min_composite: Some(min_composite),
+            min_success_rate_score: None,
+            min_latency_score: None,
+            min_routing_score: None,
+            min_recovery_score: None,
+        }
+    }
+
+    /// Validate that this SLO target is well-formed:
+    /// - Every configured threshold must be in [0.0, 100.0].
+    /// - At least one threshold must be set.
+    ///
+    /// Returns `Err(InvalidSloConfig)` with a descriptive context string on failure.
+    pub fn validate(&self) -> Result<(), crate::errors::AnchorKitError> {
+        let mut any = false;
+        let checks: [(&str, Option<f64>); 5] = [
+            ("min_composite",         self.min_composite),
+            ("min_success_rate_score", self.min_success_rate_score),
+            ("min_latency_score",     self.min_latency_score),
+            ("min_routing_score",     self.min_routing_score),
+            ("min_recovery_score",    self.min_recovery_score),
+        ];
+        for (name, val) in checks {
+            if let Some(v) = val {
+                any = true;
+                if !(0.0..=100.0).contains(&v) {
+                    return Err(crate::errors::AnchorKitError::invalid_slo_config(
+                        &alloc::format!("{name}={v:.2} is out of range [0, 100]"),
+                    ));
+                }
+            }
+        }
+        if !any {
+            return Err(crate::errors::AnchorKitError::invalid_slo_config(
+                "at least one SLO threshold must be configured",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The result of evaluating a single [`SloTarget`] against a [`HealthScore`].
+#[derive(Clone, Debug)]
+pub struct SloEvaluation {
+    /// `true` when all configured thresholds are met.
+    pub satisfied: bool,
+    /// Human-readable list of individual threshold outcomes.
+    pub violations: alloc::vec::Vec<SloViolationDetail>,
+}
+
+impl SloEvaluation {
+    /// Returns `true` when no thresholds were violated.
+    pub fn is_satisfied(&self) -> bool {
+        self.satisfied
+    }
+}
+
+/// Details about a single threshold violation.
+#[derive(Clone, Debug)]
+pub struct SloViolationDetail {
+    /// Name of the dimension that was violated (e.g. `"min_composite"`).
+    pub dimension: String,
+    /// The configured minimum threshold.
+    pub threshold: f64,
+    /// The actual observed value.
+    pub actual: f64,
+}
+
+impl SloViolationDetail {
+    /// Format as a human-readable string.
+    pub fn describe(&self) -> String {
+        alloc::format!(
+            "{}: required>={:.2} actual={:.2}",
+            self.dimension, self.threshold, self.actual
+        )
+    }
+}
+
+/// Evaluate a [`SloTarget`] against a [`HealthScore`].
+///
+/// Every configured threshold is checked; all violations are collected rather
+/// than stopping at the first failure.
+///
+/// # Examples
+///
+/// ```rust
+/// use anchorkit::anchor_health::{
+///     HealthWindowBuilder, score_window, SloTarget, evaluate_slo,
+/// };
+///
+/// let window = HealthWindowBuilder::new(0, 300)
+///     .successes(99).failures(1).p50_latency(100.0).routing(10, 0).recovery(0)
+///     .build();
+/// let score = score_window(&window);
+/// let target = SloTarget::composite_only(80.0);
+/// let eval = evaluate_slo(&target, &score);
+/// assert!(eval.is_satisfied());
+/// ```
+pub fn evaluate_slo(target: &SloTarget, score: &HealthScore) -> SloEvaluation {
+    let mut violations: alloc::vec::Vec<SloViolationDetail> = alloc::vec::Vec::new();
+
+    let checks: [(&str, Option<f64>, f64); 5] = [
+        ("min_composite",          target.min_composite,          score.composite),
+        ("min_success_rate_score", target.min_success_rate_score, score.success_rate_score),
+        ("min_latency_score",      target.min_latency_score,      score.latency_score),
+        ("min_routing_score",      target.min_routing_score,      score.routing_score),
+        ("min_recovery_score",     target.min_recovery_score,     score.recovery_score),
+    ];
+
+    for (dim, threshold_opt, actual) in checks {
+        if let Some(threshold) = threshold_opt {
+            if actual < threshold {
+                violations.push(SloViolationDetail {
+                    dimension: dim.into(),
+                    threshold,
+                    actual,
+                });
+            }
+        }
+    }
+
+    SloEvaluation {
+        satisfied: violations.is_empty(),
+        violations,
+    }
+}
+
+/// Evaluate SLO targets against all windows in a report and return the result.
+///
+/// When `maintenance_active` is `true` on the report the evaluation is skipped
+/// and a satisfied result is returned (planned outages should not trigger SLO
+/// violations).
+///
+/// # Examples
+///
+/// ```rust
+/// use anchorkit::anchor_health::{
+///     HealthWindowBuilder, build_health_report, SloTarget, evaluate_slo_for_report,
+/// };
+///
+/// let w = HealthWindowBuilder::new(0, 300)
+///     .successes(50).failures(50).p50_latency(8000.0).routing(10, 8).recovery(3600)
+///     .build();
+/// let report = build_health_report("anchor.example.com", &[w]);
+/// let target = SloTarget::composite_only(80.0);
+/// let eval = evaluate_slo_for_report(&report, &target);
+/// assert!(!eval.is_satisfied());
+/// assert!(!eval.violations.is_empty());
+/// ```
+pub fn evaluate_slo_for_report(report: &AnchorHealthReport, target: &SloTarget) -> SloEvaluation {
+    // Suppress SLO evaluation during planned maintenance
+    if report.maintenance_active {
+        return SloEvaluation { satisfied: true, violations: alloc::vec::Vec::new() };
+    }
+
+    let score = HealthScore {
+        composite:          report.composite_score,
+        success_rate_score: report.success_rate_score,
+        latency_score:      report.latency_score,
+        routing_score:      report.routing_score,
+        recovery_score:     report.recovery_score,
+    };
+    evaluate_slo(target, &score)
+}
+
+// ---------------------------------------------------------------------------
+// SLO-enriched health report
+// ---------------------------------------------------------------------------
+
+/// A health report that bundles an [`SloEvaluation`] alongside the standard
+/// metrics.  Produced by [`build_slo_report`].
+#[derive(Clone, Debug)]
+pub struct SloHealthReport {
+    /// The underlying health report (scores, trend, maintenance flag).
+    pub health: AnchorHealthReport,
+    /// The SLO target that was evaluated.
+    pub target: SloTarget,
+    /// The evaluation result.
+    pub evaluation: SloEvaluation,
+}
+
+impl SloHealthReport {
+    /// Returns `true` when all SLO thresholds are met (or maintenance is active).
+    pub fn is_slo_satisfied(&self) -> bool {
+        self.evaluation.is_satisfied()
+    }
+
+    /// Returns a human-readable summary of any violations.
+    pub fn violation_summary(&self) -> String {
+        if self.evaluation.violations.is_empty() {
+            return "all SLO targets met".into();
+        }
+        let parts: alloc::vec::Vec<String> = self.evaluation.violations
+            .iter()
+            .map(|v| v.describe())
+            .collect();
+        parts.join("; ")
+    }
+}
+
+/// Build an [`SloHealthReport`] from observation windows and an SLO target.
+///
+/// Returns `Err(InvalidSloConfig)` when the target fails validation.
+///
+/// # Examples
+///
+/// ```rust
+/// use anchorkit::anchor_health::{HealthWindowBuilder, SloTarget, build_slo_report};
+///
+/// let w = HealthWindowBuilder::new(0, 300)
+///     .successes(99).failures(1).p50_latency(100.0).routing(10, 0).recovery(0)
+///     .build();
+/// let target = SloTarget::composite_only(80.0);
+/// let report = build_slo_report("anchor.example.com", &[w], target, false).unwrap();
+/// assert!(report.is_slo_satisfied());
+/// ```
+pub fn build_slo_report(
+    anchor_id: &str,
+    windows: &[HealthWindow],
+    target: SloTarget,
+    maintenance_active: bool,
+) -> Result<SloHealthReport, crate::errors::AnchorKitError> {
+    target.validate()?;
+    let health = build_health_report_with_maintenance(anchor_id, windows, maintenance_active);
+    let evaluation = evaluate_slo_for_report(&health, &target);
+    Ok(SloHealthReport { health, target, evaluation })
+}
+
+// ---------------------------------------------------------------------------
+// SLO tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod slo_tests {
+    use super::*;
+
+    fn healthy_window() -> HealthWindow {
+        HealthWindowBuilder::new(0, 300)
+            .successes(99).failures(1).p50_latency(100.0).routing(10, 0).recovery(0).build()
+    }
+
+    fn critical_window() -> HealthWindow {
+        HealthWindowBuilder::new(0, 300)
+            .successes(10).failures(90).p50_latency(9000.0).routing(10, 9).recovery(3600).build()
+    }
+
+    // ── SloTarget::validate ───────────────────────────────────────────────
+
+    #[test]
+    fn validate_all_none_rejected() {
+        let t = SloTarget {
+            min_composite: None,
+            min_success_rate_score: None,
+            min_latency_score: None,
+            min_routing_score: None,
+            min_recovery_score: None,
+        };
+        let err = t.validate().expect_err("all-None SLO must be rejected");
+        assert_eq!(err.code, crate::errors::ErrorCode::InvalidSloConfig);
+    }
+
+    #[test]
+    fn validate_threshold_above_100_rejected() {
+        let t = SloTarget::composite_only(101.0);
+        let err = t.validate().expect_err("threshold > 100 must be rejected");
+        assert_eq!(err.code, crate::errors::ErrorCode::InvalidSloConfig);
+        assert!(err.context.as_deref().unwrap_or("").contains("101.00"));
+    }
+
+    #[test]
+    fn validate_threshold_below_0_rejected() {
+        let t = SloTarget::composite_only(-1.0);
+        let err = t.validate().expect_err("threshold < 0 must be rejected");
+        assert_eq!(err.code, crate::errors::ErrorCode::InvalidSloConfig);
+    }
+
+    #[test]
+    fn validate_valid_composite_only_passes() {
+        let t = SloTarget::composite_only(80.0);
+        assert!(t.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_full_target_passes() {
+        let t = SloTarget {
+            min_composite: Some(80.0),
+            min_success_rate_score: Some(70.0),
+            min_latency_score: Some(60.0),
+            min_routing_score: Some(75.0),
+            min_recovery_score: Some(50.0),
+        };
+        assert!(t.validate().is_ok());
+    }
+
+    // ── evaluate_slo — satisfied ──────────────────────────────────────────
+
+    #[test]
+    fn evaluate_slo_satisfied_for_healthy_anchor() {
+        let score = score_window(&healthy_window());
+        let target = SloTarget::composite_only(80.0);
+        let eval = evaluate_slo(&target, &score);
+        assert!(eval.is_satisfied());
+        assert!(eval.violations.is_empty());
+    }
+
+    #[test]
+    fn evaluate_slo_satisfied_when_exactly_at_threshold() {
+        let score = score_window(&healthy_window());
+        // Use a threshold exactly equal to the computed composite
+        let target = SloTarget::composite_only(score.composite);
+        let eval = evaluate_slo(&target, &score);
+        assert!(eval.is_satisfied(), "exact threshold must be satisfied");
+    }
+
+    // ── evaluate_slo — violated ───────────────────────────────────────────
+
+    #[test]
+    fn evaluate_slo_violated_for_critical_anchor() {
+        let score = score_window(&critical_window());
+        let target = SloTarget::composite_only(80.0);
+        let eval = evaluate_slo(&target, &score);
+        assert!(!eval.is_satisfied());
+        assert_eq!(eval.violations.len(), 1);
+        assert_eq!(eval.violations[0].dimension, "min_composite");
+    }
+
+    #[test]
+    fn evaluate_slo_collects_multiple_violations() {
+        let score = score_window(&critical_window());
+        let target = SloTarget {
+            min_composite: Some(80.0),
+            min_success_rate_score: Some(90.0),
+            min_latency_score: Some(80.0),
+            min_routing_score: Some(80.0),
+            min_recovery_score: Some(80.0),
+        };
+        let eval = evaluate_slo(&target, &score);
+        assert!(!eval.is_satisfied());
+        assert!(eval.violations.len() > 1, "multiple violations expected");
+    }
+
+    #[test]
+    fn violation_detail_describe_format() {
+        let d = SloViolationDetail {
+            dimension: "min_composite".into(),
+            threshold: 80.0,
+            actual: 42.5,
+        };
+        let s = d.describe();
+        assert!(s.contains("min_composite"), "desc={s}");
+        assert!(s.contains("80.00"), "desc={s}");
+        assert!(s.contains("42.50"), "desc={s}");
+    }
+
+    // ── evaluate_slo_for_report ───────────────────────────────────────────
+
+    #[test]
+    fn evaluate_slo_for_report_satisfied_for_healthy() {
+        let report = build_health_report("anc", &[healthy_window()]);
+        let target = SloTarget::composite_only(80.0);
+        let eval = evaluate_slo_for_report(&report, &target);
+        assert!(eval.is_satisfied());
+    }
+
+    #[test]
+    fn evaluate_slo_for_report_violated_for_critical() {
+        let report = build_health_report("anc", &[critical_window()]);
+        let target = SloTarget::composite_only(80.0);
+        let eval = evaluate_slo_for_report(&report, &target);
+        assert!(!eval.is_satisfied());
+    }
+
+    #[test]
+    fn evaluate_slo_for_report_suppressed_during_maintenance() {
+        // Even a critical report must be treated as satisfied when maintenance is active
+        let report = build_health_report_with_maintenance("anc", &[critical_window()], true);
+        let target = SloTarget::composite_only(80.0);
+        let eval = evaluate_slo_for_report(&report, &target);
+        assert!(
+            eval.is_satisfied(),
+            "SLO evaluation must be suppressed during maintenance"
+        );
+        assert!(eval.violations.is_empty());
+    }
+
+    // ── build_slo_report ──────────────────────────────────────────────────
+
+    #[test]
+    fn build_slo_report_satisfied_healthy_anchor() {
+        let target = SloTarget::composite_only(80.0);
+        let report = build_slo_report("anc", &[healthy_window()], target, false).unwrap();
+        assert!(report.is_slo_satisfied());
+        assert_eq!(report.violation_summary(), "all SLO targets met");
+    }
+
+    #[test]
+    fn build_slo_report_violated_critical_anchor() {
+        let target = SloTarget::composite_only(80.0);
+        let report = build_slo_report("anc", &[critical_window()], target, false).unwrap();
+        assert!(!report.is_slo_satisfied());
+        let summary = report.violation_summary();
+        assert!(summary.contains("min_composite"), "summary={summary}");
+    }
+
+    #[test]
+    fn build_slo_report_suppressed_during_maintenance() {
+        let target = SloTarget::composite_only(80.0);
+        let report = build_slo_report("anc", &[critical_window()], target, true).unwrap();
+        assert!(
+            report.is_slo_satisfied(),
+            "SLO must be suppressed during maintenance"
+        );
+    }
+
+    #[test]
+    fn build_slo_report_rejects_invalid_target() {
+        let bad_target = SloTarget::composite_only(110.0);
+        let err = build_slo_report("anc", &[healthy_window()], bad_target, false)
+            .expect_err("invalid target must be rejected");
+        assert_eq!(err.code, crate::errors::ErrorCode::InvalidSloConfig);
+    }
+
+    #[test]
+    fn build_slo_report_carries_health_data() {
+        let target = SloTarget::composite_only(50.0);
+        let report = build_slo_report("myanchor", &[healthy_window()], target, false).unwrap();
+        assert_eq!(report.health.anchor_id, "myanchor");
+        assert!(report.health.composite_score > 80.0);
+    }
+
+    #[test]
+    fn violation_summary_lists_all_violations() {
+        let target = SloTarget {
+            min_composite: Some(80.0),
+            min_success_rate_score: Some(90.0),
+            min_latency_score: None,
+            min_routing_score: None,
+            min_recovery_score: None,
+        };
+        let report = build_slo_report("anc", &[critical_window()], target, false).unwrap();
+        let summary = report.violation_summary();
+        assert!(summary.contains("min_composite"), "summary={summary}");
+        assert!(summary.contains("min_success_rate_score"), "summary={summary}");
+    }
+
+    #[test]
+    fn slo_target_composite_only_constructor() {
+        let t = SloTarget::composite_only(75.0);
+        assert_eq!(t.min_composite, Some(75.0));
+        assert!(t.min_success_rate_score.is_none());
+        assert!(t.min_latency_score.is_none());
+        assert!(t.min_routing_score.is_none());
+        assert!(t.min_recovery_score.is_none());
     }
 }

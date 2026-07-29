@@ -30,5 +30,17 @@ if ! cargo test --all-features > /dev/null 2>&1; then
 fi
 echo "  ✓ Tests OK"
 
+# Documentation lint (only when markdown files are staged)
+STAGED_MD=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.md$' || true)
+if [[ -n "$STAGED_MD" ]]; then
+    echo "  → Linting staged documentation..."
+    if ! bash scripts/validate-docs.sh 2>&1 | grep -q "✓ Documentation lint passed"; then
+        echo "  ✗ Documentation lint failed. Run 'bash scripts/validate-docs.sh' for details."
+        echo "     Use 'bash scripts/validate-docs.sh --fix' to auto-fix formatting issues."
+        exit 1
+    fi
+    echo "  ✓ Documentation lint OK"
+fi
+
 echo "✓ All pre-commit checks passed!"
 exit 0
