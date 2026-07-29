@@ -19,7 +19,8 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use crate::retry::{retry_with_backoff, LedgerJitterSource, RetryConfig};
+use crate::retry::{retry_with_backoff_traced, LedgerJitterSource, RetryConfig};
+use crate::trace_context::TraceContext;
 use crate::transaction_state_tracker::TransactionState;
 
 // ── PollResult ────────────────────────────────────────────────────────────────
@@ -72,6 +73,14 @@ pub struct StateTransition {
     pub to: TransactionState,
     /// Timestamp (milliseconds) when the transition was detected.
     pub timestamp: u64,
+    /// Trace ID of the monitoring run that observed this transition.
+    ///
+    /// Constant for the lifetime of one monitor, so an operator can join the
+    /// recorded transitions of a long-running background poll against the
+    /// request that started it.
+    pub trace_id: alloc::string::String,
+    /// Span ID of the poll cycle that observed this transition.
+    pub span_id: alloc::string::String,
 }
 
 // ── BackpressureConfig ────────────────────────────────────────────────────────
@@ -150,6 +159,13 @@ pub struct StreamingTransactionMonitor {
     transitions: Vec<StateTransition>,
     /// Backpressure configuration.
     backpressure: BackpressureConfig,
+    /// Trace context the whole monitoring run belongs to.
+    ///
+    /// Defaults to a context derived from the transaction ID so a monitor
+    /// started without one is still traceable; use
+    /// [`with_trace`](Self::with_trace) to attach the originating request's
+    /// context instead.
+    trace: TraceContext,
 }
 
 impl StreamingTransactionMonitor {
@@ -160,6 +176,7 @@ impl StreamingTransactionMonitor {
             retry_config: RetryConfig::default(),
             transitions: Vec::new(),
             backpressure: BackpressureConfig::default(),
+            trace: default_monitor_trace(transaction_id),
         }
     }
 
@@ -172,6 +189,34 @@ impl StreamingTransactionMonitor {
     pub fn with_backpressure(mut self, config: BackpressureConfig) -> Self {
         self.backpressure = config;
         self
+    }
+
+    /// Attach the trace context this monitoring run belongs to.
+    ///
+    /// The monitor records a `monitor:<transaction_id>` child span of `trace`,
+    /// so a background poll that outlives the request that started it still
+    /// carries that request's trace ID.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use anchorkit::streaming_monitor::StreamingTransactionMonitor;
+    /// use anchorkit::trace_context::TraceContext;
+    ///
+    /// let request = TraceContext::root_from_seed("sep24:deposit-1");
+    /// let monitor = StreamingTransactionMonitor::new(7, 1000).with_trace(&request);
+    /// assert_eq!(monitor.trace().trace_id(), request.trace_id());
+    /// ```
+    pub fn with_trace(mut self, trace: &TraceContext) -> Self {
+        let mut seed = alloc::string::String::from("monitor:");
+        seed.push_str(&alloc::format!("{}", self.transaction_id));
+        self.trace = trace.child(&seed);
+        self
+    }
+
+    /// The trace context this monitor runs under.
+    pub fn trace(&self) -> &TraceContext {
+        &self.trace
     }
 
     /// Return a copy of all recorded state transitions since the monitor started
@@ -187,9 +232,19 @@ impl StreamingTransactionMonitor {
 
     /// Record a transition, respecting the backpressure config (cap + coalescing).
     ///
+    /// `poll_trace` is the context of the poll cycle that observed the change;
+    /// its identifiers are stored on the entry so the transition history stays
+    /// joinable with the delivery and retry logs.
+    ///
     /// Returns `true` if the transition was recorded, `false` if it was
     /// coalesced away because it duplicates the most recent entry.
-    fn record_transition(&mut self, from: TransactionState, to: TransactionState, timestamp: u64) -> bool {
+    fn record_transition(
+        &mut self,
+        from: TransactionState,
+        to: TransactionState,
+        timestamp: u64,
+        poll_trace: &TraceContext,
+    ) -> bool {
         if self.backpressure.coalesce_across_polls {
             if let Some(last) = self.transitions.last() {
                 if last.from == from && last.to == to {
@@ -198,7 +253,13 @@ impl StreamingTransactionMonitor {
             }
         }
 
-        self.transitions.push(StateTransition { from, to, timestamp });
+        self.transitions.push(StateTransition {
+            from,
+            to,
+            timestamp,
+            trace_id: poll_trace.trace_id().into(),
+            span_id: poll_trace.span_id().into(),
+        });
 
         if self.backpressure.max_queued_transitions > 0 {
             while self.transitions.len() > self.backpressure.max_queued_transitions {
@@ -220,11 +281,67 @@ impl StreamingTransactionMonitor {
     pub fn run<P, E, S, T>(
         &mut self,
         mut poll_fn: P,
+        on_event: E,
+        sleep_fn: S,
+        timestamp_fn: T,
+    ) where
+        P: FnMut(u64) -> Result<PollResult, alloc::string::String>,
+        E: FnMut(TransactionStatusUpdate),
+        S: FnMut(u64),
+        T: Fn() -> u64,
+    {
+        self.run_traced(
+            |id, _trace| poll_fn(id),
+            on_event,
+            sleep_fn,
+            timestamp_fn,
+        )
+    }
+
+    /// Run the monitor, handing each poll its trace context.
+    ///
+    /// Identical to [`run`](Self::run) except that `poll_fn` also receives the
+    /// [`TraceContext`] of the attempt it is serving, so the outbound status
+    /// request can carry `traceparent` headers. Every poll cycle is a child
+    /// span of the monitor span, and every retry within a cycle is a child of
+    /// that — all sharing the monitor's trace ID for the lifetime of the run.
+    ///
+    /// - `poll_fn`: given a transaction ID and the attempt's trace context,
+    ///   returns `Ok(PollResult)` or `Err(String)`.
+    /// - `on_event`: called for every [`TransactionStatusUpdate`] emitted.
+    /// - `sleep_fn`: called with the poll interval (ms) between polls.
+    /// - `timestamp_fn`: called when emitting `StateChanged` events.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use anchorkit::streaming_monitor::{PollResult, StreamingTransactionMonitor};
+    /// use anchorkit::trace_context::TraceContext;
+    ///
+    /// let request = TraceContext::root_from_seed("sep24:deposit-1");
+    /// let mut monitor = StreamingTransactionMonitor::new(7, 0).with_trace(&request);
+    /// let mut seen = Vec::new();
+    ///
+    /// monitor.run_traced(
+    ///     |_id, trace| {
+    ///         seen.push(trace.trace_id().to_string());
+    ///         Ok(PollResult::Completed { stellar_tx_id: "abc".into() })
+    ///     },
+    ///     |_event| {},
+    ///     |_ms| {},
+    ///     || 0,
+    /// );
+    ///
+    /// assert!(seen.iter().all(|id| id == request.trace_id()));
+    /// ```
+    pub fn run_traced<P, E, S, T>(
+        &mut self,
+        mut poll_fn: P,
         mut on_event: E,
         mut sleep_fn: S,
         timestamp_fn: T,
     ) where
-        P: FnMut(u64) -> Result<PollResult, alloc::string::String>,
+        P: FnMut(u64, &TraceContext) -> Result<PollResult, alloc::string::String>,
         E: FnMut(TransactionStatusUpdate),
         S: FnMut(u64),
         T: Fn() -> u64,
@@ -235,10 +352,21 @@ impl StreamingTransactionMonitor {
             timestamp_fn(),
         );
 
+        let monitor_trace = self.trace.clone();
+        let transaction_id = self.transaction_id;
+        let retry_config = self.retry_config.clone();
+        // Poll cycles are numbered so each one is its own span; the counter is
+        // what makes a long-running background monitor readable in a trace.
+        let mut cycle: u32 = 0;
+
         loop {
-            let result = retry_with_backoff(
-                &self.retry_config,
-                |_| poll_fn(self.transaction_id),
+            let cycle_trace = monitor_trace.child_for_attempt(cycle);
+            cycle = cycle.wrapping_add(1);
+
+            let result = retry_with_backoff_traced(
+                &retry_config,
+                &cycle_trace,
+                |_, attempt_trace| poll_fn(transaction_id, attempt_trace),
                 |_| true,
                 |ms| sleep_fn(ms),
                 &mut jitter,
@@ -248,7 +376,7 @@ impl StreamingTransactionMonitor {
                 Err(reason) => {
                     if let Some(prev) = last_state {
                         let ts = timestamp_fn();
-                        self.record_transition(prev, TransactionState::Failed, ts);
+                        self.record_transition(prev, TransactionState::Failed, ts, &cycle_trace);
                         on_event(TransactionStatusUpdate::StateChanged {
                             from: prev,
                             to: TransactionState::Failed,
@@ -261,7 +389,7 @@ impl StreamingTransactionMonitor {
                 Ok(PollResult::Failed { reason }) => {
                     if let Some(prev) = last_state {
                         let ts = timestamp_fn();
-                        self.record_transition(prev, TransactionState::Failed, ts);
+                        self.record_transition(prev, TransactionState::Failed, ts, &cycle_trace);
                         on_event(TransactionStatusUpdate::StateChanged {
                             from: prev,
                             to: TransactionState::Failed,
@@ -274,7 +402,7 @@ impl StreamingTransactionMonitor {
                 Ok(PollResult::Completed { stellar_tx_id }) => {
                     if let Some(prev) = last_state {
                         let ts = timestamp_fn();
-                        self.record_transition(prev, TransactionState::Completed, ts);
+                        self.record_transition(prev, TransactionState::Completed, ts, &cycle_trace);
                         on_event(TransactionStatusUpdate::StateChanged {
                             from: prev,
                             to: TransactionState::Completed,
@@ -291,7 +419,7 @@ impl StreamingTransactionMonitor {
                     if let Some(prev) = last_state {
                         if prev != current_state {
                             let ts = timestamp_fn();
-                            self.record_transition(prev, current_state, ts);
+                            self.record_transition(prev, current_state, ts, &cycle_trace);
                             on_event(TransactionStatusUpdate::StateChanged {
                                 from: prev,
                                 to: current_state,
@@ -300,7 +428,12 @@ impl StreamingTransactionMonitor {
                         }
                     } else {
                         let ts = timestamp_fn();
-                        self.record_transition(TransactionState::Pending, current_state, ts);
+                        self.record_transition(
+                            TransactionState::Pending,
+                            current_state,
+                            ts,
+                            &cycle_trace,
+                        );
                     }
 
                     if !will_coalesce {
@@ -319,6 +452,14 @@ impl StreamingTransactionMonitor {
             sleep_fn(self.poll_interval_ms);
         }
     }
+}
+
+/// Trace context used by a monitor that was not given one.
+///
+/// Derived from the transaction ID so repeated monitoring of the same
+/// transaction shares a trace ID, and so background work is never untraced.
+fn default_monitor_trace(transaction_id: u64) -> TraceContext {
+    TraceContext::root_from_seed(&alloc::format!("monitor:{}", transaction_id))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -713,5 +854,170 @@ mod tests {
         let bp = BackpressureConfig { max_queued_transitions: 5, coalesce_updates: false, coalesce_across_polls: false };
         let monitor = StreamingTransactionMonitor::new(1, 0).with_backpressure(bp.clone());
         assert_eq!(monitor.backpressure.max_queued_transitions, 5);
+    }
+
+    // ── Issue #610 — trace context across background monitoring ───────────────
+
+    use alloc::string::{String, ToString};
+
+    /// A monitor started under a request keeps that request's trace ID for
+    /// every poll, across every poll cycle and every retry within a cycle.
+    #[test]
+    fn test_trace_survives_polls_and_retries() {
+        let request = TraceContext::root_from_seed("sep24:deposit-1");
+        let mut monitor = StreamingTransactionMonitor::new(7, 0).with_trace(&request);
+        let mut seen: Vec<String> = Vec::new();
+        let mut calls = 0u32;
+
+        monitor.run_traced(
+            |_id, trace| {
+                seen.push(trace.trace_id().to_string());
+                calls += 1;
+                match calls {
+                    // First cycle: two transient failures then a pending state,
+                    // exercising the retry path inside a poll cycle.
+                    1 | 2 => Err(String::from("transient")),
+                    3 => Ok(PollResult::Pending(TransactionState::InProgress)),
+                    _ => Ok(PollResult::Completed {
+                        stellar_tx_id: String::from("tx-1"),
+                    }),
+                }
+            },
+            |_e| {},
+            |_| {},
+            || 1_000,
+        );
+
+        assert!(seen.len() >= 4, "expected retries and multiple cycles: {seen:?}");
+        assert!(
+            seen.iter().all(|id| id == request.trace_id()),
+            "trace_id must survive background polling: {seen:?}"
+        );
+    }
+
+    /// Each poll cycle is its own span, and retries within a cycle are children
+    /// of that cycle — so the trace shows cycles and attempts separately.
+    #[test]
+    fn test_poll_cycles_and_attempts_have_distinct_spans() {
+        let request = TraceContext::root_from_seed("sep24:deposit-2");
+        let mut monitor = StreamingTransactionMonitor::new(7, 0).with_trace(&request);
+        let monitor_span = monitor.trace().clone();
+        let mut spans: Vec<String> = Vec::new();
+        let mut parents: Vec<String> = Vec::new();
+        let mut calls = 0u32;
+
+        monitor.run_traced(
+            |_id, trace| {
+                spans.push(trace.span_id().to_string());
+                parents.push(trace.parent_span_id().unwrap_or_default().to_string());
+                calls += 1;
+                match calls {
+                    1 => Ok(PollResult::Pending(TransactionState::Pending)),
+                    2 => Ok(PollResult::Pending(TransactionState::InProgress)),
+                    _ => Ok(PollResult::Completed {
+                        stellar_tx_id: String::from("tx-2"),
+                    }),
+                }
+            },
+            |_e| {},
+            |_| {},
+            || 1_000,
+        );
+
+        assert_eq!(spans.len(), 3);
+        assert_ne!(spans[0], spans[1], "each poll cycle gets its own span");
+        assert_ne!(spans[1], spans[2]);
+        // Cycle N's attempt span is parented to cycle N's span, which is itself
+        // a child of the monitor span.
+        let cycle_spans: Vec<String> = (0..3u32)
+            .map(|c| monitor_span.child_for_attempt(c).span_id().to_string())
+            .collect();
+        assert_eq!(parents, cycle_spans);
+    }
+
+    /// Recorded transitions carry the trace, so the transition history can be
+    /// joined against the delivery and retry logs.
+    #[test]
+    fn test_recorded_transitions_carry_the_trace() {
+        let request = TraceContext::root_from_seed("sep24:deposit-3");
+        let mut monitor = StreamingTransactionMonitor::new(7, 0).with_trace(&request);
+        let mut calls = 0u32;
+
+        monitor.run_traced(
+            |_id, _trace| {
+                calls += 1;
+                match calls {
+                    1 => Ok(PollResult::Pending(TransactionState::Pending)),
+                    2 => Ok(PollResult::Pending(TransactionState::InProgress)),
+                    _ => Ok(PollResult::Completed {
+                        stellar_tx_id: String::from("tx-3"),
+                    }),
+                }
+            },
+            |_e| {},
+            |_| {},
+            || 1_000,
+        );
+
+        let transitions = monitor.get_transitions();
+        assert!(!transitions.is_empty());
+        assert!(
+            transitions.iter().all(|t| t.trace_id == request.trace_id()),
+            "every transition should name the originating trace"
+        );
+        assert!(transitions.iter().all(|t| !t.span_id.is_empty()));
+    }
+
+    /// A monitor with no caller-supplied context still gets a valid, stable one,
+    /// so background work is never untraced.
+    #[test]
+    fn test_monitor_without_caller_trace_is_still_traced() {
+        let a = StreamingTransactionMonitor::new(42, 0);
+        let b = StreamingTransactionMonitor::new(42, 0);
+        let c = StreamingTransactionMonitor::new(43, 0);
+
+        assert_eq!(a.trace().trace_id(), b.trace().trace_id());
+        assert_ne!(a.trace().trace_id(), c.trace().trace_id());
+        assert_eq!(
+            a.trace().trace_id().len(),
+            crate::trace_context::TRACE_ID_HEX_LEN
+        );
+    }
+
+    /// `with_trace` re-parents the monitor under the caller's request.
+    #[test]
+    fn test_with_trace_reparents_the_monitor_span() {
+        let request = TraceContext::root_from_seed("sep24:deposit-4");
+        let monitor = StreamingTransactionMonitor::new(7, 0).with_trace(&request);
+        assert_eq!(monitor.trace().trace_id(), request.trace_id());
+        assert_eq!(monitor.trace().parent_span_id(), Some(request.span_id()));
+    }
+
+    /// The untraced `run` still drives `run_traced` underneath, so its polls
+    /// are traced too.
+    #[test]
+    fn test_untraced_run_still_records_traced_transitions() {
+        let mut monitor = StreamingTransactionMonitor::new(9, 0);
+        let expected_trace = monitor.trace().trace_id().to_string();
+        let mut calls = 0u32;
+
+        monitor.run(
+            |_id| {
+                calls += 1;
+                match calls {
+                    1 => Ok(PollResult::Pending(TransactionState::Pending)),
+                    _ => Ok(PollResult::Completed {
+                        stellar_tx_id: String::from("tx-4"),
+                    }),
+                }
+            },
+            |_e| {},
+            |_| {},
+            || 1_000,
+        );
+
+        let transitions = monitor.get_transitions();
+        assert!(!transitions.is_empty());
+        assert!(transitions.iter().all(|t| t.trace_id == expected_trace));
     }
 }

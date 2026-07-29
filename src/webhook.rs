@@ -21,7 +21,8 @@ use core::cell::RefCell;
 
 use crate::{
     errors::{AnchorKitError, ErrorCode},
-    retry::{retry_with_backoff, RetryConfig},
+    retry::{retry_with_backoff_traced, RetryConfig},
+    trace_context::TraceContext,
 };
 
 // ---------------------------------------------------------------------------
@@ -606,6 +607,10 @@ impl DlqStorage {
 // ---------------------------------------------------------------------------
 
 /// Structured record stored in the DLQ when all delivery attempts are exhausted.
+///
+/// The trace fields make a dead-lettered webhook traceable back to the request
+/// that produced it: `trace_id` matches every log line emitted along the way,
+/// and `last_attempt_span_id` points at the specific attempt that gave up.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DlqEntry {
     /// The payload that failed to deliver.
@@ -618,6 +623,13 @@ pub struct DlqEntry {
     pub attempts_made: u32,
     /// Human-readable description of the last error.
     pub last_error: String,
+    /// Trace ID of the request this delivery belonged to.
+    pub trace_id: String,
+    /// Span ID of the delivery step (parent of every attempt span).
+    pub span_id: String,
+    /// Span ID of the final attempt — the one whose failure caused the
+    /// dead-letter, and the span to search for in delivery logs.
+    pub last_attempt_span_id: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -638,16 +650,140 @@ pub struct DlqEntry {
 ///
 /// On total failure a [`DlqEntry`] is appended to `dlq` under
 /// `config.dead_letter_storage_key` and an `AnchorKitError` is returned.
+///
+/// # Trace context
+///
+/// Callers that already hold a [`TraceContext`] should prefer
+/// [`deliver_webhook_traced`], which propagates it into the delivery attempts,
+/// the outbound headers, the logs and the DLQ entry. This function keeps its
+/// original signature for existing call sites and derives a deterministic
+/// context from the endpoint, the DLQ key and the payload, so a dead-lettered
+/// webhook is still traceable even when the caller has no context to pass.
 pub fn deliver_webhook<H, S, T>(
     config: &WebhookDeliveryConfig,
     payload: &str,
+    dlq: &mut BTreeMap<String, Vec<DlqEntry>>,
+    http_post: H,
+    sleep_fn: S,
+    now_fn: T,
+) -> Result<(), AnchorKitError>
+where
+    H: Fn(&str, &str, Option<&str>) -> Result<u16, String>,
+    S: FnMut(u64),
+    T: Fn() -> u64,
+{
+    let trace = derive_delivery_trace(config, payload);
+    deliver_webhook_traced(
+        config,
+        payload,
+        &trace,
+        dlq,
+        |url, body, sig, _trace| http_post(url, body, sig),
+        sleep_fn,
+        now_fn,
+    )
+}
+
+/// Derive a deterministic delivery trace for callers that supplied none.
+///
+/// Seeding on endpoint + DLQ key + payload means two deliveries of the same
+/// payload to the same endpoint share a trace ID, which is the behaviour an
+/// operator investigating a repeatedly failing webhook wants.
+fn derive_delivery_trace(config: &WebhookDeliveryConfig, payload: &str) -> TraceContext {
+    let seed = format!(
+        "webhook:{}:{}:{}",
+        config.endpoint_url, config.dead_letter_storage_key, payload
+    );
+    TraceContext::root_from_seed(&seed)
+}
+
+/// Deliver a webhook with backoff retry, propagating `trace` through every
+/// attempt.
+///
+/// This is [`deliver_webhook`] with the trace context made explicit. It is the
+/// entry point to use when a webhook is delivered as part of a larger request:
+/// pass the request's context and the whole delivery — including each retry —
+/// stays attached to that trace.
+///
+/// The context reaches four places:
+///
+/// 1. **The transport.** `http_post` receives the attempt's [`TraceContext`],
+///    so it can attach `traceparent` / `X-Trace-Id` / `X-Span-Id` headers via
+///    [`TraceContext::header_pairs`].
+/// 2. **The attempt spans.** Attempt *n* runs under
+///    `delivery_span.child_for_attempt(n)`, so retries are distinguishable but
+///    share the trace ID.
+/// 3. **The logs.** Every failed attempt logs its trace and span IDs.
+/// 4. **The DLQ.** The resulting [`DlqEntry`] records the trace ID, the delivery
+///    span and the span of the final attempt.
+///
+/// # Arguments
+///
+/// * `config` - Endpoint, retry parameters, DLQ key and optional signing key.
+/// * `payload` - The request body to POST.
+/// * `trace` - The context this delivery runs under. A `webhook-delivery` child
+///   span is derived from it so the delivery is its own step in the trace.
+/// * `dlq` - Dead-letter map; an entry is appended on total exhaustion.
+/// * `http_post` - Injectable transport
+///   `(url, body, signature_header, trace) -> Result<status, error>`.
+/// * `sleep_fn` - Called with the backoff delay (ms) between attempts.
+/// * `now_fn` - Returns the current Unix timestamp in seconds.
+///
+/// # Errors
+///
+/// Returns [`ErrorCode::WebhookDeliveryFailed`] when every attempt fails. The
+/// error context includes the trace and span IDs so the failure can be
+/// correlated with the delivery logs.
+///
+/// # Examples
+///
+/// ```rust
+/// use std::collections::BTreeMap;
+/// use anchorkit::retry::RetryConfig;
+/// use anchorkit::trace_context::TraceContext;
+/// use anchorkit::webhook::{deliver_webhook_traced, WebhookDeliveryConfig};
+///
+/// let config = WebhookDeliveryConfig {
+///     endpoint_url: "https://example.com/hook".into(),
+///     timeout_ms: 1_000,
+///     retry_config: RetryConfig::new(3, 0, 0, 1),
+///     dead_letter_storage_key: "hooks".into(),
+///     signing_key: None,
+///     max_payload_age_seconds: None,
+///     require_nonce_for_replay_protection: false,
+/// };
+///
+/// let request_trace = TraceContext::root_from_seed("deposit:txn-001");
+/// let mut dlq = BTreeMap::new();
+/// let mut header_values = Vec::new();
+///
+/// let result = deliver_webhook_traced(
+///     &config,
+///     r#"{"event":"deposit"}"#,
+///     &request_trace,
+///     &mut dlq,
+///     |_url, _body, _sig, trace| {
+///         header_values.push(trace.to_traceparent());
+///         Ok(200)
+///     },
+///     |_ms| {},
+///     || 1_000_000,
+/// );
+///
+/// assert!(result.is_ok());
+/// assert!(header_values[0].contains(request_trace.trace_id()));
+/// ```
+pub fn deliver_webhook_traced<H, S, T>(
+    config: &WebhookDeliveryConfig,
+    payload: &str,
+    trace: &TraceContext,
     dlq: &mut BTreeMap<String, Vec<DlqEntry>>,
     http_post: H,
     mut sleep_fn: S,
     now_fn: T,
 ) -> Result<(), AnchorKitError>
 where
-    H: Fn(&str, &str, Option<&str>) -> Result<u16, String>,
+    H: Fn(&str, &str, Option<&str>, &TraceContext) -> Result<u16, String>,
     S: FnMut(u64),
     T: Fn() -> u64,
 {
@@ -658,23 +794,33 @@ where
         alloc::format!("sha256={}", hex)
     });
 
+    // The delivery is its own step under the caller's trace, so retries hang off
+    // a span that means "webhook delivery" rather than off the caller directly.
+    let delivery_span = trace.child("webhook-delivery");
+
     let last_error_msg: RefCell<String> = RefCell::new(String::new());
     let last_status: RefCell<u16> = RefCell::new(0);
+    let last_attempt_span: RefCell<String> = RefCell::new(delivery_span.span_id().to_string());
 
     let mut jitter_source = crate::retry::LedgerJitterSource::new(0, now_fn());
-    let result = retry_with_backoff(
+    let result = retry_with_backoff_traced(
         &retry_cfg,
-        |attempt| {
+        &delivery_span,
+        |_attempt, attempt_trace| {
             let sig_ref = sig_header.as_deref();
-            let (status, msg) = match http_post(&config.endpoint_url, payload, sig_ref) {
-                Ok(s) if s < 400 => return Ok(()),
-                Ok(s) => (s, format!("HTTP {s}")),
-                Err(e) => (0, e),
-            };
+            *last_attempt_span.borrow_mut() = attempt_trace.span_id().to_string();
+
+            let (status, msg) =
+                match http_post(&config.endpoint_url, payload, sig_ref, attempt_trace) {
+                    Ok(s) if s < 400 => return Ok(()),
+                    Ok(s) => (s, format!("HTTP {s}")),
+                    Err(e) => (0, e),
+                };
             #[cfg(feature = "std")]
             std::eprintln!(
-                "[webhook] attempt={} status={} error=\"{}\"",
-                attempt + 1,
+                "[webhook] {} attempt={} status={} error=\"{}\"",
+                attempt_trace.log_fields(),
+                _attempt + 1,
                 status,
                 msg
             );
@@ -692,6 +838,7 @@ where
         Err(e) => {
             let last = last_error_msg.into_inner();
             let status = last_status.into_inner();
+            let last_span = last_attempt_span.into_inner();
             let attempts_made = config.retry_config.max_attempts;
             let entry = DlqEntry {
                 payload: payload.to_string(),
@@ -699,6 +846,9 @@ where
                 last_status_code: status,
                 attempts_made,
                 last_error: last.clone(),
+                trace_id: delivery_span.trace_id().to_string(),
+                span_id: delivery_span.span_id().to_string(),
+                last_attempt_span_id: last_span.clone(),
             };
             dlq.entry(config.dead_letter_storage_key.clone())
                 .or_default()
@@ -710,70 +860,41 @@ where
                     "Webhook delivery failed after {} attempt(s): {}",
                     attempts_made, e
                 ),
-                &format!("attempts_made={} last_status={} last_error={}", attempts_made, status, last),
+                &format!(
+                    "attempts_made={} last_status={} last_error={} {} last_attempt_span_id={}",
+                    attempts_made,
+                    status,
+                    last,
+                    delivery_span.log_fields(),
+                    last_span
+                ),
             ))
         }
     }
 }
 
-/// Like [`deliver_webhook`], additionally recording delivery metrics.
+/// Return the DLQ entries recorded under `key` that belong to `trace_id`.
 ///
-/// Emitted metrics (see [`crate::metrics::names`]):
+/// The operator-facing counterpart to trace propagation: given a trace ID from
+/// a log line, find every webhook that dead-lettered under that request.
 ///
-/// * [`names::WEBHOOK_DELIVERIES`] — one per call.
-/// * [`names::WEBHOOK_ATTEMPTS`] — one per HTTP POST attempt, retries included.
-/// * [`names::WEBHOOK_SUCCESSES`] / [`names::WEBHOOK_FAILURES`] — final outcome.
-/// * [`names::WEBHOOK_DLQ_ENTRIES`] — counter, one per entry written to the DLQ.
-/// * [`names::WEBHOOK_DLQ_DEPTH`] — gauge, total entries across all DLQ keys
-///   after this delivery (a resource-usage signal for DLQ growth).
+/// # Examples
 ///
-/// Delegates to [`deliver_webhook`] so delivery semantics stay identical.
+/// ```rust
+/// use std::collections::BTreeMap;
+/// use anchorkit::webhook::{dlq_entries_for_trace, DlqEntry};
 ///
-/// [`names::WEBHOOK_DELIVERIES`]: crate::metrics::names::WEBHOOK_DELIVERIES
-/// [`names::WEBHOOK_ATTEMPTS`]: crate::metrics::names::WEBHOOK_ATTEMPTS
-/// [`names::WEBHOOK_SUCCESSES`]: crate::metrics::names::WEBHOOK_SUCCESSES
-/// [`names::WEBHOOK_FAILURES`]: crate::metrics::names::WEBHOOK_FAILURES
-/// [`names::WEBHOOK_DLQ_ENTRIES`]: crate::metrics::names::WEBHOOK_DLQ_ENTRIES
-/// [`names::WEBHOOK_DLQ_DEPTH`]: crate::metrics::names::WEBHOOK_DLQ_DEPTH
-pub fn deliver_webhook_metered<H, S, T>(
-    config: &WebhookDeliveryConfig,
-    payload: &str,
-    dlq: &mut BTreeMap<String, Vec<DlqEntry>>,
-    http_post: H,
-    sleep_fn: S,
-    now_fn: T,
-    metrics: &crate::metrics::MetricsRegistry,
-) -> Result<(), AnchorKitError>
-where
-    H: Fn(&str, &str, Option<&str>) -> Result<u16, String>,
-    S: FnMut(u64),
-    T: Fn() -> u64,
-{
-    use crate::metrics::names;
-
-    metrics.incr(names::WEBHOOK_DELIVERIES);
-    let result = deliver_webhook(
-        config,
-        payload,
-        dlq,
-        |url, body, sig| {
-            metrics.incr(names::WEBHOOK_ATTEMPTS);
-            http_post(url, body, sig)
-        },
-        sleep_fn,
-        now_fn,
-    );
-    match &result {
-        Ok(()) => metrics.incr(names::WEBHOOK_SUCCESSES),
-        Err(_) => {
-            metrics.incr(names::WEBHOOK_FAILURES);
-            // deliver_webhook appends exactly one DLQ entry per failed delivery.
-            metrics.incr(names::WEBHOOK_DLQ_ENTRIES);
-        }
-    }
-    let dlq_depth: usize = dlq.values().map(Vec::len).sum();
-    metrics.set_gauge(names::WEBHOOK_DLQ_DEPTH, dlq_depth as u64);
-    result
+/// let mut dlq: BTreeMap<String, Vec<DlqEntry>> = BTreeMap::new();
+/// assert!(dlq_entries_for_trace(&dlq, "hooks", "abc").is_empty());
+/// ```
+pub fn dlq_entries_for_trace<'a>(
+    dlq: &'a BTreeMap<String, Vec<DlqEntry>>,
+    key: &str,
+    trace_id: &str,
+) -> Vec<&'a DlqEntry> {
+    dlq.get(key)
+        .map(|entries| entries.iter().filter(|e| e.trace_id == trace_id).collect())
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -840,6 +961,21 @@ mod tests {
             signing_key: None,
             max_payload_age_seconds: None,
             require_nonce_for_replay_protection: false,
+        }
+    }
+
+    /// A DLQ entry with placeholder trace fields, for tests that only exercise
+    /// the query helpers.
+    fn dlq_entry(payload: &str, failed_at_timestamp: u64, last_status_code: u16) -> DlqEntry {
+        DlqEntry {
+            payload: payload.to_string(),
+            failed_at_timestamp,
+            last_status_code,
+            attempts_made: 1,
+            last_error: "e".to_string(),
+            trace_id: "0".repeat(31) + "1",
+            span_id: "0".repeat(15) + "1",
+            last_attempt_span_id: "0".repeat(15) + "1",
         }
     }
 
@@ -923,9 +1059,9 @@ mod tests {
         let mut dlq: BTreeMap<String, Vec<DlqEntry>> = BTreeMap::new();
         let key = "test-key";
         dlq.entry(key.to_string()).or_default().extend([
-            DlqEntry { payload: "a".to_string(), failed_at_timestamp: 100, last_status_code: 500, attempts_made: 1, last_error: "e".to_string() },
-            DlqEntry { payload: "b".to_string(), failed_at_timestamp: 200, last_status_code: 503, attempts_made: 1, last_error: "e".to_string() },
-            DlqEntry { payload: "c".to_string(), failed_at_timestamp: 300, last_status_code: 0,   attempts_made: 1, last_error: "e".to_string() },
+            dlq_entry("a", 100, 500),
+            dlq_entry("b", 200, 503),
+            dlq_entry("c", 300, 0),
         ]);
 
         // All entries
@@ -936,5 +1072,231 @@ mod tests {
         assert_eq!(query_dlq(&dlq, key, 0, 150, 250).len(), 1);
         // No match
         assert_eq!(query_dlq(&dlq, key, 0, 400, 500).len(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #610 — trace context propagation across delivery attempts
+    // -----------------------------------------------------------------------
+
+    /// Every delivery attempt, including retries, carries the caller's trace ID.
+    #[test]
+    fn trace_id_survives_every_delivery_attempt() {
+        let trace = TraceContext::root_from_seed("deposit:txn-001");
+        let seen: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        let mut dlq: BTreeMap<String, Vec<DlqEntry>> = BTreeMap::new();
+
+        let result = deliver_webhook_traced(
+            &make_config(3),
+            "payload",
+            &trace,
+            &mut dlq,
+            |_url, _body, _sig, attempt_trace| {
+                seen.borrow_mut().push(attempt_trace.trace_id().to_string());
+                Ok(503)
+            },
+            |_| {},
+            || 1000,
+        );
+
+        assert!(result.is_err());
+        let seen = seen.into_inner();
+        assert_eq!(seen.len(), 3, "all three attempts should have run");
+        assert!(
+            seen.iter().all(|id| id == trace.trace_id()),
+            "trace_id must not change across delivery retries: {seen:?}"
+        );
+    }
+
+    /// Attempts are individually identifiable: distinct spans, all parented to
+    /// the delivery span.
+    #[test]
+    fn each_delivery_attempt_has_its_own_span() {
+        let trace = TraceContext::root_from_seed("deposit:txn-002");
+        let delivery_span = trace.child("webhook-delivery");
+        let spans: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        let mut dlq: BTreeMap<String, Vec<DlqEntry>> = BTreeMap::new();
+
+        let _ = deliver_webhook_traced(
+            &make_config(3),
+            "payload",
+            &trace,
+            &mut dlq,
+            |_url, _body, _sig, attempt_trace| {
+                assert_eq!(
+                    attempt_trace.parent_span_id(),
+                    Some(delivery_span.span_id()),
+                    "attempt spans hang off the delivery span"
+                );
+                spans.borrow_mut().push(attempt_trace.span_id().to_string());
+                Ok(503)
+            },
+            |_| {},
+            || 1000,
+        );
+
+        let spans = spans.into_inner();
+        assert_eq!(spans.len(), 3);
+        assert_ne!(spans[0], spans[1]);
+        assert_ne!(spans[1], spans[2]);
+        assert_ne!(spans[0], spans[2]);
+    }
+
+    /// A successful retry stops the loop but still ran under the same trace.
+    #[test]
+    fn trace_survives_a_delivery_that_succeeds_on_retry() {
+        let trace = TraceContext::root_from_seed("deposit:txn-003");
+        let attempts: RefCell<u32> = RefCell::new(0);
+        let seen: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        let mut dlq: BTreeMap<String, Vec<DlqEntry>> = BTreeMap::new();
+
+        let result = deliver_webhook_traced(
+            &make_config(4),
+            "payload",
+            &trace,
+            &mut dlq,
+            |_url, _body, _sig, attempt_trace| {
+                seen.borrow_mut().push(attempt_trace.trace_id().to_string());
+                let mut n = attempts.borrow_mut();
+                *n += 1;
+                if *n < 3 {
+                    Ok(500)
+                } else {
+                    Ok(200)
+                }
+            },
+            |_| {},
+            || 1000,
+        );
+
+        assert!(result.is_ok());
+        assert!(dlq.is_empty(), "no DLQ entry when a retry succeeds");
+        let seen = seen.into_inner();
+        assert_eq!(seen.len(), 3);
+        assert!(seen.iter().all(|id| id == trace.trace_id()));
+    }
+
+    /// The DLQ entry records the trace, so a dead-lettered webhook can be
+    /// traced back to the request that produced it.
+    #[test]
+    fn dlq_entry_records_the_trace_context() {
+        let trace = TraceContext::root_from_seed("deposit:txn-004");
+        let delivery_span = trace.child("webhook-delivery");
+        let mut dlq: BTreeMap<String, Vec<DlqEntry>> = BTreeMap::new();
+
+        let result = deliver_webhook_traced(
+            &make_config(2),
+            "my-payload",
+            &trace,
+            &mut dlq,
+            |_url, _body, _sig, _t| Ok(503),
+            |_| {},
+            || 9999,
+        );
+
+        assert!(result.is_err());
+        let entries = get_dead_letter_webhooks(&dlq, "test-key");
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.trace_id, trace.trace_id());
+        assert_eq!(entry.span_id, delivery_span.span_id());
+        assert_eq!(
+            entry.last_attempt_span_id,
+            delivery_span.child_for_attempt(1).span_id(),
+            "the final attempt's span is the one recorded"
+        );
+    }
+
+    /// The returned error carries the trace context in its diagnostic detail.
+    #[test]
+    fn delivery_error_context_includes_the_trace() {
+        let trace = TraceContext::root_from_seed("deposit:txn-005");
+        let mut dlq: BTreeMap<String, Vec<DlqEntry>> = BTreeMap::new();
+
+        let err = deliver_webhook_traced(
+            &make_config(2),
+            "payload",
+            &trace,
+            &mut dlq,
+            |_url, _body, _sig, _t| Err("connection refused".to_string()),
+            |_| {},
+            || 1000,
+        )
+        .unwrap_err();
+
+        let detail = alloc::format!("{:?}", err);
+        assert!(
+            detail.contains(trace.trace_id()),
+            "error detail should name the trace: {detail}"
+        );
+    }
+
+    /// `dlq_entries_for_trace` finds exactly the entries for one trace.
+    #[test]
+    fn dlq_entries_can_be_looked_up_by_trace_id() {
+        let config = make_config(1);
+        let mut dlq: BTreeMap<String, Vec<DlqEntry>> = BTreeMap::new();
+
+        let wanted = TraceContext::root_from_seed("wanted");
+        let other = TraceContext::root_from_seed("other");
+        for trace in [&wanted, &other, &wanted] {
+            let _ = deliver_webhook_traced(
+                &config,
+                "payload",
+                trace,
+                &mut dlq,
+                |_url, _body, _sig, _t| Ok(500),
+                |_| {},
+                || 1000,
+            );
+        }
+
+        assert_eq!(get_dead_letter_webhooks(&dlq, "test-key").len(), 3);
+        let found = dlq_entries_for_trace(&dlq, "test-key", wanted.trace_id());
+        assert_eq!(found.len(), 2);
+        assert!(found.iter().all(|e| e.trace_id == wanted.trace_id()));
+    }
+
+    /// The untraced entry point still produces a traceable DLQ entry, so
+    /// existing callers gain correlation without changing their code.
+    #[test]
+    fn untraced_delivery_still_records_a_valid_trace() {
+        let mut dlq: BTreeMap<String, Vec<DlqEntry>> = BTreeMap::new();
+        let _ = deliver_webhook(
+            &make_config(1),
+            "payload",
+            &mut dlq,
+            |_, _, _| Ok(500),
+            |_| {},
+            || 1000,
+        );
+
+        let entries = get_dead_letter_webhooks(&dlq, "test-key");
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.trace_id.len(), crate::trace_context::TRACE_ID_HEX_LEN);
+        assert_eq!(entry.span_id.len(), crate::trace_context::SPAN_ID_HEX_LEN);
+        assert_ne!(entry.span_id, entry.last_attempt_span_id);
+    }
+
+    /// The derived context is stable: the same payload to the same endpoint
+    /// dead-letters under the same trace ID every time.
+    #[test]
+    fn untraced_delivery_trace_is_stable_across_runs() {
+        let config = make_config(1);
+        let mut dlq: BTreeMap<String, Vec<DlqEntry>> = BTreeMap::new();
+        for _ in 0..2 {
+            let _ = deliver_webhook(
+                &config,
+                "payload",
+                &mut dlq,
+                |_, _, _| Ok(500),
+                |_| {},
+                || 1000,
+            );
+        }
+
+        let entries = get_dead_letter_webhooks(&dlq, "test-key");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].trace_id, entries[1].trace_id);
     }
 }

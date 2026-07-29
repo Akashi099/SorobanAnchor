@@ -217,6 +217,18 @@ The project uses GitHub Actions for continuous integration. All checks must pass
 - ✓ Linting (`cargo clippy -- -D warnings`)
 - ✓ Tests (`cargo test`)
 - ✓ WASM build (`cargo build --target wasm32-unknown-unknown`)
+- ✓ Dependency audit (`dependency-audit.yml`)
+- ✓ Feature matrix (`feature-matrix.yml` — all feature-flag combinations)
+
+## Security Review
+
+Changes that touch authentication, cryptography, authorization, HTTP
+integrations, or the deployment process require a security review in addition
+to the standard code review. Use the repository's
+[Security Review Checklist](SECURITY_REVIEW_CHECKLIST.md) as a guide.
+
+See [Governance and Security](governance-and-security.md) for the full policy,
+including which changes require two maintainer approvals.
 
 ## Troubleshooting
 

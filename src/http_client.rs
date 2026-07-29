@@ -35,6 +35,8 @@ extern crate std;
 extern crate alloc;
 use alloc::string::String;
 
+use crate::trace_context::TraceContext;
+
 // ---------------------------------------------------------------------------
 // Idempotency and request signing support
 // ---------------------------------------------------------------------------
@@ -71,6 +73,10 @@ pub struct OutboundRequestOptions {
     /// HMAC-SHA256 signing key. When `Some`, adds
     /// `X-Anchor-Signature: sha256=<hex>` computed over the request body.
     pub signing_key: Option<alloc::vec::Vec<u8>>,
+    /// Trace context for this request. When `Some`, adds `traceparent`,
+    /// `X-Trace-Id` and `X-Span-Id` headers so the anchor's logs can be
+    /// correlated with ours.
+    pub trace: Option<TraceContext>,
 }
 
 impl OutboundRequestOptions {
@@ -79,12 +85,33 @@ impl OutboundRequestOptions {
         OutboundRequestOptions {
             idempotency_key: Some(key.into()),
             signing_key: None,
+            trace: None,
         }
     }
 
     /// Attach an HMAC-SHA256 signing key to this options set.
     pub fn with_signing_key(mut self, key: &[u8]) -> Self {
         self.signing_key = Some(key.to_vec());
+        self
+    }
+
+    /// Attach a trace context to this options set.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use anchorkit::http_client::OutboundRequestOptions;
+    /// use anchorkit::trace_context::TraceContext;
+    ///
+    /// let trace = TraceContext::root_from_seed("txn-001");
+    /// let opts = OutboundRequestOptions::with_idempotency_key("txn-001")
+    ///     .with_trace(&trace);
+    ///
+    /// let names: Vec<String> = opts.build_headers("{}").into_iter().map(|(k, _)| k).collect();
+    /// assert!(names.contains(&"traceparent".to_string()));
+    /// ```
+    pub fn with_trace(mut self, trace: &TraceContext) -> Self {
+        self.trace = Some(trace.clone());
         self
     }
 
@@ -108,6 +135,7 @@ impl OutboundRequestOptions {
         OutboundRequestOptions {
             idempotency_key: Some(hex),
             signing_key: None,
+            trace: None,
         }
     }
 
@@ -117,6 +145,7 @@ impl OutboundRequestOptions {
     /// - `Idempotency-Key` — when `idempotency_key` is set.
     /// - `X-Request-Id` — same value as `Idempotency-Key` (correlation).
     /// - `X-Anchor-Signature: sha256=<hex>` — when `signing_key` is set.
+    /// - `traceparent`, `X-Trace-Id`, `X-Span-Id` — when `trace` is set.
     pub fn build_headers(&self, body: &str) -> alloc::vec::Vec<(String, String)> {
         let mut headers = alloc::vec::Vec::new();
         if let Some(ref key) = self.idempotency_key {
@@ -127,7 +156,15 @@ impl OutboundRequestOptions {
             let sig = compute_hmac_hex(sk, body);
             headers.push(("X-Anchor-Signature".into(), alloc::format!("sha256={}", sig)));
         }
+        if let Some(ref trace) = self.trace {
+            headers.extend(trace.header_pairs());
+        }
         headers
+    }
+
+    /// Return `true` when this options set carries a trace context.
+    pub fn has_trace(&self) -> bool {
+        self.trace.is_some()
     }
 
     /// Return `true` when this options set includes an idempotency key.
@@ -776,6 +813,99 @@ pub fn deliver_webhook_with_proxy(
     )
 }
 
+/// Deliver a webhook through the proxy-aware client, propagating `trace`.
+///
+/// Same as [`deliver_webhook_with_proxy`] but every delivery attempt — including
+/// retries — carries the attempt's trace headers (`traceparent`, `X-Trace-Id`,
+/// `X-Span-Id`), and the DLQ entry written on exhaustion records the trace.
+///
+/// Use this when the webhook is delivered as part of a traced request; the
+/// receiving system then logs the same trace ID the anchor did.
+///
+/// # Errors
+///
+/// Returns [`ErrorCode::WebhookDeliveryFailed`](crate::errors::ErrorCode::WebhookDeliveryFailed)
+/// when the client cannot be built or every delivery attempt fails.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use std::collections::BTreeMap;
+/// use anchorkit::http_client::deliver_webhook_with_proxy_traced;
+/// use anchorkit::retry::RetryConfig;
+/// use anchorkit::trace_context::TraceContext;
+/// use anchorkit::webhook::WebhookDeliveryConfig;
+///
+/// let config = WebhookDeliveryConfig {
+///     endpoint_url: "https://hooks.example.com/anchor".to_string(),
+///     timeout_ms: 5_000,
+///     retry_config: RetryConfig::default(),
+///     dead_letter_storage_key: "webhook_dlq".to_string(),
+///     signing_key: None,
+///     max_payload_age_seconds: None,
+///     require_nonce_for_replay_protection: false,
+/// };
+/// let trace = TraceContext::root_from_seed("deposit:txn-001");
+/// let mut dlq = BTreeMap::new();
+/// deliver_webhook_with_proxy_traced(
+///     &config,
+///     r#"{"event":"deposit"}"#,
+///     &trace,
+///     &mut dlq,
+///     None,
+///     || 0,
+/// ).unwrap();
+/// ```
+#[cfg(feature = "std")]
+pub fn deliver_webhook_with_proxy_traced(
+    config: &crate::webhook::WebhookDeliveryConfig,
+    payload: &str,
+    trace: &TraceContext,
+    dlq: &mut alloc::collections::BTreeMap<String, alloc::vec::Vec<crate::webhook::DlqEntry>>,
+    proxy: Option<&ProxyConfig>,
+    now_fn: impl Fn() -> u64,
+) -> Result<(), crate::errors::AnchorKitError> {
+    let timeout_secs = if config.timeout_ms > 0 {
+        (config.timeout_ms / 1000).max(1)
+    } else {
+        30
+    };
+
+    let client = build_client(proxy, timeout_secs).map_err(|e| {
+        crate::errors::AnchorKitError::with_context(
+            crate::errors::ErrorCode::WebhookDeliveryFailed,
+            "failed to build HTTP client for webhook delivery",
+            &e,
+        )
+    })?;
+
+    crate::webhook::deliver_webhook_traced(
+        config,
+        payload,
+        trace,
+        dlq,
+        move |url, body, sig_header, attempt_trace| {
+            let mut req = client
+                .post(url)
+                .header("Content-Type", "application/json")
+                .body(alloc::string::String::from(body));
+            if let Some(sig) = sig_header {
+                req = req.header("X-Anchor-Signature", sig);
+            }
+            // Each attempt carries its own span, so the receiver can tell a
+            // retry apart from the original delivery.
+            for (name, value) in attempt_trace.header_pairs() {
+                req = req.header(name, value);
+            }
+            req.send()
+                .map(|r| r.status().as_u16())
+                .map_err(|e| alloc::format!("HTTP POST failed: {}", e))
+        },
+        |_| {},
+        now_fn,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1143,6 +1273,63 @@ mod tests {
         assert!(names.contains(&"Idempotency-Key"));
         assert!(names.contains(&"X-Request-Id"));
         assert!(names.contains(&"X-Anchor-Signature"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #610 — trace context on outbound requests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn outbound_options_emit_trace_headers() {
+        let trace = TraceContext::root_from_seed("txn-trace-1");
+        let opts = OutboundRequestOptions::with_idempotency_key("idem-1").with_trace(&trace);
+        assert!(opts.has_trace());
+
+        let headers = opts.build_headers("{}");
+        let find = |name: &str| {
+            headers
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.as_str())
+        };
+
+        assert_eq!(find("traceparent"), Some(trace.to_traceparent().as_str()));
+        assert_eq!(find("X-Trace-Id"), Some(trace.trace_id()));
+        assert_eq!(find("X-Span-Id"), Some(trace.span_id()));
+    }
+
+    #[test]
+    fn outbound_options_without_trace_emit_no_trace_headers() {
+        let opts = OutboundRequestOptions::with_idempotency_key("idem-1");
+        assert!(!opts.has_trace());
+        let headers = opts.build_headers("{}");
+        assert!(!headers.iter().any(|(k, _)| k == "traceparent"));
+        assert!(!headers.iter().any(|(k, _)| k == "X-Trace-Id"));
+    }
+
+    #[test]
+    fn post_with_options_forwards_trace_headers_to_transport() {
+        let trace = TraceContext::root_from_seed("txn-trace-2");
+        let opts = OutboundRequestOptions::with_idempotency_key("idem-2").with_trace(&trace);
+
+        let mut captured: alloc::vec::Vec<(String, String)> = alloc::vec::Vec::new();
+        let result = post_with_options(
+            "https://example.com/sep6",
+            r#"{"amount":50}"#,
+            Some(&opts),
+            |_url, _body, hdrs| {
+                captured.extend(hdrs.iter().cloned());
+                Ok(200u16)
+            },
+        );
+
+        assert_eq!(result, Ok(200));
+        let traceparent = captured
+            .iter()
+            .find(|(k, _)| k == "traceparent")
+            .map(|(_, v)| v.clone())
+            .expect("traceparent should reach the transport");
+        assert!(traceparent.contains(trace.trace_id()));
     }
 
     #[test]

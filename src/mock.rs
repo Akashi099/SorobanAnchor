@@ -356,6 +356,188 @@ pub fn mock_price_alternative() -> RawPrice {
     }
 }
 
+// ── SEP-6 additional transaction state fixtures ─────────────────────────────
+
+/// Returns a SEP-6 transaction response with "pending_anchor" status.
+pub fn mock_transaction_response_pending_anchor() -> RawTransactionResponse {
+    RawTransactionResponse {
+        transaction_id: MOCK_TXN_ID.to_string(),
+        kind: Some("withdrawal".to_string()),
+        status: "pending_anchor".to_string(),
+        amount_in: Some(500),
+        amount_out: Some(490),
+        amount_fee: Some(10),
+        message: Some("Anchor is processing your withdrawal".to_string()),
+    }
+}
+
+/// Returns a SEP-6 transaction response with "pending_user_transfer_complete" status.
+pub fn mock_transaction_response_pending_user_transfer_complete() -> RawTransactionResponse {
+    RawTransactionResponse {
+        transaction_id: MOCK_TXN_ID.to_string(),
+        kind: Some("deposit".to_string()),
+        status: "pending_user_transfer_complete".to_string(),
+        amount_in: Some(200),
+        amount_out: None,
+        amount_fee: Some(2),
+        message: Some("Waiting for user to complete transfer".to_string()),
+    }
+}
+
+/// Returns a SEP-6 deposit response with "completed" status.
+pub fn mock_transaction_response_completed() -> RawTransactionResponse {
+    RawTransactionResponse {
+        transaction_id: MOCK_TXN_ID.to_string(),
+        kind: Some("deposit".to_string()),
+        status: "completed".to_string(),
+        amount_in: Some(100),
+        amount_out: Some(99),
+        amount_fee: Some(1),
+        message: Some("Transaction complete".to_string()),
+    }
+}
+
+/// Returns a SEP-6 transaction response with "expired_transaction" status.
+pub fn mock_transaction_response_expired() -> RawTransactionResponse {
+    RawTransactionResponse {
+        transaction_id: "expired-txn-001".to_string(),
+        kind: Some("deposit".to_string()),
+        status: "expired_transaction".to_string(),
+        amount_in: None,
+        amount_out: None,
+        amount_fee: None,
+        message: Some("Transaction expired".to_string()),
+    }
+}
+
+// ── SEP-6 additional withdrawal response fixtures ──────────────────────────
+
+/// Returns a SEP-6 withdrawal response with large amount limits.
+pub fn mock_withdrawal_response_large_limits() -> RawWithdrawalResponse {
+    RawWithdrawalResponse {
+        transaction_id: "withdraw-large-001".to_string(),
+        account_id: MOCK_ACCOUNT_ID.to_string(),
+        memo: Some("LARGEWITHDRAW".to_string()),
+        memo_type: Some("text".to_string()),
+        min_amount: Some(1_000),
+        max_amount: Some(1_000_000),
+        fee_fixed: Some(50),
+        status: Some("pending_user_transfer_start".to_string()),
+        asset_code: Some("USDC".to_string()),
+    }
+}
+
+/// Returns a SEP-6 withdrawal response with "completed" status.
+pub fn mock_withdrawal_response_completed() -> RawWithdrawalResponse {
+    RawWithdrawalResponse {
+        transaction_id: "withdraw-complete-001".to_string(),
+        account_id: MOCK_ACCOUNT_ID.to_string(),
+        memo: Some("DONE".to_string()),
+        memo_type: Some("text".to_string()),
+        min_amount: Some(5),
+        max_amount: Some(5_000),
+        fee_fixed: Some(2),
+        status: Some("completed".to_string()),
+        asset_code: Some("USDC".to_string()),
+    }
+}
+
+// ── SEP-24 additional transaction state fixtures ──────────────────────────
+
+/// Returns a SEP-24 transaction response with "pending_anchor" status.
+pub fn mock_sep24_transaction_pending_anchor() -> RawSep24TransactionResponse {
+    RawSep24TransactionResponse {
+        id: "sep24-pending-anchor-001".to_string(),
+        status: "pending_anchor".to_string(),
+        more_info_url: Some(format!("{MOCK_ANCHOR_URL}/sep24/transaction?id=sep24-pending-anchor-001")),
+        stellar_transaction_id: None,
+        asset_code: Some(MOCK_ASSET_CODE.to_string()),
+    }
+}
+
+/// Returns a SEP-24 transaction response with "pending_user_transfer_complete" status.
+pub fn mock_sep24_transaction_pending_user_transfer_complete() -> RawSep24TransactionResponse {
+    RawSep24TransactionResponse {
+        id: "sep24-pending-user-transfer-001".to_string(),
+        status: "pending_user_transfer_complete".to_string(),
+        more_info_url: Some(format!("{MOCK_ANCHOR_URL}/sep24/transaction?id=sep24-pending-user-transfer-001")),
+        stellar_transaction_id: None,
+        asset_code: Some(MOCK_ASSET_CODE.to_string()),
+    }
+}
+
+/// Returns a SEP-24 transaction response with "expired_transaction" status.
+pub fn mock_sep24_transaction_expired() -> RawSep24TransactionResponse {
+    RawSep24TransactionResponse {
+        id: "sep24-expired-001".to_string(),
+        status: "expired_transaction".to_string(),
+        more_info_url: None,
+        stellar_transaction_id: None,
+        asset_code: None,
+    }
+}
+
+/// Returns a SEP-24 transaction response with "refunded" status.
+pub fn mock_sep24_transaction_refunded() -> RawSep24TransactionResponse {
+    RawSep24TransactionResponse {
+        id: "sep24-refunded-001".to_string(),
+        status: "refunded".to_string(),
+        more_info_url: Some(format!("{MOCK_ANCHOR_URL}/sep24/transaction?id=sep24-refunded-001")),
+        stellar_transaction_id: Some("stellar-refund-txn".to_string()),
+        asset_code: Some(MOCK_ASSET_CODE.to_string()),
+    }
+}
+
+// ── SEP-38 additional quote fixtures ──────────────────────────────────────
+
+/// Returns a SEP-38 firm quote with expired timestamp.
+pub fn mock_firm_quote_expired() -> RawFirmQuote {
+    RawFirmQuote {
+        id: "quote-expired-001".to_string(),
+        expires_at: "1609459200".to_string(), // 2021-01-01
+        price: "1.0".to_string(),
+        sell_amount: "100".to_string(),
+        buy_amount: "100".to_string(),
+        sell_asset: "XLM".to_string(),
+        buy_asset: "USDC".to_string(),
+    }
+}
+
+/// Returns a SEP-38 firm quote with very large amounts.
+pub fn mock_firm_quote_large_amounts() -> RawFirmQuote {
+    RawFirmQuote {
+        id: "quote-large-001".to_string(),
+        expires_at: MOCK_EXPIRES_AT.to_string(),
+        price: "1.002".to_string(),
+        sell_amount: "10000000".to_string(),
+        buy_amount: "10020000".to_string(),
+        sell_asset: "XLM".to_string(),
+        buy_asset: "USDC".to_string(),
+    }
+}
+
+/// Returns a SEP-38 firm quote with very small amounts.
+pub fn mock_firm_quote_small_amounts() -> RawFirmQuote {
+    RawFirmQuote {
+        id: "quote-small-001".to_string(),
+        expires_at: MOCK_EXPIRES_AT.to_string(),
+        price: "1.001".to_string(),
+        sell_amount: "0.01".to_string(),
+        buy_amount: "0.01001".to_string(),
+        sell_asset: "XLM".to_string(),
+        buy_asset: "USDC".to_string(),
+    }
+}
+
+/// Returns a SEP-38 price for cryptocurrency pair (not fiat).
+pub fn mock_price_crypto_pair() -> RawPrice {
+    RawPrice {
+        buy_asset: "BTC".to_string(),
+        sell_asset: "ETH".to_string(),
+        price: "15.5".to_string(),
+    }
+}
+
 // ── Multi-anchor fixtures (#299) ───────────────────────────────────────────────
 
 /// Returns a SEP-6 deposit response from "Anchor A".
