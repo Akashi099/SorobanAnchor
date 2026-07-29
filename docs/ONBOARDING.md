@@ -167,6 +167,18 @@ cargo test --features stress-tests      # load tests (slow)
 ./scripts/pre_deploy_validate.sh  # full pre-deploy check
 ```
 
+### Generating API docs
+
+Refresh the browsable crate reference whenever the public exports change:
+
+```bash
+make api-docs
+```
+
+The generated HTML lands in `target/api-docs/doc/anchorkit/index.html` and is
+built directly from the crate's public modules and re-exports in
+`src/lib.rs`, so it stays aligned with the current public API surface.
+
 ### API contract snapshots
 
 To capture and compare the public API surface across versions, see

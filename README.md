@@ -52,6 +52,14 @@ For WASM output (Soroban deployment):
 cargo build --release --target wasm32-unknown-unknown --no-default-features --features wasm
 ```
 
+Generate browsable API reference docs for the public crate exports:
+
+```bash
+make api-docs
+```
+
+The generated HTML is written to `target/api-docs/doc/anchorkit/index.html`.
+
 ### Build Matrix
 
 SorobanAnchor supports two distinct build environments with complete feature separation:
