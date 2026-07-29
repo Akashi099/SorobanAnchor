@@ -1,0 +1,455 @@
+name: Feature Matrix
+
+# Comprehensive CI matrix covering all documented build/test combinations.
+# Each job is isolated so failures are immediately visible without reading
+# a monolithic log. Jobs that are independent run in parallel.
+#
+# Matrix coverage:
+#   - Native std build + unit tests
+#   - WASM / no_std build (wasm32-unknown-unknown)
+#   - no_std compliance check (cargo check --no-default-features)
+#   - mock-only feature gate
+#   - std + mock-only combined
+#   - stress-test suite (separate, longer-running job)
+#   - CLI integration harness
+#   - Feature gate permutation tests (test-feature-gates.sh)
+#   - Build matrix script (test_build_matrix.sh)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  WASM_TARGET: wasm32-unknown-unknown
+
+jobs:
+  # ── 1. Native std build ────────────────────────────────────────────────────
+  native-std:
+    name: "Native | std | build + test"
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-native-std-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-native-std-
+
+      - name: cargo check (std)
+        run: cargo check
+
+      - name: cargo test (std)
+        run: cargo test
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Annotate on failure
+        if: failure()
+        run: |
+          echo "::error::Native std build or test failed."
+          echo "::notice::Run locally with: cargo test"
+
+  # ── 2. WASM / no_std build ─────────────────────────────────────────────────
+  wasm-no-std:
+    name: "WASM | no_std | --features wasm"
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable + WASM target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.WASM_TARGET }}
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-wasm-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-wasm-
+
+      - name: cargo build WASM release
+        run: |
+          cargo build --release \
+            --target ${{ env.WASM_TARGET }} \
+            --no-default-features \
+            --features wasm
+
+      - name: Report WASM size
+        run: |
+          WASM=target/${{ env.WASM_TARGET }}/release/anchorkit.wasm
+          SIZE=$(du -sh "$WASM" | cut -f1)
+          echo "WASM artifact size: $SIZE"
+          echo "## WASM Build" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Artifact | Size |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|----------|------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| \`anchorkit.wasm\` | $SIZE |" >> "$GITHUB_STEP_SUMMARY"
+          ls -lh "$WASM"
+
+      - name: Verify WASM magic bytes
+        run: |
+          WASM=target/${{ env.WASM_TARGET }}/release/anchorkit.wasm
+          MAGIC=$(xxd -l 4 "$WASM" | awk '{print $2$3}' | head -1)
+          if [[ "$MAGIC" != "0061736d" ]]; then
+            echo "::error::Invalid WASM magic bytes: $MAGIC (expected 0061736d)"
+            exit 1
+          fi
+          echo "WASM magic bytes valid: $MAGIC"
+
+      - name: Annotate on failure
+        if: failure()
+        run: |
+          echo "::error::WASM build failed."
+          echo "::notice::Run locally with: cargo build --release --target wasm32-unknown-unknown --no-default-features --features wasm"
+
+  # ── 3. no_std compliance check ─────────────────────────────────────────────
+  no-std-check:
+    name: "no_std | compliance check"
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable + WASM target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.WASM_TARGET }}
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-no-std-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-no-std-
+
+      - name: cargo check --no-default-features (host)
+        run: cargo check --no-default-features
+
+      - name: cargo check --no-default-features (WASM target)
+        run: |
+          cargo check \
+            --target ${{ env.WASM_TARGET }} \
+            --no-default-features
+
+      - name: Annotate on failure
+        if: failure()
+        run: |
+          echo "::error::no_std compliance check failed — a std-only import may have been added."
+          echo "::notice::Run locally with: cargo check --no-default-features"
+
+  # ── 4. mock-only feature ───────────────────────────────────────────────────
+  mock-only:
+    name: "Native | --features mock-only | test"
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-mock-only-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-mock-only-
+
+      - name: cargo test --features mock-only
+        run: cargo test --features mock-only
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Annotate on failure
+        if: failure()
+        run: |
+          echo "::error::mock-only feature gate test failed."
+          echo "::notice::Run locally with: cargo test --features mock-only"
+
+  # ── 5. std + mock-only combined ────────────────────────────────────────────
+  std-mock-only:
+    name: "Native | --features std,mock-only | test"
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-std-mock-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-std-mock-
+
+      - name: cargo test --features std,mock-only
+        run: cargo test --features std,mock-only
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Annotate on failure
+        if: failure()
+        run: |
+          echo "::error::std + mock-only combined feature test failed."
+          echo "::notice::Run locally with: cargo test --features std,mock-only"
+
+  # ── 6. Clippy across all feature combinations ──────────────────────────────
+  clippy-matrix:
+    name: "Clippy | ${{ matrix.label }}"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: "default features"
+            flags: ""
+          - label: "std + mock-only"
+            flags: "--features std,mock-only"
+          - label: "no_std (no features)"
+            flags: "--no-default-features"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable + WASM target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: ${{ env.WASM_TARGET }}
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-clippy-${{ matrix.label }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-clippy-
+
+      - name: cargo clippy (${{ matrix.label }})
+        run: cargo clippy --all-targets ${{ matrix.flags }} -- -D warnings
+
+      - name: Annotate on failure
+        if: failure()
+        run: |
+          echo "::error::Clippy check failed for: ${{ matrix.label }}"
+          echo "::notice::Run locally with: cargo clippy --all-targets ${{ matrix.flags }} -- -D warnings"
+
+  # ── 7. CLI integration harness ─────────────────────────────────────────────
+  integration-harness:
+    name: "CLI Integration Harness"
+    runs-on: ubuntu-latest
+    needs: [native-std, wasm-no-std, no-std-check]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-harness-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-harness-
+
+      - name: Run CLI integration harness
+        run: cargo test --test cli_integration_harness -- --nocapture
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Annotate on failure
+        if: failure()
+        run: |
+          echo "::error::CLI integration harness failed."
+          echo "::notice::Run locally with: cargo test --test cli_integration_harness -- --nocapture"
+
+  # ── 8. Stress tests (separate, longer-running) ─────────────────────────────
+  stress-tests:
+    name: "Stress Tests | --features stress-tests"
+    runs-on: ubuntu-latest
+    # Only run on push to main to avoid slowing down PR feedback loops.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [native-std]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-stress-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-stress-
+
+      - name: cargo test --features stress-tests
+        run: cargo test --features stress-tests
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Annotate on failure
+        if: failure()
+        run: |
+          echo "::error::Stress test suite failed."
+          echo "::notice::Run locally with: cargo test --features stress-tests"
+
+  # ── 9. Build matrix script ─────────────────────────────────────────────────
+  build-matrix-script:
+    name: "Build Matrix Script"
+    runs-on: ubuntu-latest
+    needs: [native-std, wasm-no-std]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable + WASM target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.WASM_TARGET }}
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-build-matrix-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-build-matrix-
+
+      - name: Run test_build_matrix.sh
+        run: bash scripts/test_build_matrix.sh
+
+      - name: Annotate on failure
+        if: failure()
+        run: |
+          echo "::error::Build matrix script failed."
+          echo "::notice::Run locally with: ./scripts/test_build_matrix.sh"
+
+  # ── 10. Feature gate permutation tests ────────────────────────────────────
+  feature-gate-tests:
+    name: "Feature Gate Permutation Tests"
+    runs-on: ubuntu-latest
+    needs: [native-std, wasm-no-std, no-std-check]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable + WASM target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.WASM_TARGET }}
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-feature-gates-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-feature-gates-
+
+      - name: Run test-feature-gates.sh
+        run: bash scripts/test-feature-gates.sh
+
+      - name: Annotate on failure
+        if: failure()
+        run: |
+          echo "::error::Feature gate permutation test failed."
+          echo "::notice::Run locally with: ./scripts/test-feature-gates.sh"
+
+  # ── Summary job ────────────────────────────────────────────────────────────
+  matrix-summary:
+    name: "Matrix Summary"
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - native-std
+      - wasm-no-std
+      - no-std-check
+      - mock-only
+      - std-mock-only
+      - clippy-matrix
+      - integration-harness
+      - build-matrix-script
+      - feature-gate-tests
+
+    steps:
+      - name: Evaluate matrix results
+        run: |
+          echo "## Feature Matrix Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Job | Result |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-----|--------|" >> "$GITHUB_STEP_SUMMARY"
+
+          declare -A RESULTS=(
+            ["Native std"]="${{ needs.native-std.result }}"
+            ["WASM no_std"]="${{ needs.wasm-no-std.result }}"
+            ["no_std check"]="${{ needs.no-std-check.result }}"
+            ["mock-only"]="${{ needs.mock-only.result }}"
+            ["std + mock-only"]="${{ needs.std-mock-only.result }}"
+            ["Clippy matrix"]="${{ needs.clippy-matrix.result }}"
+            ["Integration harness"]="${{ needs.integration-harness.result }}"
+            ["Build matrix script"]="${{ needs.build-matrix-script.result }}"
+            ["Feature gate tests"]="${{ needs.feature-gate-tests.result }}"
+          )
+
+          OVERALL=0
+          for job in "${!RESULTS[@]}"; do
+            result="${RESULTS[$job]}"
+            case "$result" in
+              success)  icon="✅" ;;
+              failure)  icon="❌"; OVERALL=1 ;;
+              skipped)  icon="⏭️" ;;
+              *)        icon="❓"; OVERALL=1 ;;
+            esac
+            echo "| $job | $icon $result |" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+          if [[ "$OVERALL" -ne 0 ]]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "> ❌ One or more matrix jobs failed." >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::Feature matrix has failures — see job details above."
+            exit 1
+          fi
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "> ✅ All matrix jobs passed." >> "$GITHUB_STEP_SUMMARY"

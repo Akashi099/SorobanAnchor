@@ -1,51 +1,102 @@
 #!/bin/bash
+# run_benchmarks.sh — Run the SorobanAnchor performance benchmark suite.
+#
+# Usage:
+#   ./scripts/run_benchmarks.sh                 # Run all benchmarks
+#   ./scripts/run_benchmarks.sh --save main     # Save results as baseline 'main'
+#   ./scripts/run_benchmarks.sh --compare main  # Compare against baseline 'main'
+#
+# Results are written to target/criterion/ with HTML reports at
+# target/criterion/report/index.html.
 
 set -e
 
-echo "=== Running SorobanAnchor Performance Benchmarks ==="
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR/.."
+
+echo "=== SorobanAnchor Performance Benchmarks ==="
 echo ""
 
-BASELINE_FILE="benchmark_baseline.json"
-CURRENT_FILE="target/criterion/baseline.json"
+BASELINE_NAME="${2:-}"
+MODE="${1:-}"
 
-# Run benchmarks
-echo "Running benchmarks..."
-cargo bench --bench load_benchmarks -- --save-baseline current
-
-# Check if baseline exists
-if [ -f "$BASELINE_FILE" ]; then
-    echo ""
-    echo "Comparing against baseline..."
-    cargo bench --bench load_benchmarks -- --baseline current --load-baseline baseline
-    
-    # Simple performance regression check
-    echo ""
-    echo "Checking for performance regressions..."
-    
-    # This is a simplified check - in production, you'd parse Criterion's JSON output
-    if cargo bench --bench load_benchmarks -- --baseline baseline 2>&1 | grep -q "Performance has regressed"; then
-        echo "⚠️  WARNING: Performance regression detected!"
-        echo "Review the benchmark results above for details."
-        exit 1
-    else
-        echo "✅ No significant performance regressions detected"
+case "$MODE" in
+  --save)
+    if [ -z "$BASELINE_NAME" ]; then
+      echo "Usage: $0 --save <baseline-name>"
+      exit 1
     fi
-else
+    echo "Running benchmarks and saving baseline: $BASELINE_NAME"
+    cargo bench --bench load_benchmarks -- --save-baseline "$BASELINE_NAME"
     echo ""
-    echo "No baseline found. Saving current results as baseline..."
-    cp -r target/criterion "$BASELINE_FILE.dir" 2>/dev/null || true
-    echo "Run this script again to compare future changes against this baseline."
-fi
+    echo "✅ Baseline '$BASELINE_NAME' saved."
+    ;;
+  --compare)
+    if [ -z "$BASELINE_NAME" ]; then
+      echo "Usage: $0 --compare <baseline-name>"
+      exit 1
+    fi
+    echo "Running benchmarks and comparing against baseline: $BASELINE_NAME"
+    if cargo bench --bench load_benchmarks -- --baseline "$BASELINE_NAME" 2>&1 | tee /tmp/bench_output.txt; then
+      if grep -q "Performance has regressed" /tmp/bench_output.txt; then
+        echo ""
+        echo "⚠️  WARNING: Performance regression detected!"
+        echo "Review the output above for affected benchmarks."
+        exit 1
+      else
+        echo ""
+        echo "✅ No significant regressions detected against baseline '$BASELINE_NAME'."
+      fi
+    fi
+    ;;
+  "")
+    echo "Running all benchmarks..."
+    cargo bench --bench load_benchmarks
+    ;;
+  *)
+    echo "Unknown option: $MODE"
+    echo "Usage: $0 [--save <name> | --compare <name>]"
+    exit 1
+    ;;
+esac
 
 echo ""
-echo "=== Benchmark Summary ==="
-echo "Results saved to: target/criterion/"
-echo "HTML reports available at: target/criterion/report/index.html"
+echo "=== Benchmark Groups ==="
 echo ""
-echo "Key metrics to monitor:"
-echo "  - Single attestation throughput (ops/sec)"
-echo "  - Batch registration latency (p50, p95, p99)"
-echo "  - Rate limit check throughput under concurrency"
-echo "  - Anchor routing performance with 50 candidates"
-echo "  - Metadata cache lookup with 1000 entries"
+echo "  attestation_verification"
+echo "    • single_attestation_verification    — Expected: > 5 M ops/s"
+echo "    • batch_attestation_verification_100 — Expected: > 3 M ops/s"
+echo ""
+echo "  batch_attestor_registration"
+echo "    • /10, /50, /100                     — Expected: < 50 µs at 100 attestors"
+echo ""
+echo "  rate_limit_check"
+echo "    • /100, /500, /1000                  — Expected: > 10 M ops/s at 1 000"
+echo ""
+echo "  anchor_routing"
+echo "    • /10, /25, /50                      — Expected: < 5 µs at 50 anchors"
+echo ""
+echo "  quote_routing"
+echo "    • /10, /25, /50                      — Expected: < 10 µs at 50 quotes"
+echo ""
+echo "  metadata_cache_lookup"
+echo "    • hit/100, hit/500, hit/1000         — Expected: > 20 M ops/s (hot)"
+echo "    • miss/100, miss/500, miss/1000      — Expected: > 10 M ops/s (cold)"
+echo ""
+echo "  transaction_status_normalization"
+echo "    • single_normalize                   — Expected: > 20 M ops/s"
+echo "    • batch_normalize_100                — Expected: > 15 M ops/s"
+echo ""
+echo "  replay_detection"
+echo "    • lookup_replay/100–10000            — Expected: > 20 M ops/s"
+echo "    • insert_new/100–10000               — Expected: < 500 ns per entry"
+echo ""
+echo "  deterministic_hash"
+echo "    • hash_32_bytes                      — Expected: < 500 ns"
+echo "    • hash_1000_sequential               — Expected: < 1 ms"
+echo ""
+echo "  batch_attestation"
+echo "    • /10, /50, /100                     — Expected: < 200 µs at 100 entries"
+echo ""
+echo "HTML reports: target/criterion/report/index.html"
 echo ""

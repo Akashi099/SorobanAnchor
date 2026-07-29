@@ -186,6 +186,26 @@ pub struct AttestationPage {
     pub total: u64,
 }
 
+// ── Issue #663: Deterministic ordering for attestation results ────────────────
+
+/// Criteria for deterministically ordering [`Attestation`] records off-chain.
+///
+/// On-chain pages are always returned in ascending `id` order.  Use these
+/// variants when you need a different ordering client-side.  The `id` field
+/// is always the final tiebreaker so results are fully stable regardless of
+/// storage order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AttestationSortOrder {
+    /// Sort by `id` ascending (default on-chain order).
+    IdAsc,
+    /// Sort by `id` descending (newest first).
+    IdDesc,
+    /// Sort by `timestamp` ascending, then `id` ascending on ties.
+    TimestampAsc,
+    /// Sort by `timestamp` descending (most recent first), then `id` ascending on ties.
+    TimestampDesc,
+}
+
 /// Input record for [`AnchorKitContract::submit_attestation_batch`].
 #[contracttype]
 #[derive(Clone)]
@@ -478,6 +498,210 @@ pub struct RoutingAnchorMeta {
     pub uptime_percentage: u32,
     pub total_volume: u64,
     pub is_active: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Issue #657: Multi-anchor reputation weighting
+// ---------------------------------------------------------------------------
+
+/// Extended reputation record capturing historical behaviour signals that feed
+/// into the composite reputation score used during routing.
+///
+/// All counters are cumulative over the lifetime of the anchor record.
+/// `compute_composite_reputation` derives a single 0–10 000 score from them.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct AnchorReputationRecord {
+    /// Anchor address this record belongs to.
+    pub anchor: Address,
+    /// Total number of transactions routed through this anchor.
+    pub total_routed: u64,
+    /// Number of those that completed successfully.
+    pub successful_routed: u64,
+    /// Operator-assigned quality score (0–10 000).  This is set manually by
+    /// admins to capture qualitative signals (regulatory standing, SLA tier,
+    /// geographic coverage, etc.) that cannot be derived from on-chain data.
+    pub operator_quality_score: u32,
+    /// Cumulative uptime ticks (arbitrary unit; caller decides granularity).
+    pub uptime_ticks: u64,
+    /// Total observation ticks (uptime denominator).
+    pub total_ticks: u64,
+    /// Ledger timestamp of the last update.
+    pub updated_at: u64,
+}
+
+/// Weights used when computing the composite reputation score.
+///
+/// All values are scaled ×1 000 (e.g. `500` = 0.5). The three weights must
+/// sum to exactly `1 000`.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ReputationWeights {
+    /// Weight applied to the historical success-rate sub-score.
+    pub success_rate_weight: u32,
+    /// Weight applied to the uptime sub-score.
+    pub uptime_weight: u32,
+    /// Weight applied to the operator quality sub-score.
+    pub operator_quality_weight: u32,
+}
+
+impl ReputationWeights {
+    /// Default weights: 40 % success rate, 35 % uptime, 25 % operator quality.
+    pub fn default_weights() -> Self {
+        ReputationWeights {
+            success_rate_weight: 400,
+            uptime_weight: 350,
+            operator_quality_weight: 250,
+        }
+    }
+
+    /// Returns `true` when all weights are non-zero and sum to exactly 1 000.
+    pub fn is_valid(&self) -> bool {
+        self.success_rate_weight
+            .checked_add(self.uptime_weight)
+            .and_then(|s| s.checked_add(self.operator_quality_weight))
+            == Some(1_000)
+    }
+
+    /// Compute a composite reputation score in the range `[0, 10 000]` from a
+    /// reputation record.
+    ///
+    /// Each sub-score is normalised to [0, 10 000] before weighting:
+    ///
+    /// * **success_rate** – `successful_routed / total_routed` (1.0 when no
+    ///   transactions have been routed yet, to avoid penalising new anchors).
+    /// * **uptime** – `uptime_ticks / total_ticks` (1.0 when no ticks recorded).
+    /// * **operator_quality** – `operator_quality_score / 10 000` (already in
+    ///   the target range).
+    ///
+    /// Tie-breaking uses `anchor.to_string()` lexicographic order when scores
+    /// are equal (deterministic across contract invocations).
+    pub fn compute_composite(&self, record: &AnchorReputationRecord) -> u32 {
+        let success_rate: f32 = if record.total_routed == 0 {
+            1.0_f32
+        } else {
+            (record.successful_routed.min(record.total_routed) as f32)
+                / (record.total_routed as f32)
+        };
+
+        let uptime_rate: f32 = if record.total_ticks == 0 {
+            1.0_f32
+        } else {
+            (record.uptime_ticks.min(record.total_ticks) as f32)
+                / (record.total_ticks as f32)
+        };
+
+        let operator_quality_rate: f32 =
+            (record.operator_quality_score.min(10_000) as f32) / 10_000.0_f32;
+
+        let sw = self.success_rate_weight as f32 / 1_000.0_f32;
+        let uw = self.uptime_weight as f32 / 1_000.0_f32;
+        let oqw = self.operator_quality_weight as f32 / 1_000.0_f32;
+
+        let composite =
+            sw * success_rate + uw * uptime_rate + oqw * operator_quality_rate;
+
+        (composite.clamp(0.0_f32, 1.0_f32) * 10_000.0_f32) as u32
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #658: Time-based routing policies
+// ---------------------------------------------------------------------------
+
+/// A single time window within which a routing strategy is active.
+///
+/// Times are expressed as seconds-since-midnight UTC (0 – 86 399).
+/// When `window_start_secs < window_end_secs` the window is a normal
+/// intra-day range.  When `window_start_secs > window_end_secs` the window
+/// wraps midnight (e.g. 22:00 – 02:00 is expressed as 79 200 – 7 200).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RoutingTimeWindow {
+    /// Seconds since midnight UTC at which the window opens (0 – 86 399).
+    pub window_start_secs: u32,
+    /// Seconds since midnight UTC at which the window closes (0 – 86 399,
+    /// exclusive). Equal to `window_start_secs` means the window is always
+    /// active (24-hour policy).
+    pub window_end_secs: u32,
+}
+
+impl RoutingTimeWindow {
+    /// Returns `true` when `time_of_day_secs` (seconds since midnight UTC)
+    /// falls within this window.
+    ///
+    /// A window where `start == end` is treated as always-active.
+    pub fn is_active(&self, time_of_day_secs: u32) -> bool {
+        if self.window_start_secs == self.window_end_secs {
+            // Always-active sentinel.
+            return true;
+        }
+        if self.window_start_secs < self.window_end_secs {
+            // Normal intra-day window.
+            time_of_day_secs >= self.window_start_secs
+                && time_of_day_secs < self.window_end_secs
+        } else {
+            // Midnight-wrapping window.
+            time_of_day_secs >= self.window_start_secs
+                || time_of_day_secs < self.window_end_secs
+        }
+    }
+}
+
+/// A named routing policy that becomes active only within its time window.
+///
+/// The policy names a routing strategy (`strategy_name`) that maps to one of
+/// the strategy symbols recognised by `route_transaction` (e.g.
+/// `"LowestFee"`, `"FastestSettlement"`, `"HighestReputation"`,
+/// `"WeightedScore"`).  When multiple policies overlap only the one with the
+/// lowest `priority` value (highest priority) is applied; equal priorities
+/// are broken by ascending `policy_id`.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct TimedRoutingPolicy {
+    /// Unique numeric identifier for this policy.
+    pub policy_id: u64,
+    /// Human-readable name for display / audit purposes.
+    pub name: String,
+    /// The routing strategy to activate while this policy is effective.
+    pub strategy_name: String,
+    /// The time window during which this policy is active.
+    pub window: RoutingTimeWindow,
+    /// Lower value = higher priority.  Policies with `priority == 0` take
+    /// precedence over those with `priority == 1`, etc.
+    pub priority: u32,
+    /// When `false` the policy is stored but never selected.
+    pub enabled: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Issue #659: Per-network routing profiles
+// ---------------------------------------------------------------------------
+
+/// A routing profile scoped to a specific network environment.
+///
+/// Each profile packages the routing weights and strategy defaults appropriate
+/// for one deployment environment (testnet, mainnet, local, …).  The profile
+/// whose `network_name` matches the currently active network context is
+/// selected automatically; when no match exists the default profile is used.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct NetworkRoutingProfile {
+    /// Identifier for this profile (e.g. `"mainnet"`, `"testnet"`, `"local"`).
+    pub network_name: String,
+    /// Default routing strategy for this network (maps to a strategy symbol).
+    pub default_strategy: String,
+    /// Fee weight (scaled ×1 000).
+    pub fee_weight: u32,
+    /// Speed weight (scaled ×1 000).
+    pub speed_weight: u32,
+    /// Reputation weight (scaled ×1 000).
+    pub reputation_weight: u32,
+    /// Minimum reputation score required for an anchor to be considered on
+    /// this network.
+    pub min_reputation: u32,
+    /// When `true` this profile is used as the fallback for unknown networks.
+    pub is_default: bool,
 }
 
 #[contracttype]
@@ -7525,6 +7749,506 @@ impl AnchorKitContract {
     }
 
     // -----------------------------------------------------------------------
+    // Issue #657: Multi-anchor reputation weighting
+    // -----------------------------------------------------------------------
+
+    /// Storage key for an anchor's extended reputation record.
+    fn reputation_record_key(env: &Env, anchor: &Address) -> BytesN<32> {
+        let xdr = anchor.clone().to_xdr(env);
+        let raw = xdr_to_vec(&xdr);
+        make_storage_key(env, &[b"REPREC", &raw])
+    }
+
+    /// Storage key for the contract-wide reputation weights.
+    fn reputation_weights_key(env: &Env) -> BytesN<32> {
+        make_storage_key(env, &[b"REPWTS"])
+    }
+
+    /// Upsert (create or replace) the extended reputation record for `anchor`.
+    ///
+    /// The composite reputation score is derived from the record automatically
+    /// by `get_anchor_composite_reputation`. Callers update the raw counters
+    /// here; the scoring formula is defined in [`ReputationWeights`].
+    ///
+    /// # Authorization
+    ///
+    /// Requires admin privileges.
+    pub fn set_anchor_reputation(
+        env: Env,
+        anchor: Address,
+        total_routed: u64,
+        successful_routed: u64,
+        operator_quality_score: u32,
+        uptime_ticks: u64,
+        total_ticks: u64,
+    ) {
+        Self::require_admin(&env);
+        if successful_routed > total_routed {
+            panic_with_error!(&env, ErrorCode::ValidationError);
+        }
+        if operator_quality_score > 10_000 {
+            panic_with_error!(&env, ErrorCode::ValidationError);
+        }
+        let record = AnchorReputationRecord {
+            anchor: anchor.clone(),
+            total_routed,
+            successful_routed,
+            operator_quality_score,
+            uptime_ticks,
+            total_ticks,
+            updated_at: env.ledger().timestamp(),
+        };
+        let key = Self::reputation_record_key(&env, &anchor);
+        env.storage().persistent().set(&key, &record);
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_TTL, PERSISTENT_TTL);
+
+        env.events().publish(
+            (symbol_short!("rep"), symbol_short!("updated")),
+            anchor,
+        );
+    }
+
+    /// Retrieve the extended reputation record for `anchor`, or `None` when no
+    /// record exists.
+    pub fn get_anchor_reputation(env: Env, anchor: Address) -> Option<AnchorReputationRecord> {
+        env.storage().persistent().get(&Self::reputation_record_key(&env, &anchor))
+    }
+
+    /// Set the contract-wide reputation weights used by
+    /// `get_anchor_composite_reputation` and the `ReputationWeighted` routing
+    /// strategy.
+    ///
+    /// Weights are validated: they must be non-zero and sum to exactly 1 000.
+    ///
+    /// # Authorization
+    ///
+    /// Requires admin privileges.
+    pub fn set_reputation_weights(
+        env: Env,
+        success_rate_weight: u32,
+        uptime_weight: u32,
+        operator_quality_weight: u32,
+    ) {
+        Self::require_admin(&env);
+        let weights = ReputationWeights {
+            success_rate_weight,
+            uptime_weight,
+            operator_quality_weight,
+        };
+        if !weights.is_valid() {
+            panic_with_error!(&env, ErrorCode::InvalidWeights);
+        }
+        let key = Self::reputation_weights_key(&env);
+        env.storage().persistent().set(&key, &weights);
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_TTL, PERSISTENT_TTL);
+    }
+
+    /// Retrieve the current contract-wide reputation weights, or the default
+    /// weights when none have been explicitly set.
+    pub fn get_reputation_weights(env: Env) -> ReputationWeights {
+        env.storage()
+            .persistent()
+            .get(&Self::reputation_weights_key(&env))
+            .unwrap_or_else(ReputationWeights::default_weights)
+    }
+
+    /// Compute and return the composite reputation score (0–10 000) for
+    /// `anchor`, combining historical success rate, uptime, and operator
+    /// quality according to the contract-wide [`ReputationWeights`].
+    ///
+    /// Returns `0` when no reputation record has been stored for `anchor`.
+    pub fn get_anchor_composite_reputation(env: Env, anchor: Address) -> u32 {
+        let record: AnchorReputationRecord = match env
+            .storage()
+            .persistent()
+            .get(&Self::reputation_record_key(&env, &anchor))
+        {
+            Some(r) => r,
+            None => return 0,
+        };
+        let weights: ReputationWeights = env
+            .storage()
+            .persistent()
+            .get(&Self::reputation_weights_key(&env))
+            .unwrap_or_else(ReputationWeights::default_weights);
+        weights.compute_composite(&record)
+    }
+
+    /// Return all anchors ranked by their composite reputation score in
+    /// descending order.
+    ///
+    /// Anchors with equal scores are ordered deterministically by ascending
+    /// anchor-address byte representation (XDR encoding). Anchors without a
+    /// reputation record are included with a score of 0, after all scored
+    /// anchors.
+    ///
+    /// Only anchors registered in the anchor list are considered.
+    pub fn rank_anchors_by_reputation(env: Env) -> Vec<Address> {
+        let weights: ReputationWeights = env
+            .storage()
+            .persistent()
+            .get(&Self::reputation_weights_key(&env))
+            .unwrap_or_else(ReputationWeights::default_weights);
+
+        let list_key = make_storage_key(&env, &[b"ANCHLIST"]);
+        let anchors: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<Address>>(&list_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Score each anchor; collect as (score, xdr_bytes) for deterministic sort.
+        let mut scored: alloc::vec::Vec<(u32, alloc::vec::Vec<u8>, Address)> =
+            alloc::vec::Vec::new();
+        for anchor in anchors.iter() {
+            let score: u32 = match env
+                .storage()
+                .persistent()
+                .get(&Self::reputation_record_key(&env, &anchor))
+            {
+                Some(record) => weights.compute_composite(&record),
+                None => 0,
+            };
+            let xdr = anchor.clone().to_xdr(&env);
+            let xdr_bytes = xdr_to_vec(&xdr);
+            scored.push((score, xdr_bytes, anchor));
+        }
+
+        // Sort: primary descending score, secondary ascending XDR bytes.
+        scored.sort_unstable_by(|a, b| {
+            b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1))
+        });
+
+        let mut result: Vec<Address> = Vec::new(&env);
+        for (_, _, anchor) in scored {
+            result.push_back(anchor);
+        }
+        result
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #658: Time-based routing policies
+    // -----------------------------------------------------------------------
+
+    /// Storage key for the global timed-policy counter.
+    fn timed_policy_count_key(env: &Env) -> BytesN<32> {
+        make_storage_key(env, &[b"TPOLCNT"])
+    }
+
+    /// Storage key for a timed routing policy record.
+    fn timed_policy_key(env: &Env, policy_id: u64) -> BytesN<32> {
+        make_storage_key(env, &[b"TPOL", &policy_id.to_be_bytes()])
+    }
+
+    /// Register a new time-based routing policy.
+    ///
+    /// The policy becomes a candidate for selection by
+    /// `get_active_routing_policy` during the specified time window.
+    ///
+    /// # Validation
+    ///
+    /// * `strategy_name` must be non-empty.
+    /// * `window_start_secs` and `window_end_secs` must be in [0, 86 399].
+    ///   Equal values create an always-active policy.
+    ///
+    /// # Returns
+    ///
+    /// The assigned `policy_id` (monotonically increasing).
+    ///
+    /// # Authorization
+    ///
+    /// Requires admin privileges.
+    pub fn register_timed_routing_policy(
+        env: Env,
+        name: String,
+        strategy_name: String,
+        window_start_secs: u32,
+        window_end_secs: u32,
+        priority: u32,
+    ) -> u64 {
+        Self::require_admin(&env);
+        if strategy_name.is_empty() {
+            panic_with_error!(&env, ErrorCode::ValidationError);
+        }
+        const SECS_PER_DAY: u32 = 86_400;
+        if window_start_secs >= SECS_PER_DAY || window_end_secs >= SECS_PER_DAY {
+            panic_with_error!(&env, ErrorCode::ValidationError);
+        }
+
+        let cnt_key = Self::timed_policy_count_key(&env);
+        let policy_id: u64 = env
+            .storage()
+            .persistent()
+            .get::<_, u64>(&cnt_key)
+            .unwrap_or(0);
+        let next_id = policy_id + 1;
+
+        let policy = TimedRoutingPolicy {
+            policy_id: next_id,
+            name,
+            strategy_name,
+            window: RoutingTimeWindow {
+                window_start_secs,
+                window_end_secs,
+            },
+            priority,
+            enabled: true,
+        };
+
+        let pol_key = Self::timed_policy_key(&env, next_id);
+        env.storage().persistent().set(&pol_key, &policy);
+        env.storage().persistent().extend_ttl(&pol_key, PERSISTENT_TTL, PERSISTENT_TTL);
+        env.storage().persistent().set(&cnt_key, &next_id);
+        env.storage().persistent().extend_ttl(&cnt_key, PERSISTENT_TTL, PERSISTENT_TTL);
+
+        env.events().publish(
+            (symbol_short!("tpol"), symbol_short!("added")),
+            next_id,
+        );
+
+        next_id
+    }
+
+    /// Enable or disable a timed routing policy by ID.
+    ///
+    /// Panics with `ValidationError` when the policy does not exist.
+    ///
+    /// # Authorization
+    ///
+    /// Requires admin privileges.
+    pub fn set_timed_policy_enabled(env: Env, policy_id: u64, enabled: bool) {
+        Self::require_admin(&env);
+        let pol_key = Self::timed_policy_key(&env, policy_id);
+        let mut policy: TimedRoutingPolicy = env
+            .storage()
+            .persistent()
+            .get(&pol_key)
+            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::ValidationError));
+        policy.enabled = enabled;
+        env.storage().persistent().set(&pol_key, &policy);
+        env.storage().persistent().extend_ttl(&pol_key, PERSISTENT_TTL, PERSISTENT_TTL);
+    }
+
+    /// Retrieve a timed routing policy by ID.
+    ///
+    /// Returns `None` when no policy with that ID exists.
+    pub fn get_timed_routing_policy(env: Env, policy_id: u64) -> Option<TimedRoutingPolicy> {
+        env.storage().persistent().get(&Self::timed_policy_key(&env, policy_id))
+    }
+
+    /// Evaluate which routing strategy is active at `unix_timestamp`.
+    ///
+    /// Iterates over all registered policies and returns the `strategy_name`
+    /// of the highest-priority enabled policy whose time window contains
+    /// `unix_timestamp % 86 400` (seconds since midnight UTC).
+    ///
+    /// When multiple policies share the same priority the one with the lowest
+    /// `policy_id` is chosen (deterministic tie-break).
+    ///
+    /// Returns `None` when no policy is active at the given time.
+    pub fn get_active_routing_policy(env: Env, unix_timestamp: u64) -> Option<String> {
+        let time_of_day = (unix_timestamp % 86_400) as u32;
+        let cnt_key = Self::timed_policy_count_key(&env);
+        let count: u64 = env
+            .storage()
+            .persistent()
+            .get::<_, u64>(&cnt_key)
+            .unwrap_or(0);
+
+        let mut best: Option<(u32, u64, String)> = None; // (priority, id, strategy)
+
+        for id in 1..=count {
+            let pol_key = Self::timed_policy_key(&env, id);
+            let policy: TimedRoutingPolicy = match env.storage().persistent().get(&pol_key) {
+                Some(p) => p,
+                None => continue,
+            };
+            if !policy.enabled {
+                continue;
+            }
+            if !policy.window.is_active(time_of_day) {
+                continue;
+            }
+            // Lower priority number wins; break ties by lower policy_id.
+            let better = match &best {
+                None => true,
+                Some((best_prio, best_id, _)) => {
+                    policy.priority < *best_prio
+                        || (policy.priority == *best_prio && id < *best_id)
+                }
+            };
+            if better {
+                best = Some((policy.priority, id, policy.strategy_name));
+            }
+        }
+
+        best.map(|(_, _, strategy)| strategy)
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #659: Per-network routing profiles
+    // -----------------------------------------------------------------------
+
+    /// Storage key for a network routing profile.
+    fn network_profile_key(env: &Env, network_name: &String) -> BytesN<32> {
+        let name_bytes = network_name.to_string().into_bytes();
+        make_storage_key(env, &[b"NETPROF", &name_bytes])
+    }
+
+    /// Storage key for the name of the active network context.
+    fn active_network_key(env: &Env) -> BytesN<32> {
+        make_storage_key(env, &[b"ACTNET"])
+    }
+
+    /// Register or replace a per-network routing profile.
+    ///
+    /// When `is_default` is `true` this profile becomes the fallback used when
+    /// no profile matches the active network context.  Only one default profile
+    /// is meaningful; registering multiple default profiles is allowed but the
+    /// most-recently set one is used by `get_routing_profile`.
+    ///
+    /// # Validation
+    ///
+    /// * `network_name` must be non-empty.
+    /// * `fee_weight + speed_weight + reputation_weight` must equal 1 000.
+    /// * `default_strategy` must be non-empty.
+    ///
+    /// # Authorization
+    ///
+    /// Requires admin privileges.
+    pub fn register_network_routing_profile(
+        env: Env,
+        network_name: String,
+        default_strategy: String,
+        fee_weight: u32,
+        speed_weight: u32,
+        reputation_weight: u32,
+        min_reputation: u32,
+        is_default: bool,
+    ) {
+        Self::require_admin(&env);
+        if network_name.is_empty() {
+            panic_with_error!(&env, ErrorCode::ValidationError);
+        }
+        if default_strategy.is_empty() {
+            panic_with_error!(&env, ErrorCode::ValidationError);
+        }
+        if fee_weight
+            .checked_add(speed_weight)
+            .and_then(|s| s.checked_add(reputation_weight))
+            != Some(1_000)
+        {
+            panic_with_error!(&env, ErrorCode::InvalidWeights);
+        }
+
+        let profile = NetworkRoutingProfile {
+            network_name: network_name.clone(),
+            default_strategy,
+            fee_weight,
+            speed_weight,
+            reputation_weight,
+            min_reputation,
+            is_default,
+        };
+
+        // If this is the new default, persist its name for fast fallback lookup.
+        if is_default {
+            let def_key = make_storage_key(&env, &[b"DEFNET"]);
+            env.storage().persistent().set(&def_key, &network_name);
+            env.storage().persistent().extend_ttl(&def_key, PERSISTENT_TTL, PERSISTENT_TTL);
+        }
+
+        let key = Self::network_profile_key(&env, &network_name);
+        env.storage().persistent().set(&key, &profile);
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_TTL, PERSISTENT_TTL);
+
+        env.events().publish(
+            (symbol_short!("netprof"), symbol_short!("set")),
+            network_name,
+        );
+    }
+
+    /// Set the active network context.
+    ///
+    /// Subsequent calls to `get_routing_profile` will look up the profile
+    /// registered for `network_name` first.
+    ///
+    /// # Authorization
+    ///
+    /// Requires admin privileges.
+    pub fn set_active_network(env: Env, network_name: String) {
+        Self::require_admin(&env);
+        if network_name.is_empty() {
+            panic_with_error!(&env, ErrorCode::ValidationError);
+        }
+        let key = Self::active_network_key(&env);
+        env.storage().persistent().set(&key, &network_name);
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_TTL, PERSISTENT_TTL);
+    }
+
+    /// Retrieve the active network name, or `None` when none has been set.
+    pub fn get_active_network(env: Env) -> Option<String> {
+        env.storage().persistent().get(&Self::active_network_key(&env))
+    }
+
+    /// Retrieve a network routing profile by name.
+    ///
+    /// Returns `None` when no profile exists for `network_name`.
+    pub fn get_network_routing_profile(
+        env: Env,
+        network_name: String,
+    ) -> Option<NetworkRoutingProfile> {
+        env.storage()
+            .persistent()
+            .get(&Self::network_profile_key(&env, &network_name))
+    }
+
+    /// Resolve the routing profile for the current network context.
+    ///
+    /// Resolution order:
+    /// 1. The profile matching the active network (set via `set_active_network`).
+    /// 2. The profile marked `is_default` (set via `register_network_routing_profile`
+    ///    with `is_default = true`).
+    /// 3. `None` — callers fall back to their built-in defaults.
+    pub fn get_routing_profile(env: Env) -> Option<NetworkRoutingProfile> {
+        // 1. Try the active network context.
+        let active_key = Self::active_network_key(&env);
+        if let Some(active_name) = env
+            .storage()
+            .persistent()
+            .get::<_, String>(&active_key)
+        {
+            if let Some(profile) = env
+                .storage()
+                .persistent()
+                .get::<_, NetworkRoutingProfile>(&Self::network_profile_key(&env, &active_name))
+            {
+                return Some(profile);
+            }
+        }
+
+        // 2. Fall back to the explicitly designated default profile.
+        let def_key = make_storage_key(&env, &[b"DEFNET"]);
+        if let Some(def_name) = env
+            .storage()
+            .persistent()
+            .get::<_, String>(&def_key)
+        {
+            if let Some(profile) = env
+                .storage()
+                .persistent()
+                .get::<_, NetworkRoutingProfile>(&Self::network_profile_key(&env, &def_name))
+            {
+                if profile.is_default {
+                    return Some(profile);
+                }
+            }
+        }
+
+        None
+    }
+
+    // -----------------------------------------------------------------------
     // Anchor Info Discovery
     // -----------------------------------------------------------------------
 
@@ -9513,6 +10237,46 @@ impl AnchorKitContract {
             },
         }
     }
+}
+
+// ── Issue #663: Off-chain deterministic ordering for attestation results ──────
+
+/// Sort a slice of [`Attestation`] records into a new `Vec` using the given
+/// [`AttestationSortOrder`].
+///
+/// The sort is stable with respect to non-tiebreaker criteria. `id` is always
+/// the final tiebreaker for `TimestampAsc`/`TimestampDesc` so results are
+/// fully deterministic regardless of how records are stored.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use anchorkit::contract::{Attestation, AttestationSortOrder, sort_attestations};
+/// // Assumes you have collected attestations from paginated queries.
+/// ```
+#[cfg(not(feature = "wasm"))]
+pub fn sort_attestations(
+    records: &[Attestation],
+    order: AttestationSortOrder,
+) -> alloc::vec::Vec<Attestation> {
+    let mut result: alloc::vec::Vec<Attestation> = records.to_vec();
+    result.sort_by(|a, b| {
+        let primary = match order {
+            AttestationSortOrder::IdAsc       => a.id.cmp(&b.id),
+            AttestationSortOrder::IdDesc      => b.id.cmp(&a.id),
+            AttestationSortOrder::TimestampAsc  => a.timestamp.cmp(&b.timestamp),
+            AttestationSortOrder::TimestampDesc => b.timestamp.cmp(&a.timestamp),
+        };
+        // Tiebreak on `id` ascending for timestamp-based orders.
+        if primary == core::cmp::Ordering::Equal
+            && matches!(order, AttestationSortOrder::TimestampAsc | AttestationSortOrder::TimestampDesc)
+        {
+            a.id.cmp(&b.id)
+        } else {
+            primary
+        }
+    });
+    result
 }
 
 // ---------------------------------------------------------------------------

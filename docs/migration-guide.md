@@ -321,3 +321,4 @@ assert_eq!(attestation.issuer, expected_issuer);
 - [Soroban Contract Upgrades](https://developers.stellar.org/docs/learn/storing-data)
 - [Admin Audit Log](./admin-audit-log.md)
 - [Governance and Security](./governance-and-security.md)
+- [Upgrade Playbook](./upgrade-playbook.md) — step-by-step production upgrade and rollback procedure

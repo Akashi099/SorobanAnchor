@@ -8,7 +8,7 @@ A Soroban smart contract SDK for Stellar anchors. Handles attestation management
 - Submits and retrieves on-chain attestations with replay attack protection
 - Normalizes SEP-6 deposit, withdrawal, and transaction status responses across anchors
 - Verifies SEP-10 EdDSA JWTs on-chain using stored Ed25519 public keys
-- Routes requests across multiple anchors by reputation, fees, and settlement time
+- Routes requests across multiple anchors and asset pairs by reputation, fees, and settlement time
 - Caches anchor metadata and stellar.toml capabilities with TTL-based expiry
 - Tracks transaction state transitions with full audit logging
 - Propagates request IDs and tracing spans across operations
@@ -29,6 +29,7 @@ src/                        # Core library
   response_validator.rs     # Response schema validation
   retry.rs                  # Retry with exponential backoff
   transaction_state_tracker.rs
+  multi_asset_routing.rs    # Multi-asset quote routing across corridors
   deterministic_hash.rs     # Canonical SHA-256 payload hashing
 
 tests/                      # Integration and unit tests
@@ -190,6 +191,13 @@ let id = contract.submit_attestation(issuer, subject, timestamp, payload_hash, s
 // Route across anchors by lowest fee
 let best = contract.route(options);
 
+// Route across multiple asset pairs (multi-asset, #656)
+use anchorkit::multi_asset_routing::{route_multi_asset, AssetPairRequest};
+let requests = vec![
+    AssetPairRequest { base_asset: "XLM".into(), quote_asset: "USDC".into(), amount: 1000, strategy: "LowestFee".into(), min_reputation: 70 },
+];
+let result = route_multi_asset(&requests, &all_quotes, now_timestamp)?;
+
 // Track transaction state
 tracker.transition(tx_id, TransactionStatus::Completed);
 ```
@@ -281,6 +289,27 @@ make release-validate
 The validation script checks that all required artifacts are present and that
 JSON files are well-formed.
 
+### Signing and verifying
+
+Release artifacts can be signed with GPG or minisign and verified before use:
+
+```bash
+# Sign (GPG by default)
+make release-sign
+
+# Sign in dry-run mode (prints commands without executing)
+make release-sign-dry-run
+
+# Verify a downloaded release bundle
+make release-verify TARBALL=dist/anchorkit-0.1.0.tar.gz
+# or directly:
+./scripts/verify_release.sh dist/anchorkit-0.1.0.tar.gz
+```
+
+The verify script checks the SHA-256 checksum, the detached signature, and the
+bundle contents.  See [`docs/release-signing.md`](docs/release-signing.md) for
+full key-management and CI integration guidance.
+
 ### Cleaning up
 
 ```bash
@@ -298,6 +327,40 @@ SorobanAnchor follows a documented governance and security model covering:
 - **Responsible disclosure** — Report vulnerabilities privately via GitHub's security advisory feature. We follow coordinated disclosure with a 14-day fix window.
 
 Full details: [`docs/governance-and-security.md`](docs/governance-and-security.md)
+
+## Upgrading and Migration
+
+When deploying a new contract version to production, follow the step-by-step
+upgrade playbook which covers prerequisites, WASM upload, schema migration,
+post-upgrade verification, and a full rollback procedure.
+
+- **Migration guide** — schema versioning, data preservation, and example migration code: [`docs/migration-guide.md`](docs/migration-guide.md)
+- **Upgrade playbook** — complete production runbook (pre-flight, upgrade, verify, rollback): [`docs/upgrade-playbook.md`](docs/upgrade-playbook.md)
+
+## Coverage Thresholds
+
+CI enforces minimum line-coverage percentages for the critical modules and
+reports regressions relative to the `main` branch baseline.
+
+| Module | Threshold |
+|--------|-----------|
+| `contract.rs` | ≥ 85 % |
+| `rate_limiter.rs` | ≥ 90 % |
+| `retry.rs` | ≥ 90 % |
+| `transaction_state_tracker.rs` | ≥ 85 % |
+
+Run locally:
+
+```bash
+./scripts/coverage_with_thresholds.sh
+
+# Compare against a saved baseline and flag regressions > 2 %:
+./scripts/coverage_with_thresholds.sh \
+    --baseline /tmp/baseline.json \
+    --report-delta
+```
+
+Full details: [`docs/coverage-metrics.md`](docs/coverage-metrics.md)
 
 ## Production Release Status
 
