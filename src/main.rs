@@ -1519,8 +1519,7 @@ fn doctor(network: &str, fix: bool) {
         ("Contract ID", check_contract_id_env()),
         ("Admin Secret", check_admin_secret_env()),
         ("Network", check_network_connectivity(network)),
-    ];
-    
+    ];    
     let mut all_passed = true;
     
     for (name, result) in &checks {
@@ -1558,7 +1557,16 @@ fn doctor(network: &str, fix: bool) {
     if !config_check.passed {
         all_passed = false;
     }
-    
+
+    // ── Environment fingerprint ───────────────────────────────────────────
+    println!("\n  Environment Fingerprint:");
+    let fp = anchorkit::EnvironmentFingerprint::collect();
+    println!("{}", fp.summary()
+        .lines()
+        .map(|l| format!("  {}", l))
+        .collect::<std::vec::Vec<_>>()
+        .join("\n"));
+
     println!();
     if all_passed {
         println!("✅ All checks passed! Your environment is ready.\n");

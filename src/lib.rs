@@ -143,9 +143,11 @@ pub mod migration;
 #[cfg(not(feature = "wasm"))]
 pub mod url_normalizer;
 
-// ── std-only modules (filesystem, runtime config) ─────────────────────────────
+// ── std-only modules (filesystem, runtime config, env fingerprinting) ─────────
 #[cfg(feature = "std")]
 pub mod config;
+#[cfg(feature = "std")]
+pub mod env_fingerprint;
 
 // ── Host-only modules (HTTP, threading) ───────────────────────────────────────
 // Excluded from `wasm` builds: on-chain Soroban contracts have no network access.

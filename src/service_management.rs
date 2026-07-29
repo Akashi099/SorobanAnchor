@@ -1,4 +1,5 @@
-//! Service management for anchor service enable/disable toggles and rollback handling.
+//! Service management for anchor service enable/disable toggles, rollback handling,
+//! and structured service retirement workflows.
 //!
 //! This module provides functionality to:
 //! - Enable/disable individual services for anchors
