@@ -172,6 +172,20 @@ pub mod streaming_monitor;
 #[cfg(not(feature = "wasm"))]
 pub mod structured_log;
 
+// ── Transaction archive (#675), compaction (#676) ────────────────────────────
+#[cfg(not(feature = "wasm"))]
+pub mod transaction_archive;
+#[cfg(not(feature = "wasm"))]
+pub mod transaction_compaction;
+
+// ── Artifact provenance tracking (#674) ──────────────────────────────────────
+#[cfg(not(feature = "wasm"))]
+pub mod artifact_provenance;
+
+// ── Deployment drift detection (#673) ────────────────────────────────────────
+#[cfg(not(feature = "wasm"))]
+pub mod deployment_drift;
+
 // ── Multi-asset quote routing (#656) ─────────────────────────────────────────
 // Available in host (non-WASM) builds. Provides asset-pair routing across
 // multiple corridors in a single pass.
@@ -303,6 +317,34 @@ pub use multi_asset_routing::{
 };
 #[cfg(not(feature = "wasm"))]
 pub use structured_log::{StructuredLogger, LogLevel, LogRecord, FieldValue, log_attestor_registration};
+
+// ── Issue #675: archived transaction histories ────────────────────────────────
+#[cfg(not(feature = "wasm"))]
+pub use transaction_archive::{
+    TransactionArchive, TransactionArchiveManager, ArchiveRetrievalStatus,
+    compute_archive_commitment, verify_archive_commitment,
+};
+
+// ── Issue #676: transaction history compaction ────────────────────────────────
+#[cfg(not(feature = "wasm"))]
+pub use transaction_compaction::{
+    compact_history, CompactionConfig, RawTransactionRecord,
+    TransactionSummaryRecord, CompactionResult, CompactionAggregate,
+};
+
+// ── Issue #674: artifact provenance tracking ──────────────────────────────────
+#[cfg(not(feature = "wasm"))]
+pub use artifact_provenance::{
+    ArtifactProvenance, ProvenanceStore, ProvenanceVerifier,
+    VerificationReport, FieldVerdict,
+};
+
+// ── Issue #673: deployment drift detection ────────────────────────────────────
+#[cfg(not(feature = "wasm"))]
+pub use deployment_drift::{
+    detect_drift, ConfigEntry, DeploymentSpec, DeploymentSnapshot,
+    DriftReport, DriftItem, DriftSeverity,
+};
 
 #[cfg(all(test, not(feature = "wasm")))]
 mod stellar_toml_tests;
