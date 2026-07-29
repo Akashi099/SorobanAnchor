@@ -5,6 +5,7 @@ DIST_DIR    := dist
 SOURCE_DATE_EPOCH ?= 1717200000
 
 .PHONY: build test wasm lint \
+        doc-lint doc-lint-fix doc-check \
         integration-test integration-test-live \
         integration-test-pipeline \
         stress-test \
@@ -43,6 +44,20 @@ fmt-check:
 # Linting
 lint:
 	cargo clippy -- -D warnings
+
+# ── Documentation linting ─────────────────────────────────────────────────────
+
+## Lint all documentation for broken links, heading consistency, and command hygiene.
+doc-lint:
+	@bash scripts/validate-docs.sh
+
+## Auto-fix markdownlint issues where possible (safe formatting fixes only).
+doc-lint-fix:
+	@bash scripts/validate-docs.sh --fix
+
+## Run all quality checks: code formatting, linting, tests, and documentation.
+doc-check: fmt-check lint doc-lint
+	@echo "All quality checks passed."
 
 # ── Integration test harness ──────────────────────────────────────────────────
 

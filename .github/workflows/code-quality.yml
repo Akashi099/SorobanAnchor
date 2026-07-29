@@ -73,3 +73,34 @@ jobs:
 
       - name: Run tests
         run: cargo test --features std,mock-only,stress-tests
+
+  documentation:
+    name: Documentation Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install markdownlint-cli
+        run: npm install -g markdownlint-cli@0.39.0
+
+      - name: Lint markdown files
+        run: markdownlint --config .markdownlint.json 'docs/**/*.md' 'README.md'
+
+      - name: Check broken internal links
+        run: bash scripts/validate-docs.sh
+
+      - name: Show doc lint summary on failure
+        if: failure()
+        run: |
+          echo "──────────────────────────────────────────────"
+          echo "Documentation lint failed. Common fixes:"
+          echo "  • Run locally: bash scripts/validate-docs.sh"
+          echo "  • Auto-fix:    bash scripts/validate-docs.sh --fix"
+          echo "  • Single file: bash scripts/validate-docs.sh --file docs/MY_DOC.md"
+          echo "──────────────────────────────────────────────"
