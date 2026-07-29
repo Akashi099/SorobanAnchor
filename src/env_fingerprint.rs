@@ -100,8 +100,7 @@ impl ConfigMetadata {
                     let hex: String = digest.iter().map(|b| format!("{:02x}", b)).collect();
                     let key = path
                         .to_string_lossy()
-                        .replace('\\', "/")
-                        .into_owned();
+                        .replace('\\', "/");
                     file_hashes.insert(key, hex);
                 }
             }

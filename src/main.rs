@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand};
 use serde::Serialize;
 
 use anchorkit::normalize_stellar_account_id;
+use anchorkit::config::{parse_runtime_config_str, ConfigFormat};
 
 // ── SecretKey wrapper ─────────────────────────────────────────────────────────
 //
@@ -759,6 +760,8 @@ enum CredentialsAction {
     Remove {
         #[arg(long)] name: String,
     },
+    /// Rotate the keystore password, re-encrypting all stored credentials
+    Rotate,
 }
 
 // ── Output types (JSON) ───────────────────────────────────────────────────────
@@ -1427,39 +1430,115 @@ fn check_contract_deployment(contract_id: &str, network: &str) -> CheckResult {
 }
 
 fn check_config_files() -> CheckResult {
-    let config_dir = std::path::Path::new("configs");
+    check_config_files_in(std::path::Path::new("configs"))
+}
+
+/// Validate every `.json`/`.toml` file in `config_dir` against the full
+/// `RuntimeConfig` schema (not just syntactic parseability — see #634).
+/// Split out from [`check_config_files`] so tests can point it at a
+/// scratch directory instead of the repo's real `configs/`.
+fn check_config_files_in(config_dir: &std::path::Path) -> CheckResult {
     if !config_dir.exists() {
         return CheckResult::warn("configs/ directory not found");
     }
-    
+
     let mut valid_count = 0;
     let mut total_count = 0;
-    
+    let mut failures: Vec<String> = Vec::new();
+
     if let Ok(entries) = std::fs::read_dir(config_dir) {
         for entry in entries.flatten() {
-            if let Some(ext) = entry.path().extension() {
-                if ext == "json" || ext == "toml" {
-                    total_count += 1;
-                    if ext == "json" {
-                        if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                            if serde_json::from_str::<serde_json::Value>(&content).is_ok() {
-                                valid_count += 1;
-                            }
-                        }
-                    } else {
-                        valid_count += 1; // Basic check for TOML
-                    }
+            let path = entry.path();
+            let ext = match path.extension().and_then(|e| e.to_str()) {
+                Some(ext) if ext == "json" || ext == "toml" => ext.to_string(),
+                _ => continue,
+            };
+            total_count += 1;
+            let label = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(e) => {
+                    failures.push(format!("{label}: {e}"));
+                    continue;
                 }
+            };
+            let format = if ext == "json" { ConfigFormat::Json } else { ConfigFormat::Toml };
+            match parse_runtime_config_str(&content, format) {
+                Ok(_) => valid_count += 1,
+                Err(e) => failures.push(format!("{label}: {e}")),
             }
         }
     }
-    
+
     if total_count == 0 {
         CheckResult::warn("No config files found in configs/")
     } else if valid_count == total_count {
-        CheckResult::pass(format!("{} config file(s) validated", total_count))
+        CheckResult::pass(format!("{} config file(s) validated against schema", total_count))
     } else {
-        CheckResult::fail(format!("{}/{} config files are valid", valid_count, total_count))
+        CheckResult::fail(format!(
+            "{}/{} config files are schema-valid — {}",
+            valid_count, total_count, failures.join("; ")
+        ))
+    }
+}
+
+/// Verify the Soroban WASM contract has been built at least once, in either
+/// profile. Missing artifacts are reported as a warning (not everyone running
+/// `doctor` needs a contract build — e.g. someone only using the off-chain
+/// SEP clients) with an actionable build command.
+fn check_build_artifacts() -> CheckResult {
+    check_build_artifacts_at(std::path::Path::new("."))
+}
+
+fn check_build_artifacts_at(root: &std::path::Path) -> CheckResult {
+    let target_dir = root.join("target/wasm32-unknown-unknown");
+    if !target_dir.exists() {
+        return CheckResult::warn(
+            "No WASM build artifacts found (run: cargo build --release --target wasm32-unknown-unknown --no-default-features --features wasm)"
+        );
+    }
+
+    for profile in ["release", "debug"] {
+        let profile_dir = target_dir.join(profile);
+        if let Ok(entries) = std::fs::read_dir(&profile_dir) {
+            let wasm_files: Vec<_> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("wasm"))
+                .collect();
+            if !wasm_files.is_empty() {
+                return CheckResult::pass(format!(
+                    "{} WASM artifact(s) found in target/wasm32-unknown-unknown/{profile}",
+                    wasm_files.len()
+                ));
+            }
+        }
+    }
+
+    CheckResult::warn(
+        "target/wasm32-unknown-unknown exists but contains no .wasm artifacts \
+         (run: cargo build --release --target wasm32-unknown-unknown --no-default-features --features wasm)"
+    )
+}
+
+/// Verify required build-time dependencies (beyond the Stellar CLI, which has
+/// its own dedicated check) are present on PATH: `cargo` and `rustc`.
+fn check_required_dependencies() -> CheckResult {
+    let mut missing = Vec::new();
+    for tool in ["cargo", "rustc"] {
+        let found = std::process::Command::new(tool)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !found {
+            missing.push(tool);
+        }
+    }
+    if missing.is_empty() {
+        CheckResult::pass("cargo and rustc found on PATH")
+    } else {
+        CheckResult::fail(format!("missing required tool(s) on PATH: {}", missing.join(", ")))
     }
 }
 
@@ -1515,11 +1594,13 @@ fn doctor(network: &str, fix: bool) {
     
     let checks = vec![
         ("Stellar CLI", check_stellar_cli()),
+        ("Required Dependencies", check_required_dependencies()),
         ("WASM Target", check_wasm_target(fix)),
+        ("Build Artifacts", check_build_artifacts()),
         ("Contract ID", check_contract_id_env()),
         ("Admin Secret", check_admin_secret_env()),
         ("Network", check_network_connectivity(network)),
-    ];    
+    ];
     let mut all_passed = true;
     
     for (name, result) in &checks {
@@ -1916,6 +1997,69 @@ fn credentials_remove(name: &str) {
     println!("Credential '{}' removed.", name);
 }
 
+/// Re-encrypt every entry in `store` under `new_password`, verifying each one
+/// decrypts under `old_password` first.
+///
+/// Decryption is attempted for every entry before any re-encryption happens,
+/// so a wrong `old_password` (or a corrupted entry) leaves the keystore file
+/// untouched — the caller only persists the returned map after this succeeds.
+fn rotate_keystore(
+    store: &std::collections::HashMap<String, String>,
+    old_password: &str,
+    new_password: &str,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let mut decrypted: Vec<(String, String)> = Vec::with_capacity(store.len());
+    for (name, stored) in store {
+        let plaintext = keystore_decrypt(old_password, name, stored)
+            .map_err(|e| format!("credential '{name}': {e}"))?;
+        decrypted.push((name.clone(), plaintext));
+    }
+    let mut rotated = std::collections::HashMap::with_capacity(decrypted.len());
+    for (name, plaintext) in decrypted {
+        let encrypted = keystore_encrypt(new_password, &name, &plaintext);
+        rotated.insert(name, encrypted);
+    }
+    Ok(rotated)
+}
+
+fn credentials_rotate(no_interactive: bool) {
+    if no_interactive {
+        eprintln!("error: 'credentials rotate' requires interactive password prompts; \
+                   not supported with --no-interactive / ANCHORKIT_NO_INTERACTIVE");
+        std::process::exit(1);
+    }
+    let store = keystore_load();
+    if store.is_empty() {
+        println!("No credentials stored; nothing to rotate.");
+        return;
+    }
+    let old_password = rpassword::prompt_password("Current keystore password: ")
+        .unwrap_or_else(|e| { eprintln!("error: {e}"); std::process::exit(1); });
+    let new_password = rpassword::prompt_password("New keystore password: ")
+        .unwrap_or_else(|e| { eprintln!("error: {e}"); std::process::exit(1); });
+    let confirm = rpassword::prompt_password("Confirm new keystore password: ")
+        .unwrap_or_else(|e| { eprintln!("error: {e}"); std::process::exit(1); });
+    if new_password != confirm {
+        eprintln!("error: new passwords do not match");
+        std::process::exit(1);
+    }
+    if new_password == old_password {
+        eprintln!("error: new password must differ from the current password");
+        std::process::exit(1);
+    }
+    let count = store.len();
+    match rotate_keystore(&store, &old_password, &new_password) {
+        Ok(rotated) => {
+            keystore_save(&rotated);
+            println!("Rotated {count} credential(s) to a new keystore password.");
+        }
+        Err(e) => {
+            eprintln!("error: rotation aborted, no credentials were modified: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 // ── Offline mode (#351) ───────────────────────────────────────────────────────
 
 /// Validate one or more config files without network access.
@@ -1965,12 +2109,8 @@ fn offline_validate_config(config_path: Option<&str>) -> bool {
         };
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         let result: Result<(), String> = match ext {
-            "json" => serde_json::from_str::<serde_json::Value>(&content)
-                .map(|_| ())
-                .map_err(|e| e.to_string()),
-            "toml" => toml::from_str::<toml::Value>(&content)
-                .map(|_| ())
-                .map_err(|e| e.to_string()),
+            "json" => parse_runtime_config_str(&content, ConfigFormat::Json).map(|_| ()),
+            "toml" => parse_runtime_config_str(&content, ConfigFormat::Toml).map(|_| ()),
             other => Err(format!("unsupported extension: {other}")),
         };
         match result {
@@ -2203,6 +2343,9 @@ fn main() {
                 CredentialsAction::Remove { name } => {
                     credentials_remove(&name);
                 }
+                CredentialsAction::Rotate => {
+                    credentials_rotate(no_interactive);
+                }
             }
         }
         Commands::Offline { action } => match action {
@@ -2352,10 +2495,29 @@ mod offline_tests {
     fn test_offline_validate_valid_json_written_to_tempdir() {
         let dir = std::env::temp_dir();
         let path = dir.join("anchorkit_test_valid.json");
+        // Must be schema-valid, not just syntactically valid JSON: offline_validate_config
+        // now runs full RuntimeConfig schema validation (see #634), not just a parse check.
+        std::fs::write(&path, r#"{
+            "contract": {"name": "test-anchor", "version": "1.0.0", "network": "stellar-testnet"},
+            "attestors": {"registry": [
+                {"name": "test-attestor", "address": "GBBD6A7KNZF5WNWQEPZP5DYJD2AYUTLXRB6VXJ4RCX4RTNPPQVNF3GQ", "role": "kyc-issuer", "enabled": true}
+            ]}
+        }"#).unwrap();
+        let result = offline_validate_config(Some(path.to_str().unwrap()));
+        let _ = std::fs::remove_file(&path);
+        assert!(result, "schema-valid JSON should pass validation");
+    }
+
+    #[test]
+    fn test_offline_validate_syntactically_valid_but_schema_invalid_json() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("anchorkit_test_schema_invalid.json");
+        // Well-formed JSON that does not match the RuntimeConfig schema (missing
+        // required fields, unknown top-level shape) must now be rejected.
         std::fs::write(&path, r#"{"network":"testnet","admin":"GABC"}"#).unwrap();
         let result = offline_validate_config(Some(path.to_str().unwrap()));
         let _ = std::fs::remove_file(&path);
-        assert!(result, "valid JSON should pass validation");
+        assert!(!result, "schema-invalid JSON must fail validation even though it parses");
     }
 
     #[test]
@@ -2368,6 +2530,183 @@ mod offline_tests {
         assert!(!result, "invalid JSON should fail validation");
     }
 
+}
+
+#[cfg(test)]
+mod keystore_tests {
+    use super::*;
+
+    #[test]
+    fn test_encrypt_decrypt_roundtrip() {
+        let stored = keystore_encrypt("hunter2", "alice", "SECRET-VALUE");
+        let plaintext = keystore_decrypt("hunter2", "alice", &stored).unwrap();
+        assert_eq!(plaintext, "SECRET-VALUE");
+    }
+
+    #[test]
+    fn test_decrypt_with_wrong_password_fails_clearly() {
+        let stored = keystore_encrypt("hunter2", "alice", "SECRET-VALUE");
+        let err = keystore_decrypt("wrong-password", "alice", &stored).unwrap_err();
+        assert!(err.contains("wrong password"), "got: {err}");
+    }
+
+    #[test]
+    fn test_decrypt_with_wrong_name_fails() {
+        // The name is part of the salt, so decrypting under a different name
+        // (different derived key) must fail even with the right password.
+        let stored = keystore_encrypt("hunter2", "alice", "SECRET-VALUE");
+        assert!(keystore_decrypt("hunter2", "bob", &stored).is_err());
+    }
+
+    #[test]
+    fn test_encrypt_is_nondeterministic_due_to_random_nonce() {
+        let a = keystore_encrypt("hunter2", "alice", "SECRET-VALUE");
+        let b = keystore_encrypt("hunter2", "alice", "SECRET-VALUE");
+        assert_ne!(a, b, "ciphertext should differ across calls due to a fresh random nonce");
+    }
+
+    #[test]
+    fn test_rotate_keystore_reencrypts_all_entries_under_new_password() {
+        let mut store = std::collections::HashMap::new();
+        store.insert("alice".to_string(), keystore_encrypt("old-pw", "alice", "SECRET-A"));
+        store.insert("bob".to_string(), keystore_encrypt("old-pw", "bob", "SECRET-B"));
+
+        let rotated = rotate_keystore(&store, "old-pw", "new-pw").unwrap();
+
+        assert_eq!(rotated.len(), 2);
+        assert_eq!(keystore_decrypt("new-pw", "alice", &rotated["alice"]).unwrap(), "SECRET-A");
+        assert_eq!(keystore_decrypt("new-pw", "bob", &rotated["bob"]).unwrap(), "SECRET-B");
+        // Old password must no longer work post-rotation.
+        assert!(keystore_decrypt("old-pw", "alice", &rotated["alice"]).is_err());
+    }
+
+    #[test]
+    fn test_rotate_keystore_rejects_wrong_current_password_without_modifying_data() {
+        let mut store = std::collections::HashMap::new();
+        store.insert("alice".to_string(), keystore_encrypt("old-pw", "alice", "SECRET-A"));
+
+        let err = rotate_keystore(&store, "definitely-wrong", "new-pw").unwrap_err();
+        assert!(err.contains("alice"), "error should identify the failing credential: {err}");
+
+        // The original store passed in must be untouched by the failed attempt.
+        assert_eq!(
+            keystore_decrypt("old-pw", "alice", &store["alice"]).unwrap(),
+            "SECRET-A"
+        );
+    }
+
+    #[test]
+    fn test_rotate_keystore_empty_store_succeeds_trivially() {
+        let store = std::collections::HashMap::new();
+        let rotated = rotate_keystore(&store, "old-pw", "new-pw").unwrap();
+        assert!(rotated.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod doctor_tests {
+    use super::*;
+
+    const VALID_RUNTIME_CONFIG_JSON: &str = r#"{
+        "contract": {"name": "test-anchor", "version": "1.0.0", "network": "stellar-testnet"},
+        "attestors": {"registry": [
+            {"name": "test-attestor", "address": "GBBD6A7KNZF5WNWQEPZP5DYJD2AYUTLXRB6VXJ4RCX4RTNPPQVNF3GQ", "role": "kyc-issuer", "enabled": true}
+        ]}
+    }"#;
+
+    fn tempdir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("anchorkit_doctor_test_{label}_{:?}", std::thread::current().id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_check_config_files_missing_dir_warns() {
+        let dir = std::env::temp_dir().join("anchorkit_doctor_definitely_missing_dir");
+        let _ = std::fs::remove_dir_all(&dir);
+        let result = check_config_files_in(&dir);
+        assert!(result.passed, "missing configs/ dir should warn, not fail");
+        assert!(result.warning);
+    }
+
+    #[test]
+    fn test_check_config_files_empty_dir_warns() {
+        let dir = tempdir("empty");
+        let result = check_config_files_in(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(result.passed);
+        assert!(result.warning, "empty configs/ dir should warn (no files found)");
+    }
+
+    #[test]
+    fn test_check_config_files_valid_schema_passes() {
+        let dir = tempdir("valid");
+        std::fs::write(dir.join("anchor.json"), VALID_RUNTIME_CONFIG_JSON).unwrap();
+        let result = check_config_files_in(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(result.passed && !result.warning, "got: {}", result.message);
+    }
+
+    #[test]
+    fn test_check_config_files_schema_invalid_fails() {
+        let dir = tempdir("invalid");
+        // Syntactically valid JSON, but missing required 'contract'/'attestors' fields.
+        std::fs::write(dir.join("anchor.json"), r#"{"network":"testnet"}"#).unwrap();
+        let result = check_config_files_in(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!result.passed, "schema-invalid config must fail the doctor check");
+        assert!(result.message.contains("anchor.json"), "got: {}", result.message);
+    }
+
+    #[test]
+    fn test_check_config_files_malformed_toml_fails() {
+        // Regression test: the previous implementation always counted TOML
+        // files as valid without actually parsing them.
+        let dir = tempdir("badtoml");
+        std::fs::write(dir.join("anchor.toml"), "this is not [valid toml").unwrap();
+        let result = check_config_files_in(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!result.passed, "malformed TOML must now be caught, got: {}", result.message);
+    }
+
+    #[test]
+    fn test_check_build_artifacts_missing_target_dir_warns() {
+        let dir = tempdir("no_target");
+        let result = check_build_artifacts_at(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(result.passed);
+        assert!(result.warning, "missing target dir should warn, not fail");
+    }
+
+    #[test]
+    fn test_check_build_artifacts_empty_target_dir_warns() {
+        let dir = tempdir("empty_target");
+        std::fs::create_dir_all(dir.join("target/wasm32-unknown-unknown/release")).unwrap();
+        let result = check_build_artifacts_at(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(result.passed);
+        assert!(result.warning, "target dir with no .wasm files should warn");
+    }
+
+    #[test]
+    fn test_check_build_artifacts_found_passes() {
+        let dir = tempdir("with_wasm");
+        let release_dir = dir.join("target/wasm32-unknown-unknown/release");
+        std::fs::create_dir_all(&release_dir).unwrap();
+        std::fs::write(release_dir.join("anchorkit.wasm"), b"\0asm").unwrap();
+        let result = check_build_artifacts_at(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(result.passed && !result.warning, "got: {}", result.message);
+    }
+
+    #[test]
+    fn test_check_required_dependencies_passes_in_dev_environment() {
+        // This test suite only runs under `cargo test`, so cargo (and the
+        // rustc it invokes) are necessarily on PATH.
+        let result = check_required_dependencies();
+        assert!(result.passed && !result.warning, "got: {}", result.message);
+    }
 }
 
 #[cfg(test)]
