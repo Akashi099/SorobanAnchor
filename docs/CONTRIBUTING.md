@@ -140,6 +140,22 @@ pub fn my_function(param1: Type1, param2: Type2) -> ReturnType {
 }
 ```
 
+## Roadmap and milestones
+
+The project roadmap is maintained in [ROADMAP.md](ROADMAP.md). It describes current milestone phases, planned work, and how to link issues to milestones.
+
+## Issue triage
+
+New issues are triaged and prioritized according to the process in [TRIAGE.md](TRIAGE.md). If you are picking up an issue, check the priority labels and milestone assignment there.
+
+## Branch and PR hygiene
+
+Branch naming conventions, PR workflow, and local automation are documented in [branch-pr-hygiene.md](branch-pr-hygiene.md). Run the branch name validator before pushing:
+
+```bash
+./scripts/validate-branch-name.sh
+```
+
 ## Architecture Decision Records
 
 Important architectural decisions are captured as Architecture Decision Records
@@ -218,6 +234,16 @@ Run a specific test:
 ```bash
 cargo test test_name
 ```
+
+## Release checklist
+
+Before tagging a release, run the automated checklist:
+
+```bash
+./scripts/release-checklist.sh <version>
+```
+
+Full documentation is in [release-checklist.md](release-checklist.md).
 
 ## CI/CD Pipeline
 
