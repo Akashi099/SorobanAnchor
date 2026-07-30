@@ -29,6 +29,7 @@ configs/       Example anchor configs (JSON + TOML)
 examples/      Rust and shell usage examples
 scripts/       Build, validation, CI, and deploy scripts
 docs/          All project documentation (start here)
+docs/adr/      Architecture Decision Records
 benches/       Criterion benchmarks
 fuzz/          Fuzz targets
 ```
@@ -261,6 +262,7 @@ before any key-sharing happens.
 - [README.md](../README.md)
 - [CONTRIBUTING.md](CONTRIBUTING.md)
 - [RUNBOOK.md](RUNBOOK.md)
+- [Architecture Decision Records](adr/)
 - [governance-and-security.md](governance-and-security.md)
 - [error-codes.md](error-codes.md)
 - [migration-guide.md](migration-guide.md)
