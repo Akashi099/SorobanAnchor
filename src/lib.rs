@@ -119,7 +119,7 @@
 //! cargo test --features std,mock-only,stress-tests
 //! ```
 
-#![no_std]
+#![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
 
 // ── Core modules (all build variants) ────────────────────────────────────────
@@ -160,6 +160,8 @@ pub mod host_replay_prevention;
 pub mod config;
 #[cfg(feature = "std")]
 pub mod env_fingerprint;
+#[cfg(feature = "std")]
+pub use env_fingerprint::EnvironmentFingerprint;
 
 // ── Host-only modules (HTTP, threading) ───────────────────────────────────────
 // Excluded from `wasm` builds: on-chain Soroban contracts have no network access.

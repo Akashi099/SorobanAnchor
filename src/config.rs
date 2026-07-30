@@ -263,12 +263,52 @@ pub struct AlertConfig {
 }
 
 pub fn parse_runtime_config_str(input: &str, format: ConfigFormat) -> Result<RuntimeConfig, String> {
-    let config = match format {
-        ConfigFormat::Json => serde_json::from_str(input).map_err(|err| err.to_string())?,
-        ConfigFormat::Toml => toml::from_str(input).map_err(|err| err.to_string())?,
+    // Step 1: parse into a serde_json::Value first so we can run JSON Schema
+    // validation before attempting typed deserialization. This catches unknown
+    // fields, wrong types, and missing required fields with clear messages.
+    let json_value: serde_json::Value = match format {
+        ConfigFormat::Json => serde_json::from_str(input).map_err(|e| e.to_string())?,
+        ConfigFormat::Toml => {
+            // Parse TOML then round-trip through JSON so the schema validator
+            // always operates on a serde_json::Value regardless of input format.
+            let toml_value: toml::Value = toml::from_str(input).map_err(|e| e.to_string())?;
+            serde_json::to_value(toml_value).map_err(|e| e.to_string())?
+        }
     };
+
+    // Step 2: validate against the embedded JSON Schema.
+    validate_against_schema(&json_value)?;
+
+    // Step 3: typed deserialization (shape already confirmed by schema).
+    let config: RuntimeConfig = serde_json::from_value(json_value).map_err(|e| e.to_string())?;
+
+    // Step 4: cross-field semantic validation (referential integrity, etc.).
     validate_runtime_config(&config)?;
     Ok(config)
+}
+
+/// Validate a `serde_json::Value` against the embedded `config_schema.json`.
+///
+/// The schema is compiled once per call. For hot-reload scenarios the
+/// compilation cost is negligible compared to I/O.
+fn validate_against_schema(value: &serde_json::Value) -> Result<(), String> {
+    // The schema is embedded at compile time so it is always present and
+    // consistent with the binary, regardless of the working directory.
+    const SCHEMA_JSON: &str = include_str!("../config_schema.json");
+    let schema: serde_json::Value =
+        serde_json::from_str(SCHEMA_JSON).map_err(|e| format!("internal: schema parse error: {e}"))?;
+    let compiled = jsonschema::JSONSchema::compile(&schema)
+        .map_err(|e| format!("internal: schema compile error: {e}"))?;
+    let result = match compiled.validate(value) {
+        Ok(_) => Ok(()),
+        Err(errors) => {
+            let messages: alloc::vec::Vec<String> = errors
+                .map(|e| format!("  - {}: {}", e.instance_path, e))
+                .collect();
+            Err(format!("config schema validation failed:\n{}", messages.join("\n")))
+        }
+    };
+    result
 }
 
 #[cfg(feature = "std")]

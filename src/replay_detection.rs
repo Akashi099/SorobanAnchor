@@ -73,11 +73,18 @@ pub struct ReplayAttemptRecord {
     pub ledger_sequence: u32,
 }
 
+/// TTL for per-ID replay attempt counters in temporary storage (~7 days at 5 s/ledger).
+/// After this window the counter auto-expires; a new attempt for the same ID after
+/// expiry is treated as a fresh first attempt (the USED key in persistent storage
+/// still blocks the actual attestation, so correctness is preserved).
+const REPLAY_ATTEMPT_TTL: u32 = 120_960;
+
 /// Record a replay detection event in contract storage and emit structured logs.
 ///
-/// This function should be called when a duplicate request ID is detected.
-/// It updates metrics, records the event for auditing, and returns event details
-/// for potential external logging systems.
+/// Per-ID attempt counters are stored in **temporary** storage so they
+/// auto-expire after `REPLAY_ATTEMPT_TTL` ledgers, keeping instance storage
+/// lean. Global aggregate metrics remain in instance storage because they are
+/// small and long-lived.
 ///
 /// # Arguments
 ///
@@ -96,7 +103,7 @@ pub fn record_replay_detection(
     let now = env.ledger().timestamp();
     let ledger_seq = env.ledger().sequence();
 
-    // Increment the global replay metrics
+    // ── Global aggregate metrics (instance storage — small, long-lived) ──
     let metrics_key = soroban_sdk::symbol_short!("REPLAYM");
     let mut metrics: ReplayMetrics = env
         .storage()
@@ -104,11 +111,14 @@ pub fn record_replay_detection(
         .get::<_, ReplayMetrics>(&metrics_key)
         .unwrap_or_default();
 
-    // Track attempt count for this specific request ID using a (Symbol, Bytes) tuple key
-    let attempt_key = (soroban_sdk::symbol_short!("REPLAYAT"), request_id.clone());
+    // ── Per-ID attempt counter (temporary storage — auto-expires) ────────
+    // Using temporary storage avoids unbounded growth of instance storage:
+    // each counter lives for REPLAY_ATTEMPT_TTL ledgers then is pruned
+    // automatically by the Soroban runtime.
+    let attempt_key = (soroban_sdk::symbol_short!("RPLYAT"), request_id.clone());
     let mut attempt_count: u32 = env
         .storage()
-        .instance()
+        .temporary()
         .get::<_, u32>(&attempt_key)
         .unwrap_or(0);
     attempt_count += 1;
@@ -116,17 +126,21 @@ pub fn record_replay_detection(
     // Update global metrics
     metrics.total_replay_attempts += 1;
     if attempt_count == 1 {
-        // This is the first replay of this request ID
         metrics.unique_replayed_ids += 1;
     }
     metrics.last_replay_at = now;
     metrics.last_updated_ledger = ledger_seq;
 
-    // Persist the updated metrics and attempt count
     env.storage().instance().set(&metrics_key, &metrics);
-    env.storage().instance().set(&attempt_key, &attempt_count);
 
-    // Store detailed replay event for audit trail
+    // Persist per-ID counter in temporary storage with bounded TTL.
+    env.storage().temporary().set(&attempt_key, &attempt_count);
+    env.storage().temporary().extend_ttl(&attempt_key, REPLAY_ATTEMPT_TTL, REPLAY_ATTEMPT_TTL);
+
+    // ── Audit record (temporary storage — bounded TTL) ────────────────────
+    // Detailed per-event records are also stored in temporary storage so they
+    // do not accumulate indefinitely. Monitoring systems should index these
+    // events off-chain via the emitted contract event.
     let event_id = next_replay_event_id(env);
     let event = ReplayAttemptRecord {
         request_id: request_id.clone(),
@@ -135,10 +149,10 @@ pub fn record_replay_detection(
         timestamp: now,
         ledger_sequence: ledger_seq,
     };
-    let event_key = (soroban_sdk::symbol_short!("REPLAYEV"), event_id);
-    env.storage().instance().set(&event_key, &event);
+    let event_key = (soroban_sdk::symbol_short!("RPLYEV"), event_id);
+    env.storage().temporary().set(&event_key, &event);
+    env.storage().temporary().extend_ttl(&event_key, REPLAY_ATTEMPT_TTL, REPLAY_ATTEMPT_TTL);
 
-    // Create the event for external logging
     ReplayDetectionEvent {
         request_id: request_id.clone(),
         actor: actor.clone(),
@@ -169,18 +183,13 @@ pub fn get_replay_metrics(env: &Env) -> ReplayMetrics {
 
 /// Get the count of replay attempts for a specific request ID.
 ///
-/// # Arguments
-///
-/// * `env` - The Soroban environment
-/// * `request_id` - The request ID to check
-///
-/// # Returns
-///
-/// Number of times this request ID has been replayed (0 if never seen)
+/// Reads from temporary storage. Returns 0 when the counter has expired or
+/// was never written (the USED key in persistent storage is the authoritative
+/// replay guard; this counter is for observability only).
 pub fn get_replay_count_for_id(env: &Env, request_id: &Bytes) -> u64 {
-    let attempt_key = (soroban_sdk::symbol_short!("REPLAYAT"), request_id.clone());
+    let attempt_key = (soroban_sdk::symbol_short!("RPLYAT"), request_id.clone());
     env.storage()
-        .instance()
+        .temporary()
         .get::<_, u32>(&attempt_key)
         .unwrap_or(0) as u64
 }
@@ -223,23 +232,15 @@ pub fn record_skipped_event(env: &Env) {
 }
 
 /// Get a specific replay detection event record by ID.
-///
-/// # Arguments
-///
-/// * `env` - The Soroban environment
-/// * `event_id` - The event ID to retrieve
-///
-/// # Returns
-///
-/// The `ReplayAttemptRecord` if found, or None
+/// Reads from temporary storage; returns `None` when the record has expired.
 pub fn get_replay_event(env: &Env, event_id: u64) -> Option<ReplayAttemptRecord> {
-    let event_key = (soroban_sdk::symbol_short!("REPLAYEV"), event_id);
-    env.storage().instance().get::<_, ReplayAttemptRecord>(&event_key)
+    let event_key = (soroban_sdk::symbol_short!("RPLYEV"), event_id);
+    env.storage().temporary().get::<_, ReplayAttemptRecord>(&event_key)
 }
 
-/// Get the next sequential replay event ID.
+/// Get the next sequential replay event ID (stored in instance storage).
 fn next_replay_event_id(env: &Env) -> u64 {
-    let id_key = soroban_sdk::symbol_short!("REPLAYID");
+    let id_key = soroban_sdk::symbol_short!("RPLYID");
     let current: u64 = env
         .storage()
         .instance()
@@ -337,6 +338,7 @@ mod tests {
         let request_id = Bytes::from_slice(&env, &[0x05]);
         let actor = Address::generate(&env);
 
+        // Counter lives in temporary storage; starts at 0.
         assert_eq!(env.as_contract(&cid, || get_replay_count_for_id(&env, &request_id)), 0);
 
         env.as_contract(&cid, || { record_replay_detection(&env, &request_id, &actor); });
@@ -354,9 +356,33 @@ mod tests {
 
         env.as_contract(&cid, || { record_replay_detection(&env, &request_id, &actor); });
 
+        // Event is stored in temporary storage.
         let event_opt = env.as_contract(&cid, || get_replay_event(&env, 0));
         assert!(event_opt.is_some());
         let event = event_opt.unwrap();
         assert_eq!(event.attempt_number, 1);
+    }
+
+    /// Verify that per-ID counters do NOT accumulate in instance storage.
+    /// After recording a replay, instance storage should only hold the
+    /// aggregate metrics key, not per-ID attempt keys.
+    #[test]
+    fn test_per_id_counter_not_in_instance_storage() {
+        let (env, cid) = make_test_env();
+        let request_id = Bytes::from_slice(&env, &[0xAB, 0xCD]);
+        let actor = Address::generate(&env);
+
+        env.as_contract(&cid, || { record_replay_detection(&env, &request_id, &actor); });
+
+        // The per-ID key must be absent from instance storage.
+        let old_instance_key = (soroban_sdk::symbol_short!("REPLAYAT"), request_id.clone());
+        let in_instance: bool = env.as_contract(&cid, || {
+            env.storage().instance().has(&old_instance_key)
+        });
+        assert!(!in_instance, "per-ID counter must not be stored in instance storage");
+
+        // But the counter must be readable via get_replay_count_for_id.
+        let count = env.as_contract(&cid, || get_replay_count_for_id(&env, &request_id));
+        assert_eq!(count, 1);
     }
 }
