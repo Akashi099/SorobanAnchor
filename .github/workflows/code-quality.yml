@@ -81,6 +81,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Generate API docs
+        run: cargo doc --lib --no-deps --target-dir target/api-docs
+
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:

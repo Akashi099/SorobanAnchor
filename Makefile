@@ -6,6 +6,7 @@ SOURCE_DATE_EPOCH ?= 1717200000
 
 .PHONY: build test wasm lint \
         doc-lint doc-lint-fix doc-check \
+        api-docs api-docs-clean \
         integration-test integration-test-live \
         integration-test-pipeline \
         stress-test \
@@ -58,6 +59,14 @@ doc-lint-fix:
 ## Run all quality checks: code formatting, linting, tests, and documentation.
 doc-check: fmt-check lint doc-lint
 	@echo "All quality checks passed."
+
+## Generate local HTML API docs from the crate's public exports.
+api-docs:
+	@bash scripts/generate_api_docs.sh
+
+## Remove generated API docs from target/api-docs.
+api-docs-clean:
+	rm -rf target/api-docs
 
 # ── Integration test harness ──────────────────────────────────────────────────
 
