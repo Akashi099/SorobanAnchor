@@ -54,6 +54,95 @@ mod sep10_hardening_tests {
     }
 
     // -----------------------------------------------------------------------
+    // Issue #766: empty and whitespace-only tokens are rejected up front,
+    // before any base64/JSON decoding is attempted.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rejects_empty_token() {
+        let env = make_env();
+        let contract_id = make_contract_id(&env);
+        ledger(&env, 1_000);
+        let sk = SigningKey::generate(&mut OsRng);
+        let pk = Bytes::from_slice(&env, sk.verifying_key().as_bytes());
+
+        let token = String::from_str(&env, "");
+
+        env.as_contract(&contract_id, || {
+            assert!(
+                verify_sep10_jwt(&env, &token, &pk, None).is_err(),
+                "empty token must be rejected"
+            );
+        });
+    }
+
+    #[test]
+    fn rejects_whitespace_only_token() {
+        let env = make_env();
+        let contract_id = make_contract_id(&env);
+        ledger(&env, 1_000);
+        let sk = SigningKey::generate(&mut OsRng);
+        let pk = Bytes::from_slice(&env, sk.verifying_key().as_bytes());
+
+        let token = String::from_str(&env, "   ");
+
+        env.as_contract(&contract_id, || {
+            assert!(
+                verify_sep10_jwt(&env, &token, &pk, None).is_err(),
+                "whitespace-only token must be rejected"
+            );
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #767: a token must have exactly three dot-separated parts.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rejects_four_part_token() {
+        let env = make_env();
+        let contract_id = make_contract_id(&env);
+        ledger(&env, 1_000);
+        let sk = SigningKey::generate(&mut OsRng);
+        let pk = Bytes::from_slice(&env, sk.verifying_key().as_bytes());
+        let sub = Address::generate(&env).to_string();
+        let sub_str: std::string::String = sub.to_string();
+
+        // An otherwise well-formed token with one extra trailing segment.
+        let jwt = build_sep10_jwt(&sk, &sub_str, 5_000);
+        let four_part_jwt = format!("{}.extra", jwt);
+        let token = String::from_str(&env, &four_part_jwt);
+
+        env.as_contract(&contract_id, || {
+            assert!(
+                verify_sep10_jwt(&env, &token, &pk, None).is_err(),
+                "four-part token must be rejected"
+            );
+        });
+    }
+
+    #[test]
+    fn accepts_structurally_valid_three_part_token() {
+        let env = make_env();
+        let contract_id = make_contract_id(&env);
+        ledger(&env, 1_000);
+        let sk = SigningKey::generate(&mut OsRng);
+        let pk = Bytes::from_slice(&env, sk.verifying_key().as_bytes());
+        let sub = Address::generate(&env).to_string();
+        let sub_str: std::string::String = sub.to_string();
+
+        let jwt = build_sep10_jwt(&sk, &sub_str, 5_000);
+        let token = String::from_str(&env, &jwt);
+
+        env.as_contract(&contract_id, || {
+            assert!(
+                verify_sep10_jwt(&env, &token, &pk, None).is_ok(),
+                "structurally valid three-part token must reach verification"
+            );
+        });
+    }
+
+    // -----------------------------------------------------------------------
     // iat: must be present (already tested upstream — confirm still rejected)
     // -----------------------------------------------------------------------
 
