@@ -16,7 +16,7 @@ pub const MAX_JWT_LEN: u32 = 2048;
 pub const JWT_MAX_LEN_KEY: &[u8] = b"JWTMAXLEN";
 
 /// Maximum allowed token lifetime in seconds (24 hours).
-pub const MAX_JWT_LIFETIME: u64 = 86_400;
+pub(crate) const MAX_JWT_LIFETIME: u64 = 86_400;
 
 /// Default clock skew tolerance in seconds.
 pub const DEFAULT_CLOCK_SKEW: u64 = 60;
@@ -367,6 +367,11 @@ pub fn verify_sep10_jwt(
     check_ed25519_verify(env.crypto().ed25519_verify(&pk, &signing_input, &sig))?;
 
     let payload_dec = base64url_decode(payload_b64).map_err(|_| ())?;
+    // Reject an empty payload immediately — an empty byte slice cannot contain
+    // valid claims and would produce parser-version-dependent error messages.
+    if payload_dec.is_empty() {
+        return Err(());
+    }
     let exp = parse_json_exp(&payload_dec)?;
     let now = env.ledger().timestamp();
 
@@ -392,7 +397,10 @@ pub fn verify_sep10_jwt(
     if iat > now.saturating_add(skew) {
         return Err(());
     }
-    if exp.saturating_sub(iat) > MAX_JWT_LIFETIME {
+    // Use checked_sub so that an iat > exp (or an iat so large the subtraction
+    // would wrap) is treated as an invalid lifetime rather than silently
+    // producing 0 or wrapping to a small value that appears within limits.
+    if exp.checked_sub(iat).map_or(true, |lifetime| lifetime > MAX_JWT_LIFETIME) {
         return Err(());
     }
 
@@ -950,6 +958,35 @@ mod tests {
         let token = String::from_str(&env, jwt.as_str());
         env.as_contract(&contract_id, || {
             assert!(verify_sep10_jwt(&env, &token, &pk, None).is_err());
+        });
+    }
+
+    #[test]
+    fn verify_rejects_empty_payload_section() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        // Construct a JWT whose middle (payload) section is an empty base64url
+        // string — "header..sig". The empty-payload guard must fire before any
+        // claim parsing occurs, returning the same invalid-claims result.
+        let env = Env::default();
+        ledger(&env, 1_000);
+        let contract_id = make_contract_id(&env);
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let pk = Bytes::from_slice(&env, signing_key.verifying_key().as_bytes());
+
+        let header = r#"{"alg":"EdDSA","typ":"JWT"}"#;
+        let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
+        // Empty payload: the segment between the two dots is the empty string.
+        let signing_input = format!("{}.", header_b64);
+        let sig = signing_key.sign(signing_input.as_bytes());
+        let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_bytes());
+        let jwt = format!("{}.{}", signing_input, sig_b64);
+        let token = String::from_str(&env, &jwt);
+
+        env.as_contract(&contract_id, || {
+            assert!(
+                verify_sep10_jwt(&env, &token, &pk, None).is_err(),
+                "empty payload section must be rejected as malformed claims"
+            );
         });
     }
 }
