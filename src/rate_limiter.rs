@@ -274,7 +274,10 @@ impl RateLimiter {
         
         // Check if limit is exceeded
         if state.submission_count >= config.max_submissions {
-            return Err(AnchorKitError::rate_limit_exceeded());
+            return Err(AnchorKitError::new(
+                crate::errors::ErrorCode::RateLimitExceeded,
+                "Request throttled: rate-limit window capacity exhausted; retry after the window expires",
+            ));
         }
 
         // Opt-in burst-control gate (#630). A no-op when no BurstControlConfig
@@ -290,8 +293,8 @@ impl RateLimiter {
             Self::check_fairness(env, config, &state, &fairness_config, current_ledger)?;
         }
 
-        // Increment counter and save state
-        state.submission_count += 1;
+        // Increment counter and save state; saturating_add prevents wrapping to zero.
+        state.submission_count = state.submission_count.saturating_add(1);
         env.storage().persistent().set(&state_key, &state);
 
         Ok(())
@@ -584,33 +587,20 @@ impl RateLimiter {
     
     /// Check if a rate-limit window has expired.
     ///
-    /// Uses `checked_sub` instead of `saturating_sub` so that a sequence
-    /// anomaly where `current < window_start` (e.g. due to a ledger rollback
-    /// or corrupted stored state) is treated as **not expired** rather than
-    /// silently wrapping to 0 and comparing against `window_length`.
-    ///
-    /// # Safe-default rationale
-    ///
-    /// When `current_ledger < window_start_ledger` the subtraction overflows.
-    /// Saturating to 0 makes the condition `0 >= window_length` false for any
-    /// positive `window_length`, so the old behaviour was accidentally correct.
-    /// Using `checked_sub` makes the intent explicit: we detect the underflow
-    /// and deliberately return `false` (window not expired), preserving the
-    /// existing rate-limit state so an attestor cannot exploit the anomaly to
-    /// bypass their quota.
+    /// `window_start_ledger` is always set to `env.ledger().sequence()` at
+    /// state creation or window reset, so `current_ledger >= window_start_ledger`
+    /// is guaranteed by the preceding state normalization. `saturating_sub`
+    /// makes that invariant explicit: if `current < window_start` (which cannot
+    /// happen in practice), the subtraction saturates to 0 and `validate_config`
+    /// ensures `window_length > 0`, so the expression is still `false` — the
+    /// window is treated as not expired and the existing submission count is
+    /// preserved.
     pub(crate) fn is_window_expired(
         current_ledger: u32,
         window_start_ledger: u32,
         window_length: u32,
     ) -> bool {
-        match current_ledger.checked_sub(window_start_ledger) {
-            Some(delta) => delta >= window_length,
-            // current < window_start: ledger sequence anomaly or stored-state
-            // inconsistency. Treat as window not yet expired so the existing
-            // submission count is preserved and the attestor cannot exploit
-            // the anomaly to bypass their rate limit.
-            None => false,
-        }
+        current_ledger.saturating_sub(window_start_ledger) >= window_length
     }
     
     /// Generate collision-resistant storage key for per-attestor rate limit state.
@@ -1174,6 +1164,40 @@ mod tests {
         // State must still show exactly max_submissions
         let state = env.as_contract(&contract_id, &|| RateLimiter::get_state(&env, &attestor));
         assert_eq!(state.submission_count, 2);
+    }
+
+    /// Verify that the stored counter saturates at max_submissions rather than
+    /// wrapping to zero when the window is full. Forces the state directly to
+    /// u32::MAX and confirms that a subsequent denied request leaves the counter
+    /// unchanged (saturating_add(1) on u32::MAX stays u32::MAX, not 0).
+    #[test]
+    fn test_counter_saturates_at_u32_max() {
+        let env = Env::default();
+        let attestor = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+        let config = RateLimitConfig { max_submissions: 5, window_length: 100 };
+        let contract_address = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+        let contract_id = env.register_contract(&contract_address, crate::contract::AnchorKitContract);
+
+        // Artificially write a state with submission_count at u32::MAX to
+        // simulate a counter that has been driven to its integer ceiling.
+        env.as_contract(&contract_id, &|| {
+            let key = RateLimiter::state_key(&env, &attestor);
+            env.storage().persistent().set(&key, &RateLimitState {
+                submission_count: u32::MAX,
+                window_start_ledger: 0,
+            });
+        });
+
+        // The next call must be rejected (count >= max_submissions).
+        let result = env.as_contract(&contract_id, &|| {
+            RateLimiter::check_and_increment(&env, &attestor, &config)
+        });
+        assert!(result.is_err(), "over-limit call must be rejected");
+        assert_eq!(result.unwrap_err().code, ErrorCode::RateLimitExceeded);
+
+        // The counter must remain at u32::MAX — it must not have wrapped to 0.
+        let state = env.as_contract(&contract_id, &|| RateLimiter::get_state(&env, &attestor));
+        assert_eq!(state.submission_count, u32::MAX, "counter must saturate, not wrap");
     }
 
     // -------------------------------------------------------------------------
