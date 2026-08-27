@@ -251,6 +251,45 @@ mod tests {
         }
     }
 
+    /// Regression: every terminal state must explicitly reject a transition
+    /// back to `Active` (reactivation). This covers the path described in the
+    /// spec where a generic branch could have allowed terminal → Active.
+    #[test]
+    fn test_terminal_states_reject_reactivation_to_active() {
+        let terminals = [
+            SessionState::Closed,
+            SessionState::Expired,
+            SessionState::Exhausted,
+        ];
+        for from in terminals {
+            let result = validate_transition(from, SessionState::Active);
+            assert_eq!(
+                result,
+                Err(SessionTransitionError::FromTerminal),
+                "terminal state {from:?} must reject transition to Active with FromTerminal, got {result:?}"
+            );
+        }
+    }
+
+    /// Regression: terminal states must also reject Created (no walk-back
+    /// to non-terminal non-Active states either).
+    #[test]
+    fn test_terminal_states_reject_transition_to_created() {
+        let terminals = [
+            SessionState::Closed,
+            SessionState::Expired,
+            SessionState::Exhausted,
+        ];
+        for from in terminals {
+            let result = validate_transition(from, SessionState::Created);
+            assert_eq!(
+                result,
+                Err(SessionTransitionError::FromTerminal),
+                "terminal state {from:?} must reject transition to Created, got {result:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_active_cannot_go_to_created() {
         assert_eq!(

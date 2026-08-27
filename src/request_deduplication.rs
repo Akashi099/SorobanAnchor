@@ -111,10 +111,21 @@ struct DeduplicationEntry {
 /// Maps [`DeduplicationKey`]s to cached outcomes with per-entry TTLs. Entries
 /// expire after `default_ttl_secs` seconds from the time they are recorded;
 /// call [`purge_expired`](Self::purge_expired) periodically to reclaim memory.
+///
+/// The store enforces a hard capacity limit (`max_entries`). Any call to
+/// [`record_success`](Self::record_success) or
+/// [`record_failure`](Self::record_failure) that would push the number of
+/// **live** (non-expired) entries past this limit first evicts expired entries.
+/// If the store is still at capacity after eviction, the insertion is silently
+/// dropped to prevent unbounded memory growth.
 #[derive(Debug)]
 pub struct DeduplicationStore {
     /// Default time-to-live in seconds for each entry.
     default_ttl_secs: u64,
+    /// Maximum number of entries the store will hold at any one time.
+    /// `0` means unlimited (backward-compatible default when constructed via
+    /// [`DeduplicationStore::new`]).
+    max_entries: usize,
     entries: BTreeMap<String, DeduplicationEntry>,
 }
 
@@ -123,6 +134,20 @@ impl DeduplicationStore {
     pub fn new(default_ttl_secs: u64) -> Self {
         DeduplicationStore {
             default_ttl_secs,
+            max_entries: 0,
+            entries: BTreeMap::new(),
+        }
+    }
+
+    /// Create a new store with the given default TTL and a hard capacity cap.
+    ///
+    /// When `max_entries > 0` the insertion path evicts expired entries before
+    /// adding a new key, and skips the insertion if the store is still full
+    /// after eviction.  `max_entries == 0` disables the cap (same as [`new`]).
+    pub fn with_capacity(default_ttl_secs: u64, max_entries: usize) -> Self {
+        DeduplicationStore {
+            default_ttl_secs,
+            max_entries,
             entries: BTreeMap::new(),
         }
     }
@@ -141,6 +166,12 @@ impl DeduplicationStore {
 
     /// Store a successful outcome for `key`.
     pub fn record_success(&mut self, key: &DeduplicationKey, summary: impl Into<String>, now_secs: u64) {
+        self.enforce_capacity(now_secs);
+        if self.max_entries > 0 && self.entries.len() >= self.max_entries {
+            // Still at capacity after eviction — drop the insertion to stay
+            // within the configured bound.
+            return;
+        }
         self.entries.insert(
             key.as_map_key(),
             DeduplicationEntry {
@@ -152,6 +183,10 @@ impl DeduplicationStore {
 
     /// Store a failure outcome for `key`.
     pub fn record_failure(&mut self, key: &DeduplicationKey, error: impl Into<String>, now_secs: u64) {
+        self.enforce_capacity(now_secs);
+        if self.max_entries > 0 && self.entries.len() >= self.max_entries {
+            return;
+        }
         self.entries.insert(
             key.as_map_key(),
             DeduplicationEntry {
@@ -171,6 +206,18 @@ impl DeduplicationStore {
                 None
             }
         })
+    }
+
+    /// Enforce the capacity limit before an insertion by evicting expired
+    /// entries.  Called at the start of every `record_*` method.
+    fn enforce_capacity(&mut self, now_secs: u64) {
+        if self.max_entries == 0 {
+            return; // no cap configured
+        }
+        if self.entries.len() >= self.max_entries {
+            // Evict expired entries to make room.
+            self.entries.retain(|_, v| v.expires_at > now_secs);
+        }
     }
 
     /// Remove all expired entries, returning the count of entries removed.
@@ -371,5 +418,82 @@ mod tests {
         store.record_success(&k1, "ok", 0);
         assert!(store.is_duplicate(&k1, 1));
         assert!(!store.is_duplicate(&k2, 1));
+    }
+
+    // -----------------------------------------------------------------------
+    // request_id_tests — capacity guard
+    // -----------------------------------------------------------------------
+
+    /// The store must never exceed max_entries after an insertion even when no
+    /// purge has been called yet.
+    #[test]
+    fn capacity_guard_never_exceeds_max_entries() {
+        let max = 3usize;
+        let mut store = DeduplicationStore::with_capacity(300, max);
+
+        for i in 0..10u32 {
+            let k = DeduplicationKey::new("op", i.to_string());
+            store.record_success(&k, "ok", 0);
+            assert!(
+                store.len() <= max,
+                "store.len() = {} exceeded max_entries = {} after inserting key {}",
+                store.len(), max, i
+            );
+        }
+    }
+
+    /// Entries that are still within their TTL continue to deduplicate even
+    /// when the store is at capacity.
+    #[test]
+    fn capacity_guard_preserves_existing_deduplication() {
+        let mut store = DeduplicationStore::with_capacity(300, 2);
+        let k1 = DeduplicationKey::new("op", "a");
+        let k2 = DeduplicationKey::new("op", "b");
+        store.record_success(&k1, "ok", 0);
+        store.record_success(&k2, "ok", 0);
+
+        // At capacity — k1 and k2 should still deduplicate.
+        assert!(store.is_duplicate(&k1, 1));
+        assert!(store.is_duplicate(&k2, 1));
+    }
+
+    /// When expired entries exist, the capacity guard evicts them to make room
+    /// for a new insertion rather than dropping the new entry.
+    #[test]
+    fn capacity_guard_evicts_expired_before_dropping_new_entry() {
+        // TTL = 10 s, capacity = 2
+        let mut store = DeduplicationStore::with_capacity(10, 2);
+        let k1 = DeduplicationKey::new("op", "a");
+        let k2 = DeduplicationKey::new("op", "b");
+        let k3 = DeduplicationKey::new("op", "c");
+
+        store.record_success(&k1, "ok", 0);  // expires at t=10
+        store.record_success(&k2, "ok", 0);  // expires at t=10
+        assert_eq!(store.len(), 2);
+
+        // At t=20 both k1 and k2 are expired. Inserting k3 should evict them
+        // and succeed, leaving only k3 in the store.
+        store.record_success(&k3, "ok", 20); // expires at t=30
+        assert_eq!(store.len(), 1, "expired entries should have been evicted");
+        assert!(store.is_duplicate(&k3, 21));
+        assert!(!store.is_duplicate(&k1, 21), "k1 should be gone");
+        assert!(!store.is_duplicate(&k2, 21), "k2 should be gone");
+    }
+
+    /// `record_failure` also respects the capacity cap.
+    #[test]
+    fn capacity_guard_applies_to_record_failure() {
+        let mut store = DeduplicationStore::with_capacity(300, 1);
+        let k1 = DeduplicationKey::new("op", "x");
+        let k2 = DeduplicationKey::new("op", "y");
+
+        store.record_failure(&k1, "err", 0);
+        assert_eq!(store.len(), 1);
+
+        // k1 is still live — k2 insertion must be dropped.
+        store.record_failure(&k2, "err", 0);
+        assert_eq!(store.len(), 1, "second entry should be dropped when at capacity");
+        assert!(store.is_duplicate(&k1, 1), "k1 must still deduplicate");
+        assert!(!store.is_duplicate(&k2, 1), "k2 was never inserted");
     }
 }

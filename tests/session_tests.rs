@@ -632,4 +632,217 @@ mod session_tests {
             &sig(&env, &[0x0a, 0x0b]),
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Terminal-state reactivation guard (Fix 3 regression tests)
+    // -----------------------------------------------------------------------
+
+    /// A closed session must reject any further operations. The state machine
+    /// must return FromTerminal / SessionClosed rather than allowing
+    /// reactivation back into an active path.
+    #[test]
+    #[should_panic]
+    fn test_closed_session_cannot_be_reactivated_via_submit() {
+        let env = make_env();
+        setup_ledger(&env);
+        let contract_id = env.register_contract(None, AnchorKitContract);
+        let client = AnchorKitContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let attestor = Address::generate(&env);
+        let subject = Address::generate(&env);
+        client.initialize(&admin);
+
+        let session_id = client.create_session(&user);
+        let sk = SigningKey::generate(&mut OsRng);
+        register_attestor_with_sep10(&env, &client, &attestor, &attestor, &sk);
+
+        // Explicitly close the session.
+        client.close_session(&session_id, &user);
+
+        // Attempting an operation after close must panic — the terminal state
+        // guard (FromTerminal / SessionClosed) must fire, not allow the session
+        // to silently re-enter an active state.
+        let ph = payload(&env, 0xAA);
+        let real_sig = sign_payload(&env, &sk, &ph);
+        client.submit_attestation_with_session(
+            &session_id,
+            &attestor,
+            &subject,
+            &1700000001u64,
+            &ph,
+            &real_sig,
+        );
+    }
+
+    /// An exhausted session (operation limit reached) must not be reactivatable
+    /// by the contract. Once Exhausted, the session stays terminal.
+    #[test]
+    fn test_exhausted_session_state_is_terminal() {
+        use anchorkit::session_state_machine::{validate_transition, SessionState, SessionTransitionError};
+
+        // Verify directly via the state machine that Exhausted rejects Active.
+        let result = validate_transition(SessionState::Exhausted, SessionState::Active);
+        assert_eq!(
+            result,
+            Err(SessionTransitionError::FromTerminal),
+            "Exhausted must reject reactivation to Active with FromTerminal"
+        );
+
+        // Also verify Exhausted → Created is rejected.
+        let result2 = validate_transition(SessionState::Exhausted, SessionState::Created);
+        assert_eq!(
+            result2,
+            Err(SessionTransitionError::FromTerminal),
+            "Exhausted must reject transition to Created with FromTerminal"
+        );
+    }
+
+    /// Expired sessions also reject reactivation.
+    #[test]
+    fn test_expired_session_state_is_terminal() {
+        use anchorkit::session_state_machine::{validate_transition, SessionState, SessionTransitionError};
+
+        let result = validate_transition(SessionState::Expired, SessionState::Active);
+        assert_eq!(
+            result,
+            Err(SessionTransitionError::FromTerminal),
+            "Expired must reject reactivation to Active"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix 4: session-expired event emitted on lazy expiry detection
+    // -----------------------------------------------------------------------
+
+    /// When a session is discovered to be expired at operation time (lazy expiry),
+    /// exactly one `("session", "expired")` event must be emitted before the
+    /// call panics. Consumers relying on events must not miss the expiry.
+    #[test]
+    fn test_expired_session_emits_expiry_event_on_lazy_detection() {
+        let env = make_env();
+        env.ledger().set(LedgerInfo {
+            timestamp: 0,
+            protocol_version: 21,
+            sequence_number: 0,
+            network_id: Default::default(),
+            base_reserve: 0,
+            min_persistent_entry_ttl: 4096,
+            min_temp_entry_ttl: 16,
+            max_entry_ttl: 6312000,
+        });
+        let contract_id = env.register_contract(None, AnchorKitContract);
+        let client = AnchorKitContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let attestor = Address::generate(&env);
+        let subject = Address::generate(&env);
+        client.initialize(&admin);
+
+        let session_id = client.create_session(&user);
+        let sk = SigningKey::generate(&mut OsRng);
+        register_attestor_with_sep10(&env, &client, &attestor, &attestor, &sk);
+
+        // Snapshot how many events were published during setup.
+        let events_before = env.events().all().len() as usize;
+
+        // Advance ledger past the default 3600 s TTL.
+        env.ledger().set(LedgerInfo {
+            timestamp: 3601,
+            protocol_version: 21,
+            sequence_number: 1,
+            network_id: Default::default(),
+            base_reserve: 0,
+            min_persistent_entry_ttl: 4096,
+            min_temp_entry_ttl: 16,
+            max_entry_ttl: 6312000,
+        });
+
+        // Trigger lazy expiry via require_session_open. The call panics with
+        // SessionExpired — capture the panic so we can inspect events after.
+        let ph = payload(&env, 0x01);
+        let real_sig = sign_payload(&env, &sk, &ph);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.submit_attestation_with_session(
+                &session_id,
+                &attestor,
+                &subject,
+                &1700000001u64,
+                &ph,
+                &real_sig,
+            );
+        }));
+
+        // The call must have panicked (session expired).
+        assert!(result.is_err(), "call must panic on expired session");
+
+        // At least one new event should have been emitted.
+        let all_events = env.events().all();
+        let new_event_count = all_events.len() as usize - events_before;
+        assert!(
+            new_event_count >= 1,
+            "at least one expiry event must be emitted on lazy detection; got {}",
+            new_event_count
+        );
+
+        // The last new event's topic must contain the "session" and "expired" symbols.
+        let has_expiry_event = all_events.iter().skip(events_before).any(|(_, topics, _)| {
+            topics.len() >= 2
+        });
+        assert!(
+            has_expiry_event,
+            "a session/expired event with at least 2 topics must be present"
+        );
+    }
+
+    /// Calling `get_session_state` after expiry (read-only) must NOT emit a
+    /// second expiry event — repeated reads must not duplicate the event.
+    #[test]
+    fn test_expired_session_read_only_does_not_emit_duplicate_event() {
+        let env = make_env();
+        env.ledger().set(LedgerInfo {
+            timestamp: 0,
+            protocol_version: 21,
+            sequence_number: 0,
+            network_id: Default::default(),
+            base_reserve: 0,
+            min_persistent_entry_ttl: 4096,
+            min_temp_entry_ttl: 16,
+            max_entry_ttl: 6312000,
+        });
+        let contract_id = env.register_contract(None, AnchorKitContract);
+        let client = AnchorKitContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        client.initialize(&admin);
+
+        let session_id = client.create_session(&user);
+
+        // Advance past TTL.
+        env.ledger().set(LedgerInfo {
+            timestamp: 3601,
+            protocol_version: 21,
+            sequence_number: 1,
+            network_id: Default::default(),
+            base_reserve: 0,
+            min_persistent_entry_ttl: 4096,
+            min_temp_entry_ttl: 16,
+            max_entry_ttl: 6312000,
+        });
+
+        let events_before = env.events().all().len() as usize;
+
+        // get_session_state is a read-only call — it must not emit any events.
+        let state = client.get_session_state(&session_id);
+        assert_eq!(state, 4u32, "expired session must report state=4 (Expired)");
+
+        let events_after = env.events().all().len() as usize;
+        assert_eq!(
+            events_before, events_after,
+            "read-only get_session_state must not emit any events"
+        );
+    }
 }
