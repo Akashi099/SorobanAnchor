@@ -172,6 +172,11 @@ pub enum ErrorCode {
     InvalidSloConfig          = 75,
     /// No SLO has been configured for this anchor.
     SloNotConfigured          = 76,
+
+    // Registration input errors (77)
+    /// Registration was rejected because a required text field is blank
+    /// (e.g. the SEP-10 token supplied to `register_attestor` is empty).
+    InvalidRegistration       = 77,
 }
 
 impl ErrorCode {
@@ -256,6 +261,7 @@ impl ErrorCode {
             ErrorCode::SloViolation              => "Service level objective was violated",
             ErrorCode::InvalidSloConfig          => "SLO configuration is invalid",
             ErrorCode::SloNotConfigured          => "No SLO has been configured for this anchor",
+            ErrorCode::InvalidRegistration       => "Registration rejected: a required text field is blank",
         }
     }
 }

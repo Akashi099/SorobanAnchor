@@ -3201,6 +3201,12 @@ impl AnchorKitContract {
     /// AnchorKitContract::register_attestor(env, attestor, token, issuer, pubkey);
     /// ```
     pub fn register_attestor(env: Env, attestor: Address, sep10_token: String, sep10_issuer: Address, public_key: BytesN<32>) {
+        // Reject a blank SEP-10 token immediately — an empty identifier makes
+        // authentication impossible to diagnose and would cause a confusing
+        // JWT-verification error later.  Fail fast before any state mutation.
+        if sep10_token.len() == 0 {
+            panic_with_error!(&env, ErrorCode::InvalidRegistration);
+        }
         // Accept via primary admin, AttestorAdmin role, OR ManageAttestors capability.
         if !Self::has_role_internal(&env, &attestor, AdminRole::AttestorAdmin)
             && !Self::has_capability_internal(&env, &attestor, AdminCapability::ManageAttestors)
