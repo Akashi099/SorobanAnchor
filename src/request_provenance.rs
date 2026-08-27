@@ -65,6 +65,32 @@ pub enum ProvenanceError {
 // ProvenanceRecord
 // ---------------------------------------------------------------------------
 
+/// Maximum allowed length in bytes for custom provenance metadata strings.
+pub const MAX_METADATA_LEN: usize = 1024;
+
+/// Backward-compatible alias for [`MAX_METADATA_LEN`].
+pub const MAX_METADATA_LENGTH: usize = MAX_METADATA_LEN;
+
+/// Errors that can arise during provenance validation or construction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProvenanceError {
+    /// Metadata exceeds the maximum allowed length (`MAX_METADATA_LEN`).
+    MetadataTooLong {
+        len: usize,
+        max: usize,
+    },
+}
+
+impl core::fmt::Display for ProvenanceError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ProvenanceError::MetadataTooLong { len, max } => {
+                write!(f, "provenance metadata length {len} exceeds limit of {max} bytes")
+            }
+        }
+    }
+}
+
 /// Provenance and lineage record for a single request.
 ///
 /// Attach one of these to every request that enters the system so that
@@ -81,6 +107,8 @@ pub struct ProvenanceRecord {
     origin_service: String,
     /// Optional label for the operation being performed.
     operation: Option<String>,
+    /// Optional custom metadata attached to this record (bounded by [`MAX_METADATA_LEN`]).
+    metadata: Option<String>,
     /// Unix timestamp (seconds) when this record was created.
     created_at: u64,
 }
@@ -111,6 +139,7 @@ impl ProvenanceRecord {
             ancestors: Vec::new(),
             origin_service: svc,
             operation: Some(op),
+            metadata: None,
             created_at,
         })
     }
@@ -137,8 +166,21 @@ impl ProvenanceRecord {
             ancestors: Vec::new(),
             origin_service: svc,
             operation: Some(operation.into()),
+            metadata: None,
             created_at,
         })
+    }
+
+    /// Create a root record with custom metadata attached, validating that its
+    /// length does not exceed [`MAX_METADATA_LEN`].
+    pub fn root_with_metadata(
+        origin_service: impl Into<String>,
+        operation: impl Into<String>,
+        metadata: impl Into<String>,
+        created_at: u64,
+    ) -> Result<Self, ProvenanceError> {
+        let root = Self::root(origin_service, operation, created_at);
+        root.with_metadata(metadata)
     }
 
     /// Derive a child record from this one.
@@ -175,6 +217,7 @@ impl ProvenanceRecord {
             ancestors,
             origin_service: svc,
             operation: Some(op),
+            metadata: None,
             created_at,
         })
     }
@@ -205,8 +248,55 @@ impl ProvenanceRecord {
             ancestors,
             origin_service: svc,
             operation: Some(operation.into()),
+            metadata: None,
             created_at,
         })
+    }
+
+    /// Derive a child record with custom metadata attached, validating that its
+    /// length does not exceed [`MAX_METADATA_LEN`].
+    pub fn child_with_metadata(
+        &self,
+        child_service: impl Into<String>,
+        operation: impl Into<String>,
+        metadata: impl Into<String>,
+        created_at: u64,
+    ) -> Result<Self, ProvenanceError> {
+        let child = self.child(child_service, operation, created_at);
+        child.with_metadata(metadata)
+    }
+
+    /// Validate that a metadata string does not exceed [`MAX_METADATA_LEN`].
+    pub fn validate_metadata(metadata: &str) -> Result<(), ProvenanceError> {
+        if metadata.len() > MAX_METADATA_LEN {
+            Err(ProvenanceError::MetadataTooLong {
+                len: metadata.len(),
+                max: MAX_METADATA_LEN,
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Return `true` if `metadata` is within the maximum permitted length.
+    pub fn is_metadata_valid(metadata: &str) -> bool {
+        metadata.len() <= MAX_METADATA_LEN
+    }
+
+    /// Attach metadata to this record, validating that its length does not exceed [`MAX_METADATA_LEN`].
+    pub fn with_metadata(mut self, metadata: impl Into<String>) -> Result<Self, ProvenanceError> {
+        let meta = metadata.into();
+        Self::validate_metadata(&meta)?;
+        self.metadata = Some(meta);
+        Ok(self)
+    }
+
+    /// Set or update metadata on this record, validating length against [`MAX_METADATA_LEN`].
+    pub fn set_metadata(&mut self, metadata: impl Into<String>) -> Result<(), ProvenanceError> {
+        let meta = metadata.into();
+        Self::validate_metadata(&meta)?;
+        self.metadata = Some(meta);
+        Ok(())
     }
 
     // ── Accessors ──────────────────────────────────────────────────────────
@@ -251,6 +341,11 @@ impl ProvenanceRecord {
         self.operation.as_deref()
     }
 
+    /// Custom metadata attached to this record, if set.
+    pub fn metadata(&self) -> Option<&str> {
+        self.metadata.as_deref()
+    }
+
     /// Unix timestamp (seconds) when this record was created.
     pub fn created_at(&self) -> u64 {
         self.created_at
@@ -266,17 +361,29 @@ impl ProvenanceRecord {
     /// Produce a compact log-friendly summary.
     ///
     /// ```text
-    /// req=<id> parent=<id|none> depth=<n> svc=<name> op=<op>
+    /// req=<id> parent=<id|none> depth=<n> svc=<name> op=<op> [meta=<meta>]
     /// ```
     pub fn log_fields(&self) -> String {
-        format!(
-            "req={} parent={} depth={} svc={} op={}",
-            self.request_id,
-            self.parent_id.as_deref().unwrap_or("none"),
-            self.depth(),
-            self.origin_service,
-            self.operation.as_deref().unwrap_or("unknown"),
-        )
+        if let Some(ref meta) = self.metadata {
+            format!(
+                "req={} parent={} depth={} svc={} op={} meta={}",
+                self.request_id,
+                self.parent_id.as_deref().unwrap_or("none"),
+                self.depth(),
+                self.origin_service,
+                self.operation.as_deref().unwrap_or("unknown"),
+                meta,
+            )
+        } else {
+            format!(
+                "req={} parent={} depth={} svc={} op={}",
+                self.request_id,
+                self.parent_id.as_deref().unwrap_or("none"),
+                self.depth(),
+                self.origin_service,
+                self.operation.as_deref().unwrap_or("unknown"),
+            )
+        }
     }
 
     /// Serialize to a list of `(header_name, header_value)` pairs for HTTP propagation.
@@ -288,6 +395,7 @@ impl ProvenanceRecord {
     /// | `X-Request-Depth` | Depth as decimal |
     /// | `X-Request-Origin` | Originating service |
     /// | `X-Request-Operation` | Operation label |
+    /// | `X-Request-Metadata` | Custom metadata (if set) |
     pub fn to_headers(&self) -> Vec<(String, String)> {
         let mut headers = Vec::new();
         headers.push((PROVENANCE_ID_HEADER.to_string(), self.request_id.clone()));
@@ -300,18 +408,23 @@ impl ProvenanceRecord {
         if let Some(ref op) = self.operation {
             headers.push((OPERATION_HEADER.to_string(), op.clone()));
         }
+        if let Some(ref meta) = self.metadata {
+            headers.push((METADATA_HEADER.to_string(), meta.clone()));
+        }
         headers
     }
 
     /// Parse a [`ProvenanceRecord`] from HTTP headers.
     ///
-    /// Returns `None` when the required `X-Request-Provenance-Id` header is absent.
+    /// Returns `None` when the required `X-Request-Provenance-Id` header is absent,
+    /// or if any metadata header exceeds [`MAX_METADATA_LEN`].
     pub fn from_headers(headers: &[(String, String)]) -> Option<Self> {
         let mut request_id: Option<String> = None;
         let mut parent_id: Option<String> = None;
         let mut depth: usize = 0;
         let mut origin_service = String::new();
         let mut operation: Option<String> = None;
+        let mut metadata: Option<String> = None;
 
         for (name, value) in headers {
             let n = name.as_str();
@@ -327,6 +440,11 @@ impl ProvenanceRecord {
                 origin_service = value.clone();
             } else if n.eq_ignore_ascii_case(OPERATION_HEADER) {
                 operation = Some(value.clone());
+            } else if n.eq_ignore_ascii_case(METADATA_HEADER) {
+                if value.len() > MAX_METADATA_LEN {
+                    return None; // Reject over-limit metadata
+                }
+                metadata = Some(value.clone());
             }
         }
 
@@ -340,6 +458,7 @@ impl ProvenanceRecord {
             ancestors: Vec::new(),
             origin_service,
             operation,
+            metadata,
             created_at: 0, // not propagated via headers
         })
     }
@@ -359,6 +478,8 @@ pub const DEPTH_HEADER: &str = "X-Request-Depth";
 pub const ORIGIN_HEADER: &str = "X-Request-Origin";
 /// `X-Request-Operation`
 pub const OPERATION_HEADER: &str = "X-Request-Operation";
+/// `X-Request-Metadata`
+pub const METADATA_HEADER: &str = "X-Request-Metadata";
 
 // ---------------------------------------------------------------------------
 // Private helpers
