@@ -78,12 +78,17 @@ pub struct RetryConfig {
     pub jitter_policy: JitterPolicy,
 }
 
+/// Default delay cap in milliseconds for [`RetryConfig::default`] — bounds how
+/// large the exponential backoff is allowed to grow before retries stop
+/// waiting any longer between attempts.
+const DEFAULT_MAX_DELAY_MS: u64 = 5_000;
+
 impl Default for RetryConfig {
     fn default() -> Self {
         RetryConfig {
             max_attempts: 3,
             base_delay_ms: 100,
-            max_delay_ms: 5_000,
+            max_delay_ms: DEFAULT_MAX_DELAY_MS,
             backoff_multiplier: 2,
             strategy: BackoffStrategy::default(),
             jitter_policy: JitterPolicy::default(),
@@ -845,6 +850,37 @@ mod retry_tests {
         let mut js = MockJitterSource::new(vec![999]);
         assert_eq!(config.delay_for_attempt(0, &mut js), 0);
         assert_eq!(config.delay_for_attempt(1, &mut js), 0);
+    }
+
+    /// Issue #762: an explicit zero `base_delay_ms` must be preserved end to
+    /// end — `sleep_fn` should observe `0` on every retry, not a positive
+    /// default substituted in its place.
+    #[test]
+    fn test_explicit_zero_base_delay_reaches_sleep_fn() {
+        let config = RetryConfig::new(3, 0, 1_000, 2);
+        assert_eq!(config.base_delay_ms, 0, "explicit zero must be stored as-is");
+
+        let mut recorded: Vec<u64> = Vec::new();
+        let mut js = MockJitterSource::new(vec![0]);
+        let _ = retry_with_backoff(
+            &config,
+            |_| Err::<i32, _>(TestError::Transient),
+            is_retryable_test,
+            |ms| recorded.push(ms),
+            &mut js,
+        );
+
+        assert_eq!(recorded.len(), 2);
+        assert!(recorded.iter().all(|&ms| ms == 0), "recorded delays: {recorded:?}");
+
+        // The default configuration (no explicit zero given) must remain
+        // unaffected by the change above.
+        let default_config = RetryConfig::default();
+        assert_eq!(default_config.base_delay_ms, 100);
+
+        // A positive explicit value must also be unaffected.
+        let positive_config = RetryConfig::new(3, 250, 1_000, 2);
+        assert_eq!(positive_config.base_delay_ms, 250);
     }
 
     /// Total delay (including jitter) never exceeds max_delay_ms.
