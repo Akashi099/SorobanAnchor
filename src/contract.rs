@@ -4257,7 +4257,7 @@ impl AnchorKitContract {
     /// [`AdminCapability::ToggleServices`].
     pub fn enable_service(env: Env, caller: Address, anchor: Address, service_code: u32) -> bool {
         Self::require_admin_or_capability(&env, &caller, AdminCapability::ToggleServices);
-        let changed = ServiceManager::enable_service(&env, &anchor, service_code);
+        let changed = ServiceManager::enable_service(&env, &anchor, service_code).unwrap_or(false);
         AdminAuditLog::log_action(
             &env,
             &caller,
@@ -4278,7 +4278,7 @@ impl AnchorKitContract {
     /// [`AdminCapability::ToggleServices`].
     pub fn disable_service(env: Env, caller: Address, anchor: Address, service_code: u32) -> bool {
         Self::require_admin_or_capability(&env, &caller, AdminCapability::ToggleServices);
-        let changed = ServiceManager::disable_service(&env, &anchor, service_code);
+        let changed = ServiceManager::disable_service(&env, &anchor, service_code).unwrap_or(false);
         AdminAuditLog::log_action(
             &env,
             &caller,
