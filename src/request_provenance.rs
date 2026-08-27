@@ -26,17 +26,17 @@
 //! use anchorkit::request_provenance::ProvenanceRecord;
 //!
 //! // Root request created by the gateway.
-//! let root = ProvenanceRecord::root("gateway", "deposit-initiate", 1000);
+//! let root = ProvenanceRecord::root("gateway", "deposit-initiate", 1000).unwrap();
 //! assert!(root.parent_id().is_none());
 //! assert_eq!(root.depth(), 0);
 //!
 //! // Downstream service derives a child.
-//! let child = root.child("anchor-service", "sep6-deposit", 1001);
+//! let child = root.child("anchor-service", "sep6-deposit", 1001).unwrap();
 //! assert_eq!(child.parent_id(), Some(root.request_id()));
 //! assert_eq!(child.depth(), 1);
 //!
 //! // Grandchild keeps the full lineage.
-//! let grandchild = child.child("webhook-dispatcher", "notify", 1002);
+//! let grandchild = child.child("webhook-dispatcher", "notify", 1002).unwrap();
 //! assert_eq!(grandchild.depth(), 2);
 //! assert_eq!(grandchild.ancestors()[0], root.request_id());
 //! assert_eq!(grandchild.ancestors()[1], child.request_id());
@@ -47,6 +47,19 @@ extern crate alloc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use alloc::format;
+
+// ---------------------------------------------------------------------------
+// ProvenanceError
+// ---------------------------------------------------------------------------
+
+/// Reasons a [`ProvenanceRecord`] could not be constructed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProvenanceError {
+    /// The actor (origin service) identifier was empty or contained only
+    /// whitespace. Every provenance record must be attributable to a named
+    /// actor so audit logs can be filtered by origin.
+    EmptyActor,
+}
 
 // ---------------------------------------------------------------------------
 // ProvenanceRecord
@@ -76,52 +89,77 @@ impl ProvenanceRecord {
     /// Create a root provenance record (no parent, depth 0).
     ///
     /// `seed` is used to derive a deterministic `request_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProvenanceError::EmptyActor`] when `origin_service` is empty
+    /// or contains only whitespace. Every record must be attributable.
     pub fn root(
         origin_service: impl Into<String>,
         operation: impl Into<String>,
         created_at: u64,
-    ) -> Self {
+    ) -> Result<Self, ProvenanceError> {
         let svc = origin_service.into();
+        if svc.trim().is_empty() {
+            return Err(ProvenanceError::EmptyActor);
+        }
         let op = operation.into();
         let id = derive_request_id(&format!("root:{}:{}:{}", svc, op, created_at));
-        ProvenanceRecord {
+        Ok(ProvenanceRecord {
             request_id: id,
             parent_id: None,
             ancestors: Vec::new(),
             origin_service: svc,
             operation: Some(op),
             created_at,
-        }
+        })
     }
 
     /// Create a root record with an explicit, caller-supplied `request_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProvenanceError::EmptyActor`] when `origin_service` is empty
+    /// or contains only whitespace.
     pub fn root_with_id(
         request_id: impl Into<String>,
         origin_service: impl Into<String>,
         operation: impl Into<String>,
         created_at: u64,
-    ) -> Self {
-        ProvenanceRecord {
+    ) -> Result<Self, ProvenanceError> {
+        let svc = origin_service.into();
+        if svc.trim().is_empty() {
+            return Err(ProvenanceError::EmptyActor);
+        }
+        Ok(ProvenanceRecord {
             request_id: request_id.into(),
             parent_id: None,
             ancestors: Vec::new(),
-            origin_service: origin_service.into(),
+            origin_service: svc,
             operation: Some(operation.into()),
             created_at,
-        }
+        })
     }
 
     /// Derive a child record from this one.
     ///
     /// The child's `ancestors` list is this record's ancestors plus this
     /// record's own ID, forming a complete lineage chain.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProvenanceError::EmptyActor`] when `child_service` is empty
+    /// or contains only whitespace.
     pub fn child(
         &self,
         child_service: impl Into<String>,
         operation: impl Into<String>,
         created_at: u64,
-    ) -> Self {
+    ) -> Result<Self, ProvenanceError> {
         let svc = child_service.into();
+        if svc.trim().is_empty() {
+            return Err(ProvenanceError::EmptyActor);
+        }
         let op = operation.into();
         let id = derive_request_id(&format!(
             "child:{}:{}:{}:{}",
@@ -131,35 +169,44 @@ impl ProvenanceRecord {
         let mut ancestors = self.ancestors.clone();
         ancestors.push(self.request_id.clone());
 
-        ProvenanceRecord {
+        Ok(ProvenanceRecord {
             request_id: id,
             parent_id: Some(self.request_id.clone()),
             ancestors,
             origin_service: svc,
             operation: Some(op),
             created_at,
-        }
+        })
     }
 
     /// Derive a child with an explicit caller-supplied ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProvenanceError::EmptyActor`] when `child_service` is empty
+    /// or contains only whitespace.
     pub fn child_with_id(
         &self,
         child_id: impl Into<String>,
         child_service: impl Into<String>,
         operation: impl Into<String>,
         created_at: u64,
-    ) -> Self {
+    ) -> Result<Self, ProvenanceError> {
+        let svc = child_service.into();
+        if svc.trim().is_empty() {
+            return Err(ProvenanceError::EmptyActor);
+        }
         let mut ancestors = self.ancestors.clone();
         ancestors.push(self.request_id.clone());
 
-        ProvenanceRecord {
+        Ok(ProvenanceRecord {
             request_id: child_id.into(),
             parent_id: Some(self.request_id.clone()),
             ancestors,
-            origin_service: child_service.into(),
+            origin_service: svc,
             operation: Some(operation.into()),
             created_at,
-        }
+        })
     }
 
     // ── Accessors ──────────────────────────────────────────────────────────
@@ -348,7 +395,7 @@ mod tests {
 
     #[test]
     fn root_has_no_parent_and_depth_zero() {
-        let r = ProvenanceRecord::root("gateway", "deposit", 1000);
+        let r = ProvenanceRecord::root("gateway", "deposit", 1000).unwrap();
         assert!(r.is_root());
         assert!(r.parent_id().is_none());
         assert_eq!(r.depth(), 0);
@@ -357,8 +404,8 @@ mod tests {
 
     #[test]
     fn child_links_to_parent() {
-        let root = ProvenanceRecord::root("gateway", "deposit", 1000);
-        let child = root.child("anchor-service", "sep6", 1001);
+        let root = ProvenanceRecord::root("gateway", "deposit", 1000).unwrap();
+        let child = root.child("anchor-service", "sep6", 1001).unwrap();
 
         assert_eq!(child.parent_id(), Some(root.request_id()));
         assert_eq!(child.depth(), 1);
@@ -369,9 +416,9 @@ mod tests {
 
     #[test]
     fn grandchild_carries_full_lineage() {
-        let root = ProvenanceRecord::root("a", "op", 0);
-        let child = root.child("b", "op2", 1);
-        let grandchild = child.child("c", "op3", 2);
+        let root = ProvenanceRecord::root("a", "op", 0).unwrap();
+        let child = root.child("b", "op2", 1).unwrap();
+        let grandchild = child.child("c", "op3", 2).unwrap();
 
         assert_eq!(grandchild.depth(), 2);
         assert_eq!(grandchild.ancestors()[0], root.request_id());
@@ -381,15 +428,15 @@ mod tests {
 
     #[test]
     fn request_ids_are_distinct() {
-        let r1 = ProvenanceRecord::root("svc", "op-a", 1000);
-        let r2 = ProvenanceRecord::root("svc", "op-b", 1000);
+        let r1 = ProvenanceRecord::root("svc", "op-a", 1000).unwrap();
+        let r2 = ProvenanceRecord::root("svc", "op-b", 1000).unwrap();
         assert_ne!(r1.request_id(), r2.request_id());
     }
 
     #[test]
     fn header_round_trip_preserves_key_fields() {
-        let root = ProvenanceRecord::root("gateway", "deposit", 1000);
-        let child = root.child("anchor", "sep6", 1001);
+        let root = ProvenanceRecord::root("gateway", "deposit", 1000).unwrap();
+        let child = root.child("anchor", "sep6", 1001).unwrap();
         let headers = child.to_headers();
         let parsed = ProvenanceRecord::from_headers(&headers).unwrap();
 
@@ -410,7 +457,7 @@ mod tests {
 
     #[test]
     fn root_header_parent_id_encodes_as_root_string() {
-        let root = ProvenanceRecord::root("svc", "op", 0);
+        let root = ProvenanceRecord::root("svc", "op", 0).unwrap();
         let headers = root.to_headers();
         let parent_header = headers
             .iter()
@@ -421,7 +468,7 @@ mod tests {
 
     #[test]
     fn log_fields_contains_expected_fields() {
-        let r = ProvenanceRecord::root("gateway", "deposit", 1000);
+        let r = ProvenanceRecord::root("gateway", "deposit", 1000).unwrap();
         let fields = r.log_fields();
         assert!(fields.contains("req="));
         assert!(fields.contains("parent=none"));
@@ -432,10 +479,58 @@ mod tests {
 
     #[test]
     fn with_explicit_id() {
-        let r = ProvenanceRecord::root_with_id("my-id-000", "svc", "op", 0);
+        let r = ProvenanceRecord::root_with_id("my-id-000", "svc", "op", 0).unwrap();
         assert_eq!(r.request_id(), "my-id-000");
-        let child = r.child_with_id("child-id-001", "svc2", "op2", 1);
+        let child = r.child_with_id("child-id-001", "svc2", "op2", 1).unwrap();
         assert_eq!(child.request_id(), "child-id-001");
         assert_eq!(child.parent_id(), Some("my-id-000"));
+    }
+
+    // ── Empty-actor rejection ─────────────────────────────────────────────
+
+    /// An empty string actor is unattributable and must be rejected.
+    #[test]
+    fn root_rejects_empty_actor() {
+        assert_eq!(
+            ProvenanceRecord::root("", "op", 0),
+            Err(ProvenanceError::EmptyActor),
+            "empty origin_service must be rejected at construction"
+        );
+    }
+
+    /// A whitespace-only actor is equally unattributable.
+    #[test]
+    fn root_rejects_whitespace_only_actor() {
+        assert_eq!(
+            ProvenanceRecord::root("   ", "op", 0),
+            Err(ProvenanceError::EmptyActor),
+            "whitespace-only origin_service must be rejected at construction"
+        );
+        assert_eq!(
+            ProvenanceRecord::root("\t\n", "op", 0),
+            Err(ProvenanceError::EmptyActor),
+        );
+    }
+
+    /// Valid actors (including ones with internal spaces) are recorded exactly.
+    #[test]
+    fn root_accepts_valid_actor() {
+        let r = ProvenanceRecord::root("anchor service", "op", 0).unwrap();
+        assert_eq!(r.origin_service(), "anchor service",
+            "valid actor must be stored without modification");
+    }
+
+    /// child() also rejects empty/whitespace-only actors.
+    #[test]
+    fn child_rejects_empty_actor() {
+        let root = ProvenanceRecord::root("gateway", "op", 0).unwrap();
+        assert_eq!(
+            root.child("", "sub-op", 1),
+            Err(ProvenanceError::EmptyActor),
+        );
+        assert_eq!(
+            root.child("  ", "sub-op", 1),
+            Err(ProvenanceError::EmptyActor),
+        );
     }
 }

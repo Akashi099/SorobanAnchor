@@ -132,10 +132,16 @@ impl DeduplicationStore {
     /// A `true` result means the operation has already been executed and the
     /// caller should retrieve the cached result via [`cached_result`](Self::cached_result)
     /// instead of re-running the operation.
+    ///
+    /// The expiration check is performed **before** the duplicate decision:
+    /// an expired entry is treated as absent — it does not block a fresh
+    /// execution of the same key.
     pub fn is_duplicate(&self, key: &DeduplicationKey, now_secs: u64) -> bool {
         match self.entries.get(&key.as_map_key()) {
-            Some(entry) => entry.expires_at > now_secs,
-            None => false,
+            // Entry exists AND is still within its TTL → this is a live duplicate.
+            Some(entry) if entry.expires_at > now_secs => true,
+            // Entry exists but has expired, or no entry at all → not a duplicate.
+            _ => false,
         }
     }
 
@@ -371,5 +377,52 @@ mod tests {
         store.record_success(&k1, "ok", 0);
         assert!(store.is_duplicate(&k1, 1));
         assert!(!store.is_duplicate(&k2, 1));
+    }
+
+    // ── Expiry-before-duplicate ordering ─────────────────────────────────
+
+    /// A live entry is a duplicate; the same key after TTL is accepted as new.
+    ///
+    /// This test advances the clock in three phases:
+    ///   1. Recorded at t=0, TTL=10 → expires_at=10.
+    ///   2. Within TTL (t=9): is_duplicate=true.
+    ///   3. At expiry boundary (t=10): is_duplicate=false — not a duplicate.
+    ///   4. Past expiry (t=11): is_duplicate=false — can be re-submitted as new.
+    ///
+    /// This confirms expiration is tested BEFORE the duplicate decision so that
+    /// the caller never sees a stale entry as live.
+    #[test]
+    fn expired_key_is_accepted_as_new_after_ttl() {
+        let mut store = DeduplicationStore::new(10); // TTL = 10 s
+        let key = DeduplicationKey::new("deposit", "txn-ttl");
+
+        // t=0: record the first execution.
+        store.record_success(&key, "first-result", 0);
+
+        // t=9: still within TTL → duplicate.
+        assert!(store.is_duplicate(&key, 9),
+            "within TTL the entry must be a live duplicate");
+
+        // t=10: at the exact expiry boundary → not a duplicate (expires_at > now is false).
+        assert!(!store.is_duplicate(&key, 10),
+            "at the expiry boundary the entry must not be treated as a duplicate");
+
+        // t=11: past expiry → not a duplicate; re-recording must succeed.
+        assert!(!store.is_duplicate(&key, 11),
+            "past expiry the entry must not be treated as a duplicate");
+
+        // Re-record at t=11 as if this is a fresh first execution.
+        store.record_success(&key, "second-result", 11);
+
+        // t=12: the freshly recorded entry (expires_at=21) is live → duplicate again.
+        assert!(store.is_duplicate(&key, 12),
+            "after re-recording, the new entry must be recognised as a duplicate");
+
+        // The cached result now reflects the second execution, not the stale first.
+        assert_eq!(
+            store.cached_result(&key, 12),
+            Some(DeduplicationResult::Success("second-result".to_string())),
+            "cached result must reflect the re-recorded entry, not the expired one"
+        );
     }
 }
