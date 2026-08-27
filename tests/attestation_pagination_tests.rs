@@ -391,4 +391,21 @@ mod attestation_pagination_tests {
         let page = client.get_attestations_paginated(&0u64, &200u64, &None);
         assert!(page.records.len() <= 50, "page returned more than 50 records");
     }
+
+    // -----------------------------------------------------------------------
+    // #800 — Zero limit is rejected
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn zero_limit_is_rejected() {
+        let env = make_env();
+        let (client, _, _) = setup(&env);
+
+        // A zero limit must be rejected before any storage access.
+        let result = client.try_get_attestations_paginated(&0u64, &0u64, &None);
+        assert!(
+            result.is_err(),
+            "expected error for zero limit, but got Ok"
+        );
+    }
 }

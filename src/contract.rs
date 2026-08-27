@@ -5031,6 +5031,13 @@ impl AnchorKitContract {
         filter: Option<AttestationFilter>,
     ) -> AttestationPage {
         const PAGE_CAP: u64 = 50;
+
+        // #800: reject a zero limit — it produces an ambiguous empty page that
+        // is indistinguishable from a genuine end-of-results signal.
+        if limit == 0 {
+            panic_with_error!(&env, ErrorCode::ValidationError);
+        }
+
         let effective_limit = limit.min(PAGE_CAP);
 
         // Read the global ATIDX index — it holds every attestation ID in
