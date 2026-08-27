@@ -5057,6 +5057,17 @@ impl AnchorKitContract {
             .unwrap_or_else(|| Vec::new(&env));
 
         let total = all_ids.len() as u64;
+
+        // #799: a cursor equal to or beyond the collection boundary returns an
+        // empty page immediately, preventing index underflow in the range arithmetic
+        // below.
+        if offset >= total {
+            return AttestationPage {
+                records: Vec::new(&env),
+                next_offset: total,
+                total,
+            };
+        }
         let mut records = Vec::new(&env);
         let mut skipped: u64 = 0;
         let mut next_offset = total; // default: last page

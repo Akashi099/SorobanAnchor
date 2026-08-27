@@ -408,4 +408,46 @@ mod attestation_pagination_tests {
             "expected error for zero limit, but got Ok"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // #799 — Cursor beyond collection boundary returns empty page
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cursor_beyond_end_returns_empty_page() {
+        let env = make_env();
+        let (client, attestor, sk) = setup(&env);
+        let subject = Address::generate(&env);
+
+        // Submit 3 attestations so total == 3.
+        for seed in 0u8..3 {
+            let ph = unique_payload(&env, seed);
+            let sig = sign_payload(&env, &sk, &ph);
+            client.submit_attestation(
+                &attestor,
+                &subject,
+                &(1_000_001u64 + seed as u64),
+                &ph,
+                &sig,
+            );
+        }
+
+        // A cursor exactly at the boundary (offset == total) must return empty.
+        let page_at_boundary = client.get_attestations_paginated(&3u64, &10u64, &None);
+        assert_eq!(
+            page_at_boundary.records.len(),
+            0,
+            "expected empty page when offset == total"
+        );
+        assert_eq!(page_at_boundary.total, 3);
+
+        // A cursor well past the end must also return empty without panic.
+        let page_past_end = client.get_attestations_paginated(&1000u64, &10u64, &None);
+        assert_eq!(
+            page_past_end.records.len(),
+            0,
+            "expected empty page when offset >> total"
+        );
+        assert_eq!(page_past_end.total, 3);
+    }
 }
