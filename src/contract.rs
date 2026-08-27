@@ -5503,10 +5503,16 @@ impl AnchorKitContract {
         // Check expiry first — an expired session should surface SessionExpired.
         let ttl = if session.session_ttl_seconds == 0 { DEFAULT_SESSION_TTL } else { session.session_ttl_seconds };
         let now = env.ledger().timestamp();
-        if now > session.created_at.saturating_add(ttl) {
+        if now > session_state_machine::session_expiry(session.created_at, ttl) {
             // Record the expiry transition before panicking.
             session.state = SessionState::Expired as u32;
             env.storage().persistent().set(&sess_key, &session);
+            // Emit the session-expired event so consumers relying on events
+            // are not silently skipped when expiry is detected lazily.
+            env.events().publish(
+                (symbol_short!("session"), symbol_short!("expired"), session_id),
+                SessionClosedEvent { session_id, initiator: session.initiator.clone(), timestamp: now },
+            );
             panic_with_error!(&env, ErrorCode::SessionExpired);
         }
         // Validate the Closed transition via the state machine.
@@ -5537,6 +5543,37 @@ impl AnchorKitContract {
             .persistent()
             .get(&sess_key)
             .unwrap_or_else(|| panic_with_error!(env, ErrorCode::SessionNotFound));
+
+        // Lazily detect TTL expiry here, before calling validate_session, so
+        // we can mutate the stored state and emit exactly one expiry event.
+        // validate_session's SessionState::Expired branch will then panic
+        // without re-emitting.
+        let ttl = if session.session_ttl_seconds == 0 {
+            DEFAULT_SESSION_TTL
+        } else {
+            session.session_ttl_seconds
+        };
+        let now = env.ledger().timestamp();
+        let from = SessionState::from_u32(session.state);
+        if now > session.created_at.saturating_add(ttl)
+            && !from.is_terminal()
+        {
+            // First detection of expiry: persist the state change and emit the
+            // event once. Subsequent reads will see SessionState::Expired and
+            // hit the match arm in validate_session without re-emitting.
+            session.state = SessionState::Expired as u32;
+            env.storage().persistent().set(&sess_key, &session);
+            env.events().publish(
+                (symbol_short!("session"), symbol_short!("expired"), session_id),
+                SessionClosedEvent {
+                    session_id,
+                    initiator: session.initiator.clone(),
+                    timestamp: now,
+                },
+            );
+            panic_with_error!(env, ErrorCode::SessionExpired);
+        }
+
         Self::validate_session(env, &session);
         // Enforce per-session operation limit.
         let op_count: u64 = env
@@ -8848,7 +8885,7 @@ impl AnchorKitContract {
             session.session_ttl_seconds
         };
         let now = env.ledger().timestamp();
-        let expiry = session.created_at.saturating_add(ttl);
+        let expiry = session_state_machine::session_expiry(session.created_at, ttl);
         if now > expiry {
             panic_with_error!(env, ErrorCode::SessionExpired);
         }

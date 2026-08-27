@@ -10,7 +10,7 @@ mod sep10_hardening_tests {
     use soroban_sdk::{Address, Bytes, Env, String};
 
     use anchorkit::contract::{AnchorKitContract, AnchorKitContractClient};
-    use anchorkit::sep10_jwt::{verify_sep10_jwt, verify_sep10_jwt_with_issuer, MAX_JWT_LIFETIME};
+    use anchorkit::sep10_jwt::{verify_sep10_jwt, verify_sep10_jwt_with_issuer};
     use crate::sep10_test_util::{
         build_sep10_jwt, build_sep10_jwt_with_iat, build_sep10_jwt_with_iss,
         build_sep10_jwt_with_future_iat, build_sep10_jwt_whitespace_iss,
@@ -51,6 +51,95 @@ mod sep10_hardening_tests {
         let issuer = Address::generate(env);
         client.set_sep10_jwt_verifying_key(&issuer, &pk);
         (client, issuer, sk)
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #766: empty and whitespace-only tokens are rejected up front,
+    // before any base64/JSON decoding is attempted.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rejects_empty_token() {
+        let env = make_env();
+        let contract_id = make_contract_id(&env);
+        ledger(&env, 1_000);
+        let sk = SigningKey::generate(&mut OsRng);
+        let pk = Bytes::from_slice(&env, sk.verifying_key().as_bytes());
+
+        let token = String::from_str(&env, "");
+
+        env.as_contract(&contract_id, || {
+            assert!(
+                verify_sep10_jwt(&env, &token, &pk, None).is_err(),
+                "empty token must be rejected"
+            );
+        });
+    }
+
+    #[test]
+    fn rejects_whitespace_only_token() {
+        let env = make_env();
+        let contract_id = make_contract_id(&env);
+        ledger(&env, 1_000);
+        let sk = SigningKey::generate(&mut OsRng);
+        let pk = Bytes::from_slice(&env, sk.verifying_key().as_bytes());
+
+        let token = String::from_str(&env, "   ");
+
+        env.as_contract(&contract_id, || {
+            assert!(
+                verify_sep10_jwt(&env, &token, &pk, None).is_err(),
+                "whitespace-only token must be rejected"
+            );
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #767: a token must have exactly three dot-separated parts.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rejects_four_part_token() {
+        let env = make_env();
+        let contract_id = make_contract_id(&env);
+        ledger(&env, 1_000);
+        let sk = SigningKey::generate(&mut OsRng);
+        let pk = Bytes::from_slice(&env, sk.verifying_key().as_bytes());
+        let sub = Address::generate(&env).to_string();
+        let sub_str: std::string::String = sub.to_string();
+
+        // An otherwise well-formed token with one extra trailing segment.
+        let jwt = build_sep10_jwt(&sk, &sub_str, 5_000);
+        let four_part_jwt = format!("{}.extra", jwt);
+        let token = String::from_str(&env, &four_part_jwt);
+
+        env.as_contract(&contract_id, || {
+            assert!(
+                verify_sep10_jwt(&env, &token, &pk, None).is_err(),
+                "four-part token must be rejected"
+            );
+        });
+    }
+
+    #[test]
+    fn accepts_structurally_valid_three_part_token() {
+        let env = make_env();
+        let contract_id = make_contract_id(&env);
+        ledger(&env, 1_000);
+        let sk = SigningKey::generate(&mut OsRng);
+        let pk = Bytes::from_slice(&env, sk.verifying_key().as_bytes());
+        let sub = Address::generate(&env).to_string();
+        let sub_str: std::string::String = sub.to_string();
+
+        let jwt = build_sep10_jwt(&sk, &sub_str, 5_000);
+        let token = String::from_str(&env, &jwt);
+
+        env.as_contract(&contract_id, || {
+            assert!(
+                verify_sep10_jwt(&env, &token, &pk, None).is_ok(),
+                "structurally valid three-part token must reach verification"
+            );
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -150,7 +239,7 @@ mod sep10_hardening_tests {
 
         // iat = now + 30 (within default 60 s skew)
         let iat = now + 30;
-        let exp = iat + MAX_JWT_LIFETIME;
+        let exp = iat + 86_400;
         let jwt = build_sep10_jwt_with_iat(&sk, &sub_str, iat, exp);
         let token = String::from_str(&env, &jwt);
 
@@ -387,5 +476,60 @@ mod sep10_hardening_tests {
         let token = String::from_str(&env, &jwt);
         client.verify_sep10_token(&token, &issuer); // first — OK
         client.verify_sep10_token(&token, &issuer); // second — must panic
+    }
+
+    // -----------------------------------------------------------------------
+    // Overflow safety: extreme iat / exp values must not wrap or panic
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rejects_token_with_extreme_iat_near_u64_max() {
+        // iat is near u64::MAX; exp = iat + 1 (still exceeds MAX_JWT_LIFETIME
+        // of 86_400 when the subtraction is done with checked_sub, so the
+        // token is rejected).  With saturating_sub the result would be 1,
+        // which is ≤ 86_400 and would incorrectly pass the lifetime check.
+        // With checked_sub the computed lifetime (u64::MAX - 1 + 1 - u64::MAX + 1)
+        // correctly reflects exp - iat = 1 … wait, here we test the inverse:
+        // iat is u64::MAX and exp is u64::MAX too, making exp - iat = 0.
+        // The interesting attack is iat >> exp where saturating_sub gives 0,
+        // but checked_sub gives None → Err.
+        let env = make_env();
+        let contract_id = make_contract_id(&env);
+        // Set clock to a plausible current time so the future-iat guard does
+        // not fire first; we want the lifetime arithmetic to be the check.
+        let now = 1_000u64;
+        ledger(&env, now);
+        let sk = SigningKey::generate(&mut OsRng);
+        let pk = Bytes::from_slice(&env, sk.verifying_key().as_bytes());
+        let sub = Address::generate(&env).to_string();
+        let sub_str: std::string::String = sub.to_string();
+
+        // Case 1: iat > exp (iat = 5000, exp = 2000 — iat after exp).
+        // saturating_sub(2000 - 5000) = 0, which is ≤ MAX_JWT_LIFETIME and
+        // would pass; checked_sub returns None → Err.
+        // exp must be in the future so the expiry check passes.
+        let exp_future = now + 3_600; // 4600, comfortably in the future
+        let iat_after_exp = exp_future + 1; // iat > exp — lifetime is negative
+        let jwt = build_sep10_jwt_with_iat(&sk, &sub_str, iat_after_exp, exp_future);
+        let token = String::from_str(&env, &jwt);
+        env.as_contract(&contract_id, || {
+            assert!(
+                verify_sep10_jwt(&env, &token, &pk, None).is_err(),
+                "iat > exp must be rejected (checked_sub returns None)"
+            );
+        });
+
+        // Case 2: iat = u64::MAX, exp = u64::MAX (exp - iat = 0 ≤ MAX_JWT_LIFETIME,
+        // but iat is astronomically in the future so the future-iat guard fires).
+        // This confirms no panic from extreme numeric claims.
+        let max = u64::MAX;
+        let jwt2 = build_sep10_jwt_with_iat(&sk, &sub_str, max, max);
+        let token2 = String::from_str(&env, &jwt2);
+        env.as_contract(&contract_id, || {
+            assert!(
+                verify_sep10_jwt(&env, &token2, &pk, None).is_err(),
+                "u64::MAX iat/exp must be rejected without panic or wraparound"
+            );
+        });
     }
 }

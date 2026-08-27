@@ -8,7 +8,7 @@ use anchorkit::contract::AnchorKitContractClient;
 
 pub fn build_sep10_jwt(signing_key: &SigningKey, sub: &str, exp: u64) -> std::string::String {
     let header = r#"{"alg":"EdDSA","typ":"JWT"}"#;
-    let iat = exp.saturating_sub(anchorkit::sep10_jwt::MAX_JWT_LIFETIME);
+    let iat = exp.saturating_sub(86_400);
     let payload = format!(
         r#"{{"sub":"{}","iat":{},"exp":{},"iss":"https://anchor.example.com"}}"#,
         sub, iat, exp
@@ -51,7 +51,7 @@ pub fn build_sep10_jwt_with_jti(
     jti: &str,
 ) -> std::string::String {
     let header = r#"{"alg":"EdDSA","typ":"JWT"}"#;
-    let iat = exp.saturating_sub(anchorkit::sep10_jwt::MAX_JWT_LIFETIME);
+    let iat = exp.saturating_sub(86_400);
     let payload = format!(
         r#"{{"sub":"{}","iat":{},"exp":{},"iss":"https://anchor.example.com","jti":"{}"}}"#,
         sub, iat, exp, jti
@@ -73,7 +73,7 @@ pub fn build_sep10_jwt_with_iss(
     issuer: &str,
 ) -> std::string::String {
     let header = r#"{"alg":"EdDSA","typ":"JWT"}"#;
-    let iat = exp.saturating_sub(anchorkit::sep10_jwt::MAX_JWT_LIFETIME);
+    let iat = exp.saturating_sub(86_400);
     let payload = format!(
         r#"{{"sub":"{}","iat":{},"exp":{},"iss":"{}"}}"#,
         sub, iat, exp, issuer
@@ -95,7 +95,7 @@ pub fn build_sep10_jwt_with_future_iat(
     seconds_ahead: u64,
 ) -> std::string::String {
     let future_iat = now + seconds_ahead;
-    let exp = future_iat + anchorkit::sep10_jwt::MAX_JWT_LIFETIME;
+    let exp = future_iat + 86_400;
     build_sep10_jwt_with_iat(signing_key, sub, future_iat, exp)
 }
 

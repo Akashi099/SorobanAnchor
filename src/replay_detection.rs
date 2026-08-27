@@ -10,6 +10,7 @@
 //! metrics or logs when a duplicate request is rejected.
 
 use soroban_sdk::{contracttype, Address, Bytes, Env};
+use crate::deterministic_hash::make_storage_key;
 
 /// Structured log entry for a replay detection event.
 #[derive(Clone, Debug)]
@@ -115,13 +116,21 @@ pub fn record_replay_detection(
     // Using temporary storage avoids unbounded growth of instance storage:
     // each counter lives for REPLAY_ATTEMPT_TTL ledgers then is pruned
     // automatically by the Soroban runtime.
-    let attempt_key = (soroban_sdk::symbol_short!("RPLYAT"), request_id.clone());
+    //
+    // make_storage_key length-prefixes each segment before hashing, so
+    // distinct byte sequences always produce distinct 32-byte keys regardless
+    // of input length — no truncation or text normalization can collapse them.
+    let mut id_raw = alloc::vec::Vec::with_capacity(request_id.len() as usize);
+    for i in 0..request_id.len() {
+        id_raw.push(request_id.get(i).unwrap_or(0));
+    }
+    let attempt_key = make_storage_key(env, &[b"RPLYAT", &id_raw]);
     let mut attempt_count: u32 = env
         .storage()
         .temporary()
         .get::<_, u32>(&attempt_key)
         .unwrap_or(0);
-    attempt_count += 1;
+    attempt_count = attempt_count.saturating_add(1);
 
     // Update global metrics
     metrics.total_replay_attempts += 1;
@@ -187,7 +196,11 @@ pub fn get_replay_metrics(env: &Env) -> ReplayMetrics {
 /// was never written (the USED key in persistent storage is the authoritative
 /// replay guard; this counter is for observability only).
 pub fn get_replay_count_for_id(env: &Env, request_id: &Bytes) -> u64 {
-    let attempt_key = (soroban_sdk::symbol_short!("RPLYAT"), request_id.clone());
+    let mut id_raw = alloc::vec::Vec::with_capacity(request_id.len() as usize);
+    for i in 0..request_id.len() {
+        id_raw.push(request_id.get(i).unwrap_or(0));
+    }
+    let attempt_key = make_storage_key(env, &[b"RPLYAT", &id_raw]);
     env.storage()
         .temporary()
         .get::<_, u32>(&attempt_key)
@@ -254,17 +267,109 @@ fn next_replay_event_id(env: &Env) -> u64 {
 /// Log a replay detection event with structured information.
 ///
 /// Emits a contract event that can be captured by indexers and monitoring systems.
+/// The event payload uses only opaque, non-sensitive identifiers: the raw
+/// `request_id` bytes and actor address are intentionally **excluded** from the
+/// emitted tuple so that formatted log output does not expose payload hashes or
+/// issuer credentials. Consumers that need the full details should read them
+/// from the [`ReplayAttemptRecord`] in temporary storage via [`get_replay_event`].
 pub fn emit_replay_detection_log(env: &Env, event: &ReplayDetectionEvent) {
     env.events().publish(
         (soroban_sdk::symbol_short!("replay"), soroban_sdk::symbol_short!("detected")),
         (
-            event.request_id.clone(),
-            event.actor.clone(),
             event.detected_at,
             event.attempt_count,
             event.ledger_sequence,
         ),
     );
+}
+
+// ---------------------------------------------------------------------------
+// Timestamp validation & clock-skew bounds
+// ---------------------------------------------------------------------------
+
+/// Default maximum age (in seconds) for a valid replay-protected timestamp (5 minutes).
+pub const DEFAULT_MAX_AGE_SECS: u64 = 300;
+
+/// Default maximum allowed forward clock skew (in seconds) for future timestamps (1 minute).
+pub const DEFAULT_CLOCK_SKEW_SECS: u64 = 60;
+
+/// Check whether `timestamp` is within the permitted age and clock-skew bounds relative to `now`.
+///
+/// The comparison is direction-safe to prevent unsigned integer underflow:
+/// - A timestamp of `0` is always rejected.
+/// - When `timestamp <= now` (past / stale): age is `now.saturating_sub(timestamp)`.
+///   Rejected if `age > max_age_secs`.
+/// - When `timestamp > now` (future / forward clock skew): drift is `timestamp.saturating_sub(now)`.
+///   Rejected if `drift > max_future_skew_secs`.
+/// - Values at the exact boundaries (`now - max_age_secs` and `now + max_future_skew_secs`) are accepted.
+///
+/// # Arguments
+///
+/// * `timestamp` - The submission or attestation timestamp to validate
+/// * `now` - The reference (current ledger) timestamp
+/// * `max_age_secs` - Maximum allowed age in the past (seconds)
+/// * `max_future_skew_secs` - Maximum allowed forward clock skew (seconds)
+///
+/// # Returns
+///
+/// `true` if `timestamp` is non-zero and within permitted bounds, `false` otherwise.
+pub fn is_timestamp_valid(
+    timestamp: u64,
+    now: u64,
+    max_age_secs: u64,
+    max_future_skew_secs: u64,
+) -> bool {
+    if timestamp == 0 {
+        return false;
+    }
+
+    if timestamp <= now {
+        let age = now.saturating_sub(timestamp);
+        age <= max_age_secs
+    } else {
+        let future_drift = timestamp.saturating_sub(now);
+        future_drift <= max_future_skew_secs
+    }
+}
+
+/// Check whether `timestamp` is within the default replay age (`DEFAULT_MAX_AGE_SECS` = 300 s)
+/// and clock-skew (`DEFAULT_CLOCK_SKEW_SECS` = 60 s) bounds relative to `now`.
+pub fn is_default_timestamp_valid(timestamp: u64, now: u64) -> bool {
+    is_timestamp_valid(timestamp, now, DEFAULT_MAX_AGE_SECS, DEFAULT_CLOCK_SKEW_SECS)
+}
+
+/// Calculate the age or future skew of `timestamp` relative to `now`, returning `None` if
+/// the timestamp is zero or exceeds the configured bounds.
+///
+/// Returns:
+/// - `Some(Ok(age))` if `timestamp <= now` and within `max_age_secs`
+/// - `Some(Err(future_drift))` if `timestamp > now` and within `max_future_skew_secs`
+/// - `None` if `timestamp == 0` or out of bounds (stale or excessively future)
+pub fn calculate_timestamp_age(
+    timestamp: u64,
+    now: u64,
+    max_age_secs: u64,
+    max_future_skew_secs: u64,
+) -> Option<Result<u64, u64>> {
+    if timestamp == 0 {
+        return None;
+    }
+
+    if timestamp <= now {
+        let age = now.saturating_sub(timestamp);
+        if age <= max_age_secs {
+            Some(Ok(age))
+        } else {
+            None
+        }
+    } else {
+        let future_drift = timestamp.saturating_sub(now);
+        if future_drift <= max_future_skew_secs {
+            Some(Err(future_drift))
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -363,6 +468,26 @@ mod tests {
         assert_eq!(event.attempt_number, 1);
     }
 
+    /// Two byte-distinct request_ids must map to separate attempt counters.
+    /// This pins the byte-preservation guarantee of the make_storage_key-based
+    /// attempt key: [0xAA] and [0xAA, 0x00] differ by a single trailing byte
+    /// and must never share a counter.
+    #[test]
+    fn test_distinct_request_ids_have_separate_counters() {
+        let (env, cid) = make_test_env();
+        let actor = Address::generate(&env);
+        let id_a = Bytes::from_slice(&env, &[0xAA]);
+        let id_b = Bytes::from_slice(&env, &[0xAA, 0x00]);
+
+        env.as_contract(&cid, || { record_replay_detection(&env, &id_a, &actor); });
+
+        let count_a = env.as_contract(&cid, || get_replay_count_for_id(&env, &id_a));
+        let count_b = env.as_contract(&cid, || get_replay_count_for_id(&env, &id_b));
+
+        assert_eq!(count_a, 1, "id_a must have one attempt recorded");
+        assert_eq!(count_b, 0, "id_b must be unaffected by id_a's recording");
+    }
+
     /// Verify that per-ID counters do NOT accumulate in instance storage.
     /// After recording a replay, instance storage should only hold the
     /// aggregate metrics key, not per-ID attempt keys.
@@ -384,5 +509,89 @@ mod tests {
         // But the counter must be readable via get_replay_count_for_id.
         let count = env.as_contract(&cid, || get_replay_count_for_id(&env, &request_id));
         assert_eq!(count, 1);
+    }
+
+    // ── Timestamp and Clock-Skew Boundary Tests (#780) ───────────────────────
+
+    #[test]
+    fn test_timestamp_within_bounds_accepted() {
+        let now = 1_000_000u64;
+        let max_age = 300u64;
+        let future_skew = 60u64;
+
+        // Current time
+        assert!(is_timestamp_valid(now, now, max_age, future_skew));
+        assert_eq!(calculate_timestamp_age(now, now, max_age, future_skew), Some(Ok(0)));
+
+        // Within past age (100 s old)
+        assert!(is_timestamp_valid(now - 100, now, max_age, future_skew));
+        assert_eq!(calculate_timestamp_age(now - 100, now, max_age, future_skew), Some(Ok(100)));
+
+        // Within future skew (30 s future)
+        assert!(is_timestamp_valid(now + 30, now, max_age, future_skew));
+        assert_eq!(calculate_timestamp_age(now + 30, now, max_age, future_skew), Some(Err(30)));
+    }
+
+    #[test]
+    fn test_timestamp_at_exact_boundaries_accepted() {
+        let now = 1_000_000u64;
+        let max_age = 300u64;
+        let future_skew = 60u64;
+
+        // Exact past boundary (age == max_age)
+        let stale_boundary = now - max_age;
+        assert!(is_timestamp_valid(stale_boundary, now, max_age, future_skew));
+        assert_eq!(calculate_timestamp_age(stale_boundary, now, max_age, future_skew), Some(Ok(max_age)));
+
+        // Exact future boundary (drift == future_skew)
+        let future_boundary = now + future_skew;
+        assert!(is_timestamp_valid(future_boundary, now, max_age, future_skew));
+        assert_eq!(calculate_timestamp_age(future_boundary, now, max_age, future_skew), Some(Err(future_skew)));
+    }
+
+    #[test]
+    fn test_stale_and_future_beyond_boundaries_rejected() {
+        let now = 1_000_000u64;
+        let max_age = 300u64;
+        let future_skew = 60u64;
+
+        // Just beyond past boundary (301 s old)
+        let too_stale = now - max_age - 1;
+        assert!(!is_timestamp_valid(too_stale, now, max_age, future_skew));
+        assert_eq!(calculate_timestamp_age(too_stale, now, max_age, future_skew), None);
+
+        // Just beyond future boundary (61 s future)
+        let too_future = now + future_skew + 1;
+        assert!(!is_timestamp_valid(too_future, now, max_age, future_skew));
+        assert_eq!(calculate_timestamp_age(too_future, now, max_age, future_skew), None);
+
+        // Zero timestamp is always invalid
+        assert!(!is_timestamp_valid(0, now, max_age, future_skew));
+        assert_eq!(calculate_timestamp_age(0, now, max_age, future_skew), None);
+    }
+
+    #[test]
+    fn test_direction_safe_comparison_no_underflow() {
+        let max_age = 300u64;
+        let future_skew = 60u64;
+
+        // When now is small (e.g. now = 50 < max_age)
+        let now_small = 50u64;
+        assert!(is_timestamp_valid(20, now_small, max_age, future_skew));
+        assert!(is_timestamp_valid(50, now_small, max_age, future_skew));
+        assert!(is_timestamp_valid(100, now_small, max_age, future_skew));
+        assert!(!is_timestamp_valid(120, now_small, max_age, future_skew)); // 120 - 50 = 70 > 60
+
+        // When timestamp is near u64::MAX
+        let now = 1_000_000u64;
+        assert!(!is_timestamp_valid(u64::MAX, now, max_age, future_skew));
+        assert_eq!(calculate_timestamp_age(u64::MAX, now, max_age, future_skew), None);
+
+        // Default bounds helper
+        assert!(is_default_timestamp_valid(1_000_000, 1_000_000));
+        assert!(is_default_timestamp_valid(1_000_000 - 300, 1_000_000));
+        assert!(is_default_timestamp_valid(1_000_000 + 60, 1_000_000));
+        assert!(!is_default_timestamp_valid(1_000_000 - 301, 1_000_000));
+        assert!(!is_default_timestamp_valid(1_000_000 + 61, 1_000_000));
     }
 }

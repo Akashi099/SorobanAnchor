@@ -71,6 +71,35 @@ impl SessionState {
 }
 
 // ---------------------------------------------------------------------------
+// Expiry helpers
+// ---------------------------------------------------------------------------
+
+/// Compute the Unix timestamp (seconds) at which a session expires.
+///
+/// Adds `ttl_secs` to `created_at` using **saturating arithmetic** so that an
+/// extreme TTL value (e.g. `u64::MAX`) never wraps around and produces a
+/// timestamp in the past.  This keeps a session with an extreme TTL
+/// permanently live rather than accidentally expiring it immediately.
+///
+/// Ordinary TTL values (hours, days) are unaffected — `saturating_add` is
+/// identical to `+` for any pair of values whose sum fits in `u64`.
+///
+/// # Examples
+///
+/// ```
+/// use anchorkit::session_state_machine::session_expiry;
+///
+/// // Normal TTL: exact arithmetic.
+/// assert_eq!(session_expiry(1_000, 3_600), 4_600);
+///
+/// // Extreme TTL: saturates at u64::MAX instead of wrapping.
+/// assert_eq!(session_expiry(1_000, u64::MAX), u64::MAX);
+/// ```
+pub fn session_expiry(created_at: u64, ttl_secs: u64) -> u64 {
+    created_at.saturating_add(ttl_secs)
+}
+
+// ---------------------------------------------------------------------------
 // Transition table
 // ---------------------------------------------------------------------------
 
@@ -251,6 +280,45 @@ mod tests {
         }
     }
 
+    /// Regression: every terminal state must explicitly reject a transition
+    /// back to `Active` (reactivation). This covers the path described in the
+    /// spec where a generic branch could have allowed terminal → Active.
+    #[test]
+    fn test_terminal_states_reject_reactivation_to_active() {
+        let terminals = [
+            SessionState::Closed,
+            SessionState::Expired,
+            SessionState::Exhausted,
+        ];
+        for from in terminals {
+            let result = validate_transition(from, SessionState::Active);
+            assert_eq!(
+                result,
+                Err(SessionTransitionError::FromTerminal),
+                "terminal state {from:?} must reject transition to Active with FromTerminal, got {result:?}"
+            );
+        }
+    }
+
+    /// Regression: terminal states must also reject Created (no walk-back
+    /// to non-terminal non-Active states either).
+    #[test]
+    fn test_terminal_states_reject_transition_to_created() {
+        let terminals = [
+            SessionState::Closed,
+            SessionState::Expired,
+            SessionState::Exhausted,
+        ];
+        for from in terminals {
+            let result = validate_transition(from, SessionState::Created);
+            assert_eq!(
+                result,
+                Err(SessionTransitionError::FromTerminal),
+                "terminal state {from:?} must reject transition to Created, got {result:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_active_cannot_go_to_created() {
         assert_eq!(
@@ -290,5 +358,39 @@ mod tests {
     #[test]
     fn test_close_directly_from_created() {
         assert!(validate_transition(SessionState::Created, SessionState::Closed).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Expiry helpers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_session_expiry_normal_ttl() {
+        // Ordinary TTL: saturating_add behaves identically to +.
+        assert_eq!(session_expiry(1_000, 3_600), 4_600);
+        assert_eq!(session_expiry(0, 0), 0);
+        assert_eq!(session_expiry(1_000_000, 86_400), 1_086_400);
+    }
+
+    #[test]
+    fn test_session_expiry_extreme_ttl_does_not_wrap() {
+        // u64::MAX TTL must not wrap to a past timestamp — it should saturate at u64::MAX.
+        assert_eq!(session_expiry(1_000, u64::MAX), u64::MAX,
+            "extreme TTL must saturate at u64::MAX, not wrap around to a small value");
+        // Any non-zero created_at with MAX TTL also saturates.
+        assert_eq!(session_expiry(u64::MAX, 1), u64::MAX);
+        // Both at MAX saturates.
+        assert_eq!(session_expiry(u64::MAX, u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn test_session_expiry_boundary() {
+        // created_at=0, ttl=3600 → expiry=3600.
+        // now=3600 is NOT expired (now > expiry is false).
+        // now=3601 IS expired (now > expiry is true).
+        let expiry = session_expiry(0, 3600);
+        assert_eq!(expiry, 3600);
+        assert!(3600u64 <= expiry, "at-boundary timestamp should not be expired");
+        assert!(3601u64 > expiry,  "one second past boundary should be expired");
     }
 }
