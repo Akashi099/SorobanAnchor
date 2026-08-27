@@ -267,12 +267,15 @@ fn next_replay_event_id(env: &Env) -> u64 {
 /// Log a replay detection event with structured information.
 ///
 /// Emits a contract event that can be captured by indexers and monitoring systems.
+/// The event payload uses only opaque, non-sensitive identifiers: the raw
+/// `request_id` bytes and actor address are intentionally **excluded** from the
+/// emitted tuple so that formatted log output does not expose payload hashes or
+/// issuer credentials. Consumers that need the full details should read them
+/// from the [`ReplayAttemptRecord`] in temporary storage via [`get_replay_event`].
 pub fn emit_replay_detection_log(env: &Env, event: &ReplayDetectionEvent) {
     env.events().publish(
         (soroban_sdk::symbol_short!("replay"), soroban_sdk::symbol_short!("detected")),
         (
-            event.request_id.clone(),
-            event.actor.clone(),
             event.detected_at,
             event.attempt_count,
             event.ledger_sequence,

@@ -111,10 +111,21 @@ struct DeduplicationEntry {
 /// Maps [`DeduplicationKey`]s to cached outcomes with per-entry TTLs. Entries
 /// expire after `default_ttl_secs` seconds from the time they are recorded;
 /// call [`purge_expired`](Self::purge_expired) periodically to reclaim memory.
+///
+/// The store enforces a hard capacity limit (`max_entries`). Any call to
+/// [`record_success`](Self::record_success) or
+/// [`record_failure`](Self::record_failure) that would push the number of
+/// **live** (non-expired) entries past this limit first evicts expired entries.
+/// If the store is still at capacity after eviction, the insertion is silently
+/// dropped to prevent unbounded memory growth.
 #[derive(Debug)]
 pub struct DeduplicationStore {
     /// Default time-to-live in seconds for each entry.
     default_ttl_secs: u64,
+    /// Maximum number of entries the store will hold at any one time.
+    /// `0` means unlimited (backward-compatible default when constructed via
+    /// [`DeduplicationStore::new`]).
+    max_entries: usize,
     entries: BTreeMap<String, DeduplicationEntry>,
 }
 
@@ -123,6 +134,20 @@ impl DeduplicationStore {
     pub fn new(default_ttl_secs: u64) -> Self {
         DeduplicationStore {
             default_ttl_secs,
+            max_entries: 0,
+            entries: BTreeMap::new(),
+        }
+    }
+
+    /// Create a new store with the given default TTL and a hard capacity cap.
+    ///
+    /// When `max_entries > 0` the insertion path evicts expired entries before
+    /// adding a new key, and skips the insertion if the store is still full
+    /// after eviction.  `max_entries == 0` disables the cap (same as [`new`]).
+    pub fn with_capacity(default_ttl_secs: u64, max_entries: usize) -> Self {
+        DeduplicationStore {
+            default_ttl_secs,
+            max_entries,
             entries: BTreeMap::new(),
         }
     }
@@ -147,6 +172,12 @@ impl DeduplicationStore {
 
     /// Store a successful outcome for `key`.
     pub fn record_success(&mut self, key: &DeduplicationKey, summary: impl Into<String>, now_secs: u64) {
+        self.enforce_capacity(now_secs);
+        if self.max_entries > 0 && self.entries.len() >= self.max_entries {
+            // Still at capacity after eviction — drop the insertion to stay
+            // within the configured bound.
+            return;
+        }
         self.entries.insert(
             key.as_map_key(),
             DeduplicationEntry {
@@ -158,6 +189,10 @@ impl DeduplicationStore {
 
     /// Store a failure outcome for `key`.
     pub fn record_failure(&mut self, key: &DeduplicationKey, error: impl Into<String>, now_secs: u64) {
+        self.enforce_capacity(now_secs);
+        if self.max_entries > 0 && self.entries.len() >= self.max_entries {
+            return;
+        }
         self.entries.insert(
             key.as_map_key(),
             DeduplicationEntry {
@@ -177,6 +212,18 @@ impl DeduplicationStore {
                 None
             }
         })
+    }
+
+    /// Enforce the capacity limit before an insertion by evicting expired
+    /// entries.  Called at the start of every `record_*` method.
+    fn enforce_capacity(&mut self, now_secs: u64) {
+        if self.max_entries == 0 {
+            return; // no cap configured
+        }
+        if self.entries.len() >= self.max_entries {
+            // Evict expired entries to make room.
+            self.entries.retain(|_, v| v.expires_at > now_secs);
+        }
     }
 
     /// Remove all expired entries, returning the count of entries removed.
