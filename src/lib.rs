@@ -237,7 +237,11 @@ pub use trace_context::{TraceContext, TraceError, TRACEPARENT_HEADER, TRACE_ID_H
 pub use request_deduplication::{DeduplicationStore, DeduplicationKey, DeduplicationResult, DeduplicationStats, execute_deduplicated};
 pub use retry_budget::{RetryBudget, RetryBudgetConfig, BudgetExhaustedError, execute_with_budget};
 pub use distributed_correlation::{CorrelationContext, CorrelationError, CORRELATION_ID_HEADER, ORIGIN_SERVICE_HEADER, HOP_COUNT_HEADER, BAGGAGE_HEADER};
-pub use request_provenance::{ProvenanceRecord, PROVENANCE_ID_HEADER, PARENT_ID_HEADER, DEPTH_HEADER, ORIGIN_HEADER, OPERATION_HEADER};
+pub use request_provenance::{
+    ProvenanceRecord, ProvenanceError,
+    PROVENANCE_ID_HEADER, PARENT_ID_HEADER, DEPTH_HEADER, ORIGIN_HEADER, OPERATION_HEADER, METADATA_HEADER,
+    MAX_METADATA_LEN,
+};
 pub use deterministic_hash::{compute_payload_hash, verify_payload_hash};
 pub use contract::{AnchorKitContract, AnchorTomlProvenance, EndpointUpdated, CacheConfig};
 pub use contract::{AttestorRevocationRecord};
