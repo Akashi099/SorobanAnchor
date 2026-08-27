@@ -210,4 +210,56 @@ mod replay_protection_tests {
             &session_id, &issuer, &subject, &1_000_002u64, &hash, &sig(&env),
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Timestamp age and clock-skew boundary assertions (#780)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_replay_timestamp_skew_and_boundaries() {
+        use anchorkit::replay_detection::{
+            is_timestamp_valid, calculate_timestamp_age,
+            DEFAULT_MAX_AGE_SECS, DEFAULT_CLOCK_SKEW_SECS,
+        };
+
+        let now = 1_000_000u64;
+        let max_age = DEFAULT_MAX_AGE_SECS; // 300 s
+        let max_skew = DEFAULT_CLOCK_SKEW_SECS; // 60 s
+
+        // 1. Valid timestamp at current ledger time
+        assert!(is_timestamp_valid(now, now, max_age, max_skew));
+        assert_eq!(calculate_timestamp_age(now, now, max_age, max_skew), Some(Ok(0)));
+
+        // 2. Valid timestamp within past window
+        assert!(is_timestamp_valid(now - 150, now, max_age, max_skew));
+        assert_eq!(calculate_timestamp_age(now - 150, now, max_age, max_skew), Some(Ok(150)));
+
+        // 3. Stale boundary: exact allowed boundary is accepted
+        let stale_boundary = now - max_age;
+        assert!(is_timestamp_valid(stale_boundary, now, max_age, max_skew));
+        assert_eq!(calculate_timestamp_age(stale_boundary, now, max_age, max_skew), Some(Ok(max_age)));
+
+        // 4. Stale beyond boundary: rejected without underflow
+        let stale_excess = now - max_age - 1;
+        assert!(!is_timestamp_valid(stale_excess, now, max_age, max_skew));
+        assert_eq!(calculate_timestamp_age(stale_excess, now, max_age, max_skew), None);
+
+        // 5. Valid timestamp within forward clock-skew window
+        assert!(is_timestamp_valid(now + 30, now, max_age, max_skew));
+        assert_eq!(calculate_timestamp_age(now + 30, now, max_age, max_skew), Some(Err(30)));
+
+        // 6. Future boundary: exact allowed future skew is accepted
+        let future_boundary = now + max_skew;
+        assert!(is_timestamp_valid(future_boundary, now, max_age, max_skew));
+        assert_eq!(calculate_timestamp_age(future_boundary, now, max_age, max_skew), Some(Err(max_skew)));
+
+        // 7. Future beyond boundary: rejected without wraparound
+        let future_excess = now + max_skew + 1;
+        assert!(!is_timestamp_valid(future_excess, now, max_age, max_skew));
+        assert_eq!(calculate_timestamp_age(future_excess, now, max_age, max_skew), None);
+
+        // 8. Zero timestamp is rejected
+        assert!(!is_timestamp_valid(0, now, max_age, max_skew));
+        assert_eq!(calculate_timestamp_age(0, now, max_age, max_skew), None);
+    }
 }
