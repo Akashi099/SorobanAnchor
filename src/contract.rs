@@ -1717,6 +1717,12 @@ const MAX_JWT_MAX_LEN: u32 = 16384;
 /// Default lifetime for an approved KYC record before the approval expires.
 const KYC_EXPIRY_SECONDS: u64 = 30 * 24 * 60 * 60; // 30 days
 
+/// Maximum validity window for a submitted quote (30 days in seconds).
+/// Quotes whose `valid_until` field exceeds `now + MAX_QUOTE_VALIDITY_SECONDS`
+/// are rejected to prevent unbounded validity windows that make routing
+/// unpredictable.
+const MAX_QUOTE_VALIDITY_SECONDS: u64 = 30 * 24 * 60 * 60;
+
 fn current_kyc_status(env: &Env, record: &KycRecord) -> KycStatus {
     if let Some(expiry) = record.expiry {
         if env.ledger().timestamp() > expiry {
@@ -5657,8 +5663,7 @@ impl AnchorKitContract {
         }
         // Reject quotes expiring more than 30 days in the future to prevent
         // unbounded validity windows that make routing unpredictable.
-        const MAX_QUOTE_VALIDITY: u64 = 30 * 24 * 60 * 60;
-        if valid_until.saturating_sub(now) > MAX_QUOTE_VALIDITY {
+        if valid_until.saturating_sub(now) > MAX_QUOTE_VALIDITY_SECONDS {
             panic_with_error!(&env, ErrorCode::InvalidQuote);
         }
         let inst = env.storage().instance();
