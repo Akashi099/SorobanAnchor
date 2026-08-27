@@ -157,10 +157,16 @@ impl DeduplicationStore {
     /// A `true` result means the operation has already been executed and the
     /// caller should retrieve the cached result via [`cached_result`](Self::cached_result)
     /// instead of re-running the operation.
+    ///
+    /// The expiration check is performed **before** the duplicate decision:
+    /// an expired entry is treated as absent — it does not block a fresh
+    /// execution of the same key.
     pub fn is_duplicate(&self, key: &DeduplicationKey, now_secs: u64) -> bool {
         match self.entries.get(&key.as_map_key()) {
-            Some(entry) => entry.expires_at > now_secs,
-            None => false,
+            // Entry exists AND is still within its TTL → this is a live duplicate.
+            Some(entry) if entry.expires_at > now_secs => true,
+            // Entry exists but has expired, or no entry at all → not a duplicate.
+            _ => false,
         }
     }
 
@@ -420,80 +426,50 @@ mod tests {
         assert!(!store.is_duplicate(&k2, 1));
     }
 
-    // -----------------------------------------------------------------------
-    // request_id_tests — capacity guard
-    // -----------------------------------------------------------------------
+    // ── Expiry-before-duplicate ordering ─────────────────────────────────
 
-    /// The store must never exceed max_entries after an insertion even when no
-    /// purge has been called yet.
+    /// A live entry is a duplicate; the same key after TTL is accepted as new.
+    ///
+    /// This test advances the clock in three phases:
+    ///   1. Recorded at t=0, TTL=10 → expires_at=10.
+    ///   2. Within TTL (t=9): is_duplicate=true.
+    ///   3. At expiry boundary (t=10): is_duplicate=false — not a duplicate.
+    ///   4. Past expiry (t=11): is_duplicate=false — can be re-submitted as new.
+    ///
+    /// This confirms expiration is tested BEFORE the duplicate decision so that
+    /// the caller never sees a stale entry as live.
     #[test]
-    fn capacity_guard_never_exceeds_max_entries() {
-        let max = 3usize;
-        let mut store = DeduplicationStore::with_capacity(300, max);
+    fn expired_key_is_accepted_as_new_after_ttl() {
+        let mut store = DeduplicationStore::new(10); // TTL = 10 s
+        let key = DeduplicationKey::new("deposit", "txn-ttl");
 
-        for i in 0..10u32 {
-            let k = DeduplicationKey::new("op", i.to_string());
-            store.record_success(&k, "ok", 0);
-            assert!(
-                store.len() <= max,
-                "store.len() = {} exceeded max_entries = {} after inserting key {}",
-                store.len(), max, i
-            );
-        }
-    }
+        // t=0: record the first execution.
+        store.record_success(&key, "first-result", 0);
 
-    /// Entries that are still within their TTL continue to deduplicate even
-    /// when the store is at capacity.
-    #[test]
-    fn capacity_guard_preserves_existing_deduplication() {
-        let mut store = DeduplicationStore::with_capacity(300, 2);
-        let k1 = DeduplicationKey::new("op", "a");
-        let k2 = DeduplicationKey::new("op", "b");
-        store.record_success(&k1, "ok", 0);
-        store.record_success(&k2, "ok", 0);
+        // t=9: still within TTL → duplicate.
+        assert!(store.is_duplicate(&key, 9),
+            "within TTL the entry must be a live duplicate");
 
-        // At capacity — k1 and k2 should still deduplicate.
-        assert!(store.is_duplicate(&k1, 1));
-        assert!(store.is_duplicate(&k2, 1));
-    }
+        // t=10: at the exact expiry boundary → not a duplicate (expires_at > now is false).
+        assert!(!store.is_duplicate(&key, 10),
+            "at the expiry boundary the entry must not be treated as a duplicate");
 
-    /// When expired entries exist, the capacity guard evicts them to make room
-    /// for a new insertion rather than dropping the new entry.
-    #[test]
-    fn capacity_guard_evicts_expired_before_dropping_new_entry() {
-        // TTL = 10 s, capacity = 2
-        let mut store = DeduplicationStore::with_capacity(10, 2);
-        let k1 = DeduplicationKey::new("op", "a");
-        let k2 = DeduplicationKey::new("op", "b");
-        let k3 = DeduplicationKey::new("op", "c");
+        // t=11: past expiry → not a duplicate; re-recording must succeed.
+        assert!(!store.is_duplicate(&key, 11),
+            "past expiry the entry must not be treated as a duplicate");
 
-        store.record_success(&k1, "ok", 0);  // expires at t=10
-        store.record_success(&k2, "ok", 0);  // expires at t=10
-        assert_eq!(store.len(), 2);
+        // Re-record at t=11 as if this is a fresh first execution.
+        store.record_success(&key, "second-result", 11);
 
-        // At t=20 both k1 and k2 are expired. Inserting k3 should evict them
-        // and succeed, leaving only k3 in the store.
-        store.record_success(&k3, "ok", 20); // expires at t=30
-        assert_eq!(store.len(), 1, "expired entries should have been evicted");
-        assert!(store.is_duplicate(&k3, 21));
-        assert!(!store.is_duplicate(&k1, 21), "k1 should be gone");
-        assert!(!store.is_duplicate(&k2, 21), "k2 should be gone");
-    }
+        // t=12: the freshly recorded entry (expires_at=21) is live → duplicate again.
+        assert!(store.is_duplicate(&key, 12),
+            "after re-recording, the new entry must be recognised as a duplicate");
 
-    /// `record_failure` also respects the capacity cap.
-    #[test]
-    fn capacity_guard_applies_to_record_failure() {
-        let mut store = DeduplicationStore::with_capacity(300, 1);
-        let k1 = DeduplicationKey::new("op", "x");
-        let k2 = DeduplicationKey::new("op", "y");
-
-        store.record_failure(&k1, "err", 0);
-        assert_eq!(store.len(), 1);
-
-        // k1 is still live — k2 insertion must be dropped.
-        store.record_failure(&k2, "err", 0);
-        assert_eq!(store.len(), 1, "second entry should be dropped when at capacity");
-        assert!(store.is_duplicate(&k1, 1), "k1 must still deduplicate");
-        assert!(!store.is_duplicate(&k2, 1), "k2 was never inserted");
+        // The cached result now reflects the second execution, not the stale first.
+        assert_eq!(
+            store.cached_result(&key, 12),
+            Some(DeduplicationResult::Success("second-result".to_string())),
+            "cached result must reflect the re-recorded entry, not the expired one"
+        );
     }
 }

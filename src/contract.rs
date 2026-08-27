@@ -5503,7 +5503,7 @@ impl AnchorKitContract {
         // Check expiry first — an expired session should surface SessionExpired.
         let ttl = if session.session_ttl_seconds == 0 { DEFAULT_SESSION_TTL } else { session.session_ttl_seconds };
         let now = env.ledger().timestamp();
-        if now > session.created_at.saturating_add(ttl) {
+        if now > session_state_machine::session_expiry(session.created_at, ttl) {
             // Record the expiry transition before panicking.
             session.state = SessionState::Expired as u32;
             env.storage().persistent().set(&sess_key, &session);
@@ -8885,7 +8885,7 @@ impl AnchorKitContract {
             session.session_ttl_seconds
         };
         let now = env.ledger().timestamp();
-        let expiry = session.created_at.saturating_add(ttl);
+        let expiry = session_state_machine::session_expiry(session.created_at, ttl);
         if now > expiry {
             panic_with_error!(env, ErrorCode::SessionExpired);
         }

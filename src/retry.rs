@@ -78,12 +78,17 @@ pub struct RetryConfig {
     pub jitter_policy: JitterPolicy,
 }
 
+/// Default delay cap in milliseconds for [`RetryConfig::default`] — bounds how
+/// large the exponential backoff is allowed to grow before retries stop
+/// waiting any longer between attempts.
+const DEFAULT_MAX_DELAY_MS: u64 = 5_000;
+
 impl Default for RetryConfig {
     fn default() -> Self {
         RetryConfig {
             max_attempts: 3,
             base_delay_ms: 100,
-            max_delay_ms: 5_000,
+            max_delay_ms: DEFAULT_MAX_DELAY_MS,
             backoff_multiplier: 2,
             strategy: BackoffStrategy::default(),
             jitter_policy: JitterPolicy::default(),
@@ -247,7 +252,7 @@ impl RetryConfig {
                 let offset = jitter_source.next_seed() % jitter_bound;
                 let sign = (jitter_source.next_seed() % 2) as i64;
                 if sign == 0 {
-                    (base + offset).min(self.max_delay_ms)
+                    base.saturating_add(offset).min(self.max_delay_ms)
                 } else {
                     base.saturating_sub(offset).max(self.base_delay_ms.min(base))
                 }
@@ -847,6 +852,37 @@ mod retry_tests {
         assert_eq!(config.delay_for_attempt(1, &mut js), 0);
     }
 
+    /// Issue #762: an explicit zero `base_delay_ms` must be preserved end to
+    /// end — `sleep_fn` should observe `0` on every retry, not a positive
+    /// default substituted in its place.
+    #[test]
+    fn test_explicit_zero_base_delay_reaches_sleep_fn() {
+        let config = RetryConfig::new(3, 0, 1_000, 2);
+        assert_eq!(config.base_delay_ms, 0, "explicit zero must be stored as-is");
+
+        let mut recorded: Vec<u64> = Vec::new();
+        let mut js = MockJitterSource::new(vec![0]);
+        let _ = retry_with_backoff(
+            &config,
+            |_| Err::<i32, _>(TestError::Transient),
+            is_retryable_test,
+            |ms| recorded.push(ms),
+            &mut js,
+        );
+
+        assert_eq!(recorded.len(), 2);
+        assert!(recorded.iter().all(|&ms| ms == 0), "recorded delays: {recorded:?}");
+
+        // The default configuration (no explicit zero given) must remain
+        // unaffected by the change above.
+        let default_config = RetryConfig::default();
+        assert_eq!(default_config.base_delay_ms, 100);
+
+        // A positive explicit value must also be unaffected.
+        let positive_config = RetryConfig::new(3, 250, 1_000, 2);
+        assert_eq!(positive_config.base_delay_ms, 250);
+    }
+
     /// Total delay (including jitter) never exceeds max_delay_ms.
     #[test]
     fn test_jitter_does_not_push_past_max_delay() {
@@ -1262,5 +1298,206 @@ mod retry_tests {
 
         assert_eq!(seen.len(), 2);
         assert!(seen.iter().all(|id| id == request.trace_id()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #760 — overflow-safe delay calculation
+    // -----------------------------------------------------------------------
+
+    /// An extreme attempt number combined with an extreme multiplier must not
+    /// panic on overflow; the exponential component saturates and the final
+    /// delay stays clamped to `max_delay_ms`.
+    #[test]
+    fn test_extreme_attempt_and_multiplier_do_not_overflow() {
+        let config = RetryConfig::new(3, u64::MAX / 2, u64::MAX, u32::MAX);
+        let mut js = MockJitterSource::new(vec![0]);
+        let delay = config.delay_for_attempt(u32::MAX, &mut js);
+        assert!(delay <= config.max_delay_ms);
+    }
+
+    /// An extreme `base_delay_ms` alone (normal attempt/multiplier) must
+    /// saturate at `max_delay_ms` rather than wrapping or panicking.
+    #[test]
+    fn test_extreme_base_delay_saturates_at_max() {
+        let config = RetryConfig::new(3, u64::MAX, 5_000, 2);
+        let mut js = MockJitterSource::new(vec![0]);
+        let delay = config.delay_for_attempt(5, &mut js);
+        assert_eq!(delay, config.max_delay_ms);
+    }
+
+    /// Linear strategy must also survive an extreme attempt index without
+    /// overflowing the `attempt * base_delay_ms` computation.
+    #[test]
+    fn test_linear_extreme_attempt_does_not_overflow() {
+        let config = RetryConfig::with_strategy(
+            3,
+            u64::MAX / 2,
+            u64::MAX,
+            1,
+            BackoffStrategy::Linear,
+            JitterPolicy::None,
+        );
+        let mut js = MockJitterSource::new(vec![0]);
+        let delay = config.delay_for_attempt(u32::MAX, &mut js);
+        assert!(delay <= config.max_delay_ms);
+    }
+
+    /// Normal, non-extreme attempts must retain their existing (unchanged)
+    /// exponential delays after the overflow fix.
+    #[test]
+    fn test_normal_attempts_unaffected_by_overflow_fix() {
+        let config = RetryConfig::new(4, 100, 10_000, 2);
+        let mut js = MockJitterSource::new(vec![0]);
+        assert_eq!(config.delay_for_attempt(0, &mut js), 100);
+        assert_eq!(config.delay_for_attempt(1, &mut js), 200);
+        assert_eq!(config.delay_for_attempt(2, &mut js), 400);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #761 — no retry scheduling after the final attempt
+    // -----------------------------------------------------------------------
+
+    /// With an always-retryable error, the operation must run exactly
+    /// `max_attempts` times — never one more — and no delay/sleep callback
+    /// may fire after the final attempt.
+    #[test]
+    fn test_final_attempt_returns_immediately_without_extra_call_or_sleep() {
+        let config = RetryConfig::new(4, 10, 1_000, 2);
+        let mut calls = 0u32;
+        let mut delay_calls = 0u32;
+        let mut js = MockJitterSource::new(vec![0]);
+        let result = retry_with_backoff(
+            &config,
+            |_| {
+                calls += 1;
+                Err::<i32, _>(TestError::Transient) // always retryable
+            },
+            is_retryable_test,
+            |_| delay_calls += 1,
+            &mut js,
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            calls, config.max_attempts,
+            "operation must run exactly max_attempts times, never one more"
+        );
+        assert_eq!(
+            delay_calls,
+            config.max_attempts - 1,
+            "no delay must be scheduled after the final attempt"
+        );
+    }
+
+    /// A successful first attempt must retain current behaviour: exactly one
+    /// call, no delay.
+    #[test]
+    fn test_first_attempt_success_unaffected_by_boundary_fix() {
+        let config = RetryConfig::new(4, 10, 1_000, 2);
+        let mut calls = 0u32;
+        let mut delay_calls = 0u32;
+        let mut js = MockJitterSource::new(vec![0]);
+        let result = retry_with_backoff(
+            &config,
+            |_| {
+                calls += 1;
+                Ok::<_, TestError>(1)
+            },
+            is_retryable_test,
+            |_| delay_calls += 1,
+            &mut js,
+        );
+        assert_eq!(result, Ok(1));
+        assert_eq!(calls, 1);
+        assert_eq!(delay_calls, 0);
+    }
+
+    /// An immediate non-retryable error must retain current behaviour: one
+    /// call, no delay, error returned right away.
+    #[test]
+    fn test_immediate_nonretryable_error_unaffected_by_boundary_fix() {
+        let config = RetryConfig::new(4, 10, 1_000, 2);
+        let mut calls = 0u32;
+        let mut delay_calls = 0u32;
+        let mut js = MockJitterSource::new(vec![0]);
+        let result = retry_with_backoff(
+            &config,
+            |_| {
+                calls += 1;
+                Err::<i32, _>(TestError::Permanent)
+            },
+            is_retryable_test,
+            |_| delay_calls += 1,
+            &mut js,
+        );
+        assert_eq!(result, Err(TestError::Permanent));
+        assert_eq!(calls, 1);
+        assert_eq!(delay_calls, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #763 — jitter must not push the delay past max_delay_ms
+    // -----------------------------------------------------------------------
+
+    /// Full jitter: a deterministic mock seed chosen so that `base + jitter`
+    /// would exceed `max_delay_ms` unless clamped after combination.
+    #[test]
+    fn test_full_jitter_clamped_to_max_delay() {
+        // attempt 0 => base = 4_900 (multiplier^0 = 1).
+        // jitter_bound = base_delay_ms / 2 + 1 = 2_451.
+        // seed = 2_450 => jitter = 2_450 % 2_451 = 2_450.
+        // Unclamped: 4_900 + 2_450 = 7_350, well past max_delay_ms = 5_000.
+        let config = RetryConfig::new(2, 4_900, 5_000, 1);
+        let mut js = MockJitterSource::new(vec![2_450]);
+        let delay = config.delay_for_attempt(0, &mut js);
+        assert_eq!(delay, config.max_delay_ms);
+    }
+
+    /// Equal jitter's "add" branch must also be clamped: base already equal
+    /// to `max_delay_ms`, so any positive offset must be brought back down.
+    #[test]
+    fn test_equal_jitter_add_branch_clamped_to_max_delay() {
+        let config = RetryConfig::with_strategy(
+            2,
+            5_000,
+            5_000,
+            1,
+            BackoffStrategy::Constant,
+            JitterPolicy::Equal,
+        );
+        // offset = 1 % 2_500 = 1, sign = 0 % 2 = 0 (add branch).
+        let mut js = MockJitterSource::new(vec![1, 0]);
+        let delay = config.delay_for_attempt(0, &mut js);
+        assert_eq!(delay, config.max_delay_ms);
+    }
+
+    /// The largest possible mock jitter value must never push the delay past
+    /// `max_delay_ms`, across attempts and strategies.
+    #[test]
+    fn test_largest_mock_jitter_never_exceeds_max_delay() {
+        let configs = [
+            RetryConfig::new(5, 1_000, 3_000, 2),
+            RetryConfig::with_strategy(5, 1_000, 3_000, 2, BackoffStrategy::Linear, JitterPolicy::Full),
+            RetryConfig::with_strategy(5, 1_000, 3_000, 2, BackoffStrategy::Constant, JitterPolicy::Equal),
+        ];
+        for config in configs {
+            for attempt in 0..5u32 {
+                let mut js = MockJitterSource::new(vec![u64::MAX]);
+                let delay = config.delay_for_attempt(attempt, &mut js);
+                assert!(
+                    delay <= config.max_delay_ms,
+                    "attempt={attempt}: delay {delay} exceeded max {}",
+                    config.max_delay_ms
+                );
+            }
+        }
+    }
+
+    /// Ordinary jittered delays (well within the cap) must remain unchanged
+    /// by the clamp fix.
+    #[test]
+    fn test_ordinary_jittered_delay_unaffected_by_clamp_fix() {
+        let config = RetryConfig::new(3, 100, 10_000, 2);
+        let mut js = MockJitterSource::new(vec![10]);
+        assert_eq!(config.delay_for_attempt(0, &mut js), 110);
     }
 }

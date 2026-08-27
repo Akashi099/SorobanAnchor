@@ -3,6 +3,7 @@
 //! Validates anchor domain URLs before making requests to ensure:
 //! - Proper URL format
 //! - HTTPS-only connections (TLS enforcement)
+//! - Origin-only input (root path, no sub-paths)
 //! - No embedded userinfo credentials
 //! - Rejection of IP addresses (IPv4 and IPv6)
 //! - Rejection of malformed or reserved hostnames
@@ -108,9 +109,11 @@ impl DomainPolicy {
 /// Ensures the URL is safe to use as an anchor endpoint before making any
 /// outbound HTTP requests. The following rules are enforced:
 ///
-/// - Must be non-empty and between 10 and 2048 characters.
+/// - Must be non-empty and non-whitespace-only, and between 10 and 2048 characters.
 /// - Must use the `https://` scheme exactly (HTTP, FTP, WS, WSS, etc. are rejected).
 /// - No embedded userinfo credentials (`user:pass@` or `user@` in the authority).
+/// - Must be an origin: the path must be empty or root (`/`). Query strings
+///   and fragments are still permitted after a root path.
 /// - Host must contain at least one dot (no bare hostnames like `localhost`).
 /// - No consecutive dots, leading/trailing dots, or leading/trailing hyphens
 ///   in any DNS label.
@@ -143,8 +146,15 @@ impl DomainPolicy {
 /// // Valid HTTPS domain
 /// assert!(validate_anchor_domain("https://anchor.example.com").is_ok());
 ///
-/// // Valid with port and path
-/// assert!(validate_anchor_domain("https://api.example.com:8080/sep6").is_ok());
+/// // Valid with port (root path only)
+/// assert!(validate_anchor_domain("https://api.example.com:8080").is_ok());
+///
+/// // Rejected: non-root path
+/// assert!(validate_anchor_domain("https://api.example.com/sep6").is_err());
+///
+/// // Rejected: empty or whitespace-only input
+/// assert!(validate_anchor_domain("").is_err());
+/// assert!(validate_anchor_domain("   ").is_err());
 ///
 /// // Rejected: HTTP
 /// assert!(validate_anchor_domain("http://example.com").is_err());
@@ -162,14 +172,16 @@ impl DomainPolicy {
 /// assert!(validate_anchor_domain("https://[::1]").is_err());
 /// ```
 pub fn validate_anchor_domain(domain: &str) -> Result<(), AnchorKitError> {
-    // Reject any leading or trailing whitespace before any other check.
-    // We do NOT trim — callers must supply a clean string.
-    if domain != domain.trim() {
+    // Reject empty or whitespace-only input immediately, before any URL
+    // parsing begins, so a blank configuration value surfaces as a clear
+    // domain-specific error rather than a generic parse failure.
+    if domain.trim().is_empty() {
         return Err(AnchorKitError::invalid_endpoint_format());
     }
 
-    // Check for empty input
-    if domain.is_empty() {
+    // Reject any leading or trailing whitespace on otherwise non-blank input.
+    // We do NOT trim — callers must supply a clean string.
+    if domain != domain.trim() {
         return Err(AnchorKitError::invalid_endpoint_format());
     }
 
@@ -215,6 +227,19 @@ pub fn validate_anchor_domain(domain: &str) -> Result<(), AnchorKitError> {
     // RFC 3986 §3.2.1: userinfo is the substring before '@' in the authority.
     // Any '@' in the authority means credentials are embedded — always reject.
     if authority.contains('@') {
+        return Err(AnchorKitError::invalid_endpoint_format());
+    }
+
+    // --- Path check ---
+    // An anchor domain is an origin (scheme + host [+ port]), not an
+    // endpoint URL. Reject any path other than empty or root ("/") so a
+    // caller cannot mistake a resource path for the base host.
+    let after_authority = &after_scheme[authority.len()..];
+    let path_end = after_authority
+        .find(|c: char| c == '?' || c == '#')
+        .unwrap_or(after_authority.len());
+    let path = &after_authority[..path_end];
+    if !path.is_empty() && path != "/" {
         return Err(AnchorKitError::invalid_endpoint_format());
     }
 
@@ -469,12 +494,10 @@ mod tests {
         assert!(validate_anchor_domain("https://example.com").is_ok());
         assert!(validate_anchor_domain("https://api.example.com").is_ok());
         assert!(validate_anchor_domain("https://sub.domain.example.com").is_ok());
-        assert!(validate_anchor_domain("https://example.com/path").is_ok());
-        assert!(validate_anchor_domain("https://example.com/path/to/resource").is_ok());
+        assert!(validate_anchor_domain("https://example.com/").is_ok());
         assert!(validate_anchor_domain("https://example.com:8080").is_ok());
         assert!(validate_anchor_domain("https://example.com:443").is_ok());
         assert!(validate_anchor_domain("https://example.com?param=value").is_ok());
-        assert!(validate_anchor_domain("https://example.com/path?param=value").is_ok());
         assert!(validate_anchor_domain("https://my-domain.com").is_ok());
         assert!(validate_anchor_domain("https://api-v2.example.com").is_ok());
     }
@@ -625,6 +648,32 @@ mod tests {
         assert!(validate_anchor_domain("https://exam!ple.com").is_err());
     }
 
+    #[test]
+    fn test_empty_and_whitespace_only_input_rejected() {
+        // Blank input must fail deterministically with the same error
+        // family as malformed nonblank values, before any URL parsing.
+        assert!(validate_anchor_domain("").is_err());
+        assert!(validate_anchor_domain(" ").is_err());
+        assert!(validate_anchor_domain("   ").is_err());
+        assert!(validate_anchor_domain("\t").is_err());
+        assert!(validate_anchor_domain("\n").is_err());
+        assert!(validate_anchor_domain("  \t\n  ").is_err());
+
+        // A valid HTTPS domain still passes.
+        assert!(validate_anchor_domain("https://anchor.example.com").is_ok());
+    }
+
+    #[test]
+    fn test_non_root_path_rejected() {
+        // The validator authorizes an origin, not an endpoint with a path.
+        assert!(validate_anchor_domain("https://anchor.example.com/api").is_err());
+        assert!(validate_anchor_domain("https://anchor.example.com/api/v1").is_err());
+
+        // Root path (empty or "/") remains valid.
+        assert!(validate_anchor_domain("https://anchor.example.com").is_ok());
+        assert!(validate_anchor_domain("https://anchor.example.com/").is_ok());
+    }
+
     // ------------------------------------------------------------------
     // Port validation
     // ------------------------------------------------------------------
@@ -651,8 +700,9 @@ mod tests {
         assert!(validate_anchor_domain("https://example.com:0").is_err());
         assert!(validate_anchor_domain("https://example.com:65536").is_err());
         assert!(validate_anchor_domain("https://example.com:99999").is_err());
-        assert!(validate_anchor_domain("https://example.com:8080/path").is_ok());
-        assert!(validate_anchor_domain("https://example.com:8080/path?query=value").is_ok());
+        assert!(validate_anchor_domain("https://example.com:8080/path").is_err());
+        assert!(validate_anchor_domain("https://example.com:8080/path?query=value").is_err());
+        assert!(validate_anchor_domain("https://example.com:8080/").is_ok());
     }
 
     // ------------------------------------------------------------------
@@ -715,11 +765,13 @@ mod tests {
 
     #[test]
     fn test_special_characters_in_path() {
-        assert!(validate_anchor_domain("https://example.com/path-with-dash").is_ok());
-        assert!(validate_anchor_domain("https://example.com/path_with_underscore").is_ok());
-        assert!(validate_anchor_domain("https://example.com/path.with.dot").is_ok());
-        assert!(validate_anchor_domain("https://example.com/path~tilde").is_ok());
-        assert!(validate_anchor_domain("https://example.com/path%20encoded").is_ok());
+        // Anchor domains are origins only — any non-root path is rejected
+        // regardless of which characters it contains.
+        assert!(validate_anchor_domain("https://example.com/path-with-dash").is_err());
+        assert!(validate_anchor_domain("https://example.com/path_with_underscore").is_err());
+        assert!(validate_anchor_domain("https://example.com/path.with.dot").is_err());
+        assert!(validate_anchor_domain("https://example.com/path~tilde").is_err());
+        assert!(validate_anchor_domain("https://example.com/path%20encoded").is_err());
 
         assert!(validate_anchor_domain("https://example.com/path<invalid>").is_err());
         assert!(validate_anchor_domain("https://example.com/path{invalid}").is_err());
@@ -744,15 +796,15 @@ mod tests {
 
     #[test]
     fn test_double_slashes_in_path() {
-        assert!(validate_anchor_domain("https://example.com//path").is_ok());
-        assert!(validate_anchor_domain("https://example.com/path//resource").is_ok());
+        assert!(validate_anchor_domain("https://example.com//path").is_err());
+        assert!(validate_anchor_domain("https://example.com/path//resource").is_err());
     }
 
     #[test]
     fn test_trailing_slashes() {
         assert!(validate_anchor_domain("https://example.com/").is_ok());
-        assert!(validate_anchor_domain("https://example.com/path/").is_ok());
-        assert!(validate_anchor_domain("https://example.com//").is_ok());
+        assert!(validate_anchor_domain("https://example.com/path/").is_err());
+        assert!(validate_anchor_domain("https://example.com//").is_err());
     }
 
     #[test]
@@ -776,7 +828,8 @@ mod tests {
         assert!(validate_anchor_domain("https://example.com?param=value").is_ok());
         assert!(validate_anchor_domain("https://example.com?param1=value1&param2=value2").is_ok());
         assert!(validate_anchor_domain("https://example.com#section").is_ok());
-        assert!(validate_anchor_domain("https://example.com/path#section").is_ok());
+        assert!(validate_anchor_domain("https://example.com/path#section").is_err());
+        assert!(validate_anchor_domain("https://example.com/#section").is_ok());
         assert!(validate_anchor_domain("https://example.com?param=value#section").is_ok());
     }
 
@@ -869,6 +922,29 @@ mod tests {
         let policy = DomainPolicy::allow_all().with_deny("Evil.COM");
         assert!(validate_anchor_domain_with_policy("https://evil.com", Some(&policy)).is_err());
         assert!(validate_anchor_domain_with_policy("https://EVIL.COM", Some(&policy)).is_err());
+    }
+
+    #[test]
+    fn test_policy_mixed_case_host_normalization() {
+        // Upper-, lower-, and mixed-case spellings of the same DNS name
+        // must produce identical policy results.
+        let policy = DomainPolicy::deny_all().with_allow("Anchor.Example.COM");
+        assert!(
+            validate_anchor_domain_with_policy("https://anchor.example.com", Some(&policy)).is_ok()
+        );
+        assert!(
+            validate_anchor_domain_with_policy("https://ANCHOR.EXAMPLE.COM", Some(&policy)).is_ok()
+        );
+        assert!(
+            validate_anchor_domain_with_policy("https://AnChOr.eXaMpLe.CoM", Some(&policy)).is_ok()
+        );
+        assert!(
+            validate_anchor_domain_with_policy("https://sub.AnChOr.eXaMpLe.CoM", Some(&policy))
+                .is_ok()
+        );
+        assert!(
+            validate_anchor_domain_with_policy("https://other.example.com", Some(&policy)).is_err()
+        );
     }
 
     #[test]

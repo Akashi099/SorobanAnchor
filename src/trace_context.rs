@@ -319,7 +319,11 @@ impl TraceContext {
     /// assert!(ctx.sampled());
     /// ```
     pub fn parse_traceparent(header: &str) -> Result<Self, TraceError> {
-        let mut parts = header.trim().split('-');
+        // Trim transport-level surrounding whitespace at the input boundary only.
+        // Individual components after splitting are never trimmed so that
+        // internal spaces (e.g. "4bf9 2f35...") are caught by is_valid_id.
+        let header = header.trim();
+        let mut parts = header.split('-');
         let version = parts.next().ok_or(TraceError::MalformedTraceparent)?;
         let trace_id = parts.next().ok_or(TraceError::MalformedTraceparent)?;
         let span_id = parts.next().ok_or(TraceError::MalformedTraceparent)?;
@@ -666,5 +670,32 @@ mod tests {
     fn non_zero_id_replaces_all_zero_input() {
         assert_eq!(non_zero_id("0000000000000000"), "1000000000000000");
         assert_eq!(non_zero_id("00f067aa0ba902b7"), "00f067aa0ba902b7");
+    }
+
+    // ── Trim-boundary behaviour ──────────────────────────────────────────
+
+    /// Surrounding whitespace on the raw header value is transport noise and
+    /// should be tolerated.
+    #[test]
+    fn parse_traceparent_tolerates_surrounding_whitespace() {
+        let header = alloc::format!("  00-{TRACE}-{SPAN}-01  ");
+        let ctx = TraceContext::parse_traceparent(&header)
+            .expect("surrounding whitespace should be stripped before parsing");
+        assert_eq!(ctx.trace_id(), TRACE);
+        assert_eq!(ctx.span_id(), SPAN);
+        assert!(ctx.sampled());
+    }
+
+    /// Internal whitespace inside a semantic field must not be silently
+    /// normalised — it is a malformed identifier and must be rejected.
+    #[test]
+    fn parse_traceparent_rejects_internal_whitespace_in_trace_id() {
+        // Inject a space inside the trace-id field.
+        let malformed = alloc::format!("00-4bf92f3577b34da6 a3ce929d0e0e4736-{SPAN}-01");
+        assert_eq!(
+            TraceContext::parse_traceparent(&malformed),
+            Err(TraceError::InvalidTraceId),
+            "internal whitespace in trace-id must be rejected, not silently trimmed"
+        );
     }
 }
