@@ -1709,6 +1709,9 @@ pub const MAX_OPS_PER_SESSION: u64 = 100;
 /// Minimum TTL for replay-protection entries (7 days in ledgers at ~5 s/ledger).
 pub const REPLAY_TTL: u32 = 120_960;
 
+/// Maximum accepted byte length for an attestation payload hash (SHA-256 = 32 bytes).
+pub const MAX_PAYLOAD_HASH_BYTES: u32 = 32;
+
 /// Inclusive lower bound for the configurable JWT max-length (set_jwt_max_len).
 const MIN_JWT_MAX_LEN: u32 = 2048;
 /// Inclusive upper bound for the configurable JWT max-length (set_jwt_max_len).
@@ -3328,6 +3331,17 @@ impl AnchorKitContract {
             .get(&pk_key)
             .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::AttestorNotRegistered));
 
+        // Capture whether this is a genuine active→revoked transition before any
+        // writes. An existing record with reactivated=false means the attestor is
+        // already revoked (edge case guard); no event should fire in that case.
+        let revoc_key = (symbol_short!("ATREVOC"), attestor.clone());
+        let already_revoked = env
+            .storage()
+            .persistent()
+            .get::<_, AttestorRevocationRecord>(&revoc_key)
+            .map(|r| !r.reactivated)
+            .unwrap_or(false);
+
         // Remove the active registration keys so `check_attestor` / `is_attestor`
         // start returning false immediately.
         env.storage().persistent().remove(&key);
@@ -3345,7 +3359,6 @@ impl AnchorKitContract {
             reactivated: false,
             reactivated_at: 0,
         };
-        let revoc_key = (symbol_short!("ATREVOC"), attestor.clone());
         env.storage().persistent().set(&revoc_key, &revoc_record);
         env.storage()
             .persistent()
@@ -3374,10 +3387,12 @@ impl AnchorKitContract {
             "revoked",
         );
 
-        env.events().publish(
-            (symbol_short!("attestor"), symbol_short!("removed"), attestor.clone()),
-            AttestorRevokedEvent { attestor, revoked_by: admin, timestamp: env.ledger().timestamp() },
-        );
+        if !already_revoked {
+            env.events().publish(
+                (symbol_short!("attestor"), symbol_short!("removed"), attestor.clone()),
+                AttestorRevokedEvent { attestor, revoked_by: admin, timestamp: env.ledger().timestamp() },
+            );
+        }
     }
 
     /// Reactivate an attestor that was previously revoked.
@@ -4269,7 +4284,7 @@ impl AnchorKitContract {
     /// [`AdminCapability::ToggleServices`].
     pub fn enable_service(env: Env, caller: Address, anchor: Address, service_code: u32) -> bool {
         Self::require_admin_or_capability(&env, &caller, AdminCapability::ToggleServices);
-        let changed = ServiceManager::enable_service(&env, &anchor, service_code);
+        let changed = ServiceManager::enable_service(&env, &anchor, service_code).unwrap_or(false);
         AdminAuditLog::log_action(
             &env,
             &caller,
@@ -4290,7 +4305,7 @@ impl AnchorKitContract {
     /// [`AdminCapability::ToggleServices`].
     pub fn disable_service(env: Env, caller: Address, anchor: Address, service_code: u32) -> bool {
         Self::require_admin_or_capability(&env, &caller, AdminCapability::ToggleServices);
-        let changed = ServiceManager::disable_service(&env, &anchor, service_code);
+        let changed = ServiceManager::disable_service(&env, &anchor, service_code).unwrap_or(false);
         AdminAuditLog::log_action(
             &env,
             &caller,
@@ -4398,6 +4413,9 @@ impl AnchorKitContract {
         // function panics before any storage mutation occurs, leaving the
         // contract in a consistent state.
         issuer.require_auth();
+        if payload_hash.len() > MAX_PAYLOAD_HASH_BYTES {
+            panic_with_error!(&env, ErrorCode::ValidationError);
+        }
         Self::check_attestor(&env, &issuer);
         Self::verify_attestation_signature(&env, &issuer, &payload_hash, &signature);
         Self::check_timestamp(&env, timestamp);
@@ -9269,6 +9287,9 @@ impl AnchorKitContract {
         let inst = env.storage().instance();
         let ck = soroban_sdk::vec![env, symbol_short!("COUNTER")];
         let id: u64 = inst.get(&ck).unwrap_or(0u64);
+        if id == u64::MAX {
+            panic_with_error!(env, ErrorCode::AttestorCapacityExceeded);
+        }
         inst.set(&ck, &(id + 1));
         inst.extend_ttl(INSTANCE_TTL, INSTANCE_TTL);
         id
