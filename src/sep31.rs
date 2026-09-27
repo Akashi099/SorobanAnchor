@@ -83,16 +83,43 @@ fn validate_memo_length(memo: Option<&str>) -> Result<(), Error> {
 
 /// Validate that a string is a syntactically valid positive decimal number.
 ///
-/// Accepts strings like `"100"`, `"100.50"`, `"0.01"`. Rejects empty strings,
-/// negative values, multiple dots, and non-digit characters.
+/// The canonical grammar is: one or more digits, optionally followed by a
+/// decimal point and one or more digits.  In ABNF:
+///
+/// ```text
+/// positive-decimal = 1*DIGIT [ "." 1*DIGIT ]
+/// ```
+///
+/// Accepts strings like `"100"`, `"100.50"`, `"0.01"`, `"999999999.999999999"`.
+///
+/// Rejects:
+/// - Empty strings.
+/// - Leading decimal point (`.5`) — the integer part is required.
+/// - Trailing decimal point (`5.`) — the fractional part, when present, must
+///   contain at least one digit.
+/// - Lone decimal point (`"."`).
+/// - Multiple decimal points (`"10.0.0"`).
+/// - Negative values (`"-50.00"`).
+/// - Non-digit, non-dot characters (`"abc"`).
+/// - Numerically zero values (`"0"`, `"0.00"`) — the field contract requires
+///   a *positive* decimal; zero does not satisfy that requirement.
 fn validate_positive_decimal(s: &str, field: &str) -> Result<(), Error> {
     if s.is_empty() {
         return Err(Error::validation_error(
             &alloc::format!("{} must not be empty", field),
         ));
     }
+
+    // Reject a leading decimal point — the integer part is mandatory.
+    if s.starts_with('.') {
+        return Err(Error::validation_error(
+            &alloc::format!("{} must not start with a decimal point", field),
+        ));
+    }
+
     let mut has_dot = false;
-    let mut has_digit = false;
+    let mut digits_before_dot: u32 = 0;
+    let mut digits_after_dot: u32 = 0;
     for (i, c) in s.chars().enumerate() {
         if c == '.' {
             if has_dot {
@@ -101,14 +128,12 @@ fn validate_positive_decimal(s: &str, field: &str) -> Result<(), Error> {
                 ));
             }
             has_dot = true;
-            // A lone "." is not valid
-            if s.len() == 1 {
-                return Err(Error::validation_error(
-                    &alloc::format!("{} is not a valid decimal", field),
-                ));
-            }
         } else if c.is_ascii_digit() {
-            has_digit = true;
+            if has_dot {
+                digits_after_dot += 1;
+            } else {
+                digits_before_dot += 1;
+            }
         } else if c == '-' && i == 0 {
             return Err(Error::validation_error(
                 &alloc::format!("{} must not be negative", field),
@@ -119,11 +144,32 @@ fn validate_positive_decimal(s: &str, field: &str) -> Result<(), Error> {
             ));
         }
     }
-    if !has_digit {
+
+    // Require at least one digit before the dot (already implied by the
+    // leading-dot check above, but kept explicit for clarity).
+    if digits_before_dot == 0 {
         return Err(Error::validation_error(
             &alloc::format!("{} must contain at least one digit", field),
         ));
     }
+
+    // Reject a trailing decimal point — the fractional part, when present,
+    // must contain at least one digit.
+    if has_dot && digits_after_dot == 0 {
+        return Err(Error::validation_error(
+            &alloc::format!("{} must not end with a decimal point", field),
+        ));
+    }
+
+    // Reject numerically zero values.  Parse by summing all digit characters;
+    // if every digit is '0' the value is zero and must be rejected.
+    let all_zero = s.chars().filter(|c| c.is_ascii_digit()).all(|c| c == '0');
+    if all_zero {
+        return Err(Error::validation_error(
+            &alloc::format!("{} must be greater than zero", field),
+        ));
+    }
+
     Ok(())
 }
 
@@ -169,7 +215,7 @@ fn validate_idempotency_key(key: Option<&str>) -> Result<(), Error> {
 pub fn initiate_sep31_payment(
     raw: RawSep31PaymentResponse,
 ) -> Result<Sep31PaymentResponse, Error> {
-    if raw.id.is_empty() {
+    if raw.id.trim().is_empty() {
         return Err(Error::invalid_transaction_intent());
     }
     if raw.id.len() > MAX_ID_LENGTH {

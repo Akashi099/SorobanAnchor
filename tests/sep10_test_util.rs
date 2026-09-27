@@ -63,6 +63,30 @@ pub fn build_sep10_jwt_with_jti(
     let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_bytes());
     format!("{}.{}", signing_input, sig_b64)
 }
+/// Build a SEP-10 JWT that includes both a custom `iss` and a custom `jti`
+/// claim.  Used to test that an invalid issuer token does not poison the JTI
+/// replay cache for a later valid token sharing the same JTI.
+pub fn build_sep10_jwt_with_jti_and_iss(
+    signing_key: &SigningKey,
+    sub: &str,
+    exp: u64,
+    jti: &str,
+    issuer: &str,
+) -> std::string::String {
+    let header = r#"{"alg":"EdDSA","typ":"JWT"}"#;
+    let iat = exp.saturating_sub(86_400);
+    let payload = format!(
+        r#"{{"sub":"{}","iat":{},"exp":{},"iss":"{}","jti":"{}"}}"#,
+        sub, iat, exp, issuer, jti
+    );
+    let header_b64 = URL_SAFE_NO_PAD.encode(header);
+    let payload_b64 = URL_SAFE_NO_PAD.encode(payload);
+    let signing_input = format!("{}.{}", header_b64, payload_b64);
+    let sig = signing_key.sign(signing_input.as_bytes());
+    let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_bytes());
+    format!("{}.{}", signing_input, sig_b64)
+}
+
 /// Build a SEP-10 JWT whose `iss` claim is set to `issuer` instead of the
 /// default `"https://anchor.example.com"`. Used to test issuer mismatch
 /// rejection in `verify_sep10_jwt_with_issuer`.

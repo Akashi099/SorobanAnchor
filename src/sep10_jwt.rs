@@ -415,7 +415,13 @@ pub fn verify_sep10_jwt(
     // Use persistent storage keyed by SHA-256("jti:" || jti_bytes) so the JTI
     // is remembered between separate contract invocations. TTL is derived from
     // the token's remaining lifetime plus a 10-minute buffer for clock skew.
-    if let Some(jti_bytes) = parse_json_jti(&payload_dec) {
+    //
+    // The replay check (has?) is performed here, before iss/sub validation, so
+    // that a replayed token is rejected as early as possible.  However, the
+    // store mutation (set + extend_ttl) is deferred until after all claim checks
+    // complete, so that an invalid token — one whose iss or sub fails — never
+    // consumes a JTI that a later valid token sharing the same JTI needs.
+    let jti_store: Option<(soroban_sdk::BytesN<32>, u32)> = if let Some(jti_bytes) = parse_json_jti(&payload_dec) {
         if jti_bytes.len() > JTI_MAX_BYTES {
             return Err(());
         }
@@ -436,9 +442,10 @@ pub fn verify_sep10_jwt(
         let ttl_ledgers = ((remaining_secs / 5) as u32)
             .saturating_add(JTI_TTL_BUFFER_LEDGERS)
             .max(1);
-        env.storage().persistent().set(&jti_key, &true);
-        env.storage().persistent().extend_ttl(&jti_key, ttl_ledgers, ttl_ledgers);
-    }
+        Some((jti_key, ttl_ledgers))
+    } else {
+        None
+    };
 
     // iss claim: must be present, non-empty, and must not be whitespace-only
     // or contain ASCII control characters. Normalize by trimming before the
@@ -472,6 +479,15 @@ pub fn verify_sep10_jwt(
         if sub != *expected {
             return Err(());
         }
+    }
+
+    // All claim and signature checks have passed.  Now commit the JTI to
+    // persistent storage so that a replay of this exact token is rejected.
+    // Doing the write here (rather than before iss/sub validation) ensures
+    // that an invalid token can never poison a JTI needed by a later valid one.
+    if let Some((jti_key, ttl_ledgers)) = jti_store {
+        env.storage().persistent().set(&jti_key, &true);
+        env.storage().persistent().extend_ttl(&jti_key, ttl_ledgers, ttl_ledgers);
     }
 
     Ok(())
