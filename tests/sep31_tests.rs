@@ -85,6 +85,119 @@ fn memo_with_invalid_type_rejected() {
     );
 }
 
+// -----------------------------------------------------------------------
+// Task 1: validate_positive_decimal — canonical decimal grammar
+// Leading/trailing decimal points are not part of the canonical grammar.
+// -----------------------------------------------------------------------
+
+#[test]
+fn amount_leading_dot_rejected() {
+    // ".5" is an ambiguous form; the canonical grammar requires an integer part.
+    let mut raw = raw_payment();
+    raw.amount = Some(".5".into());
+    assert!(
+        initiate_sep31_payment(raw).is_err(),
+        "leading dot (.5) must be rejected"
+    );
+}
+
+#[test]
+fn amount_trailing_dot_rejected() {
+    // "5." is an ambiguous form; the fractional part, when present, must
+    // contain at least one digit.
+    let mut raw = raw_payment();
+    raw.amount = Some("5.".into());
+    assert!(
+        initiate_sep31_payment(raw).is_err(),
+        "trailing dot (5.) must be rejected"
+    );
+}
+
+#[test]
+fn amount_canonical_zero_point_five_accepted() {
+    // "0.5" is the canonical way to express .5 and must be accepted.
+    let mut raw = raw_payment();
+    raw.amount = Some("0.5".into());
+    let resp = initiate_sep31_payment(raw).unwrap();
+    assert_eq!(resp.amount.as_deref(), Some("0.5"));
+}
+
+// -----------------------------------------------------------------------
+// Task 3: whitespace-only transaction ID must be rejected.
+// -----------------------------------------------------------------------
+
+#[test]
+fn whitespace_only_id_rejected() {
+    let mut raw = raw_payment();
+    raw.id = "   ".into();
+    assert_eq!(
+        initiate_sep31_payment(raw),
+        Err(Error::invalid_transaction_intent()),
+        "whitespace-only id must be rejected before any payment state is written"
+    );
+}
+
+#[test]
+fn tab_only_id_rejected() {
+    let mut raw = raw_payment();
+    raw.id = "\t\n".into();
+    assert_eq!(
+        initiate_sep31_payment(raw),
+        Err(Error::invalid_transaction_intent()),
+    );
+}
+
+// -----------------------------------------------------------------------
+// Task 4: validate_positive_decimal — zero values must be rejected.
+// The field contract says "positive decimal"; zero does not satisfy that.
+// -----------------------------------------------------------------------
+
+#[test]
+fn amount_zero_rejected() {
+    let mut raw = raw_payment();
+    raw.amount = Some("0".into());
+    assert!(
+        initiate_sep31_payment(raw).is_err(),
+        "zero amount must be rejected"
+    );
+}
+
+#[test]
+fn amount_zero_decimal_rejected() {
+    let mut raw = raw_payment();
+    raw.amount = Some("0.00".into());
+    assert!(
+        initiate_sep31_payment(raw).is_err(),
+        "0.00 must be rejected as numerically zero"
+    );
+}
+
+#[test]
+fn amount_zero_many_decimals_rejected() {
+    let mut raw = raw_payment();
+    raw.amount = Some("0.000000000".into());
+    assert!(
+        initiate_sep31_payment(raw).is_err(),
+        "0.000000000 must be rejected as numerically zero"
+    );
+}
+
+#[test]
+fn amount_fractional_positive_accepted() {
+    // A non-zero fractional value must still be accepted.
+    let mut raw = raw_payment();
+    raw.amount = Some("0.01".into());
+    let resp = initiate_sep31_payment(raw).unwrap();
+    assert_eq!(resp.amount.as_deref(), Some("0.01"));
+}
+
+#[test]
+fn amount_positive_integer_accepted() {
+    let mut raw = raw_payment();
+    raw.amount = Some("1".into());
+    assert!(initiate_sep31_payment(raw).is_ok());
+}
+
 #[test]
 fn service_type_sep31_detected_in_capability_check() {
     let env = Env::default();

@@ -419,7 +419,6 @@ impl ProvenanceRecord {
     pub fn from_headers(headers: &[(String, String)]) -> Option<Self> {
         let mut request_id: Option<String> = None;
         let mut parent_id: Option<String> = None;
-        let mut depth: usize = 0;
         let mut origin_service = String::new();
         let mut operation: Option<String> = None;
         let mut metadata: Option<String> = None;
@@ -429,11 +428,18 @@ impl ProvenanceRecord {
             if n.eq_ignore_ascii_case(PROVENANCE_ID_HEADER) {
                 request_id = Some(value.clone());
             } else if n.eq_ignore_ascii_case(PARENT_ID_HEADER) {
-                if value != "root" {
+                if value == "root" {
+                    parent_id = None;
+                } else if is_valid_request_id(value) {
                     parent_id = Some(value.clone());
+                } else {
+                    return None;
                 }
             } else if n.eq_ignore_ascii_case(DEPTH_HEADER) {
-                depth = value.parse().unwrap_or(0);
+                let _depth = match value.parse::<usize>() {
+                    Ok(parsed) => parsed,
+                    Err(_) => return None,
+                };
             } else if n.eq_ignore_ascii_case(ORIGIN_HEADER) {
                 origin_service = value.clone();
             } else if n.eq_ignore_ascii_case(OPERATION_HEADER) {
@@ -460,6 +466,11 @@ impl ProvenanceRecord {
             created_at: 0, // not propagated via headers
         })
     }
+}
+
+fn is_valid_request_id(id: &str) -> bool {
+    id.len() == 32
+        && id.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
 // ---------------------------------------------------------------------------
@@ -586,6 +597,37 @@ mod tests {
     }
 
     #[test]
+    fn from_headers_rejects_malformed_depth() {
+        let headers = alloc::vec![
+            (PROVENANCE_ID_HEADER.to_string(), "0123456789abcdef0123456789abcdef".to_string()),
+            (DEPTH_HEADER.to_string(), "abc".to_string()),
+            (ORIGIN_HEADER.to_string(), "svc".to_string()),
+        ];
+        assert!(ProvenanceRecord::from_headers(&headers).is_none());
+    }
+
+    #[test]
+    fn from_headers_rejects_depth_overflow() {
+        let headers = alloc::vec![
+            (PROVENANCE_ID_HEADER.to_string(), "0123456789abcdef0123456789abcdef".to_string()),
+            (DEPTH_HEADER.to_string(), "18446744073709551616".to_string()),
+            (ORIGIN_HEADER.to_string(), "svc".to_string()),
+        ];
+        assert!(ProvenanceRecord::from_headers(&headers).is_none());
+    }
+
+    #[test]
+    fn from_headers_rejects_malformed_parent_id() {
+        let headers = alloc::vec![
+            (PROVENANCE_ID_HEADER.to_string(), "0123456789abcdef0123456789abcdef".to_string()),
+            (PARENT_ID_HEADER.to_string(), "not-a-request-id".to_string()),
+            (DEPTH_HEADER.to_string(), "1".to_string()),
+            (ORIGIN_HEADER.to_string(), "svc".to_string()),
+        ];
+        assert!(ProvenanceRecord::from_headers(&headers).is_none());
+    }
+
+    #[test]
     fn log_fields_contains_expected_fields() {
         let r = ProvenanceRecord::root("gateway", "deposit", 1000).unwrap();
         let fields = r.log_fields();
@@ -653,3 +695,132 @@ mod tests {
         );
     }
 }
+//! Request provenance and lineage tracking (#682).
+//!
+//! Debugging a multi-step anchor workflow is difficult when requests carry no
+//! record of where they came from or what triggered them. This module
+//! introduces a [`ProvenanceRecord`] that every request can carry, capturing
+//! its origin, immediate parent, and the chain of ancestors that led to it.
+//!
+//! # Design
+//!
+//! * **Lineage chain.** A [`ProvenanceRecord`] holds a `parent_id` (the
+//!   request that directly spawned this one) and an `ancestors` list (the
+//!   full chain back to the root). This lets operators reconstruct the entire
+//!   call tree from any node.
+//! * **Origin metadata.** Records carry the originating service name, an
+//!   optional operation label, and a creation timestamp so the time between
+//!   hops is visible.
+//! * **Immutable once built.** Records are created at request entry and
+//!   threaded through the call chain read-only. Child records are derived via
+//!   [`ProvenanceRecord::child`], which copies the lineage chain and appends
+//!   the current record's ID.
+//! * **No `std` dependency.** Works in `no_std + alloc`.
+//!
+//! # Example
+//!
+//! ```rust
+//! use anchorkit::request_provenance::ProvenanceRecord;
+//!
+//! // Root request created by the gateway.
+//! let root = ProvenanceRecord::root("gateway", "deposit-initiate", 1000).unwrap();
+//! assert!(root.parent_id().is_none());
+//! assert_eq!(root.depth(), 0);
+//!
+//! // Downstream service derives a child.
+//! let child = root.child("anchor-service", "sep6-deposit", 1001).unwrap();
+//! assert_eq!(child.parent_id(), Some(root.request_id()));
+//! assert_eq!(child.depth(), 1);
+//!
+//! // Grandchild keeps the full lineage.
+//! let grandchild = child.child("webhook-dispatcher", "notify", 1002).unwrap();
+//! assert_eq!(grandchild.depth(), 2);
+//! assert_eq!(grandchild.ancestors()[0], root.request_id());
+//! assert_eq!(grandchild.ancestors()[1], child.request_id());
+//! ``
+//! Request provenance and lineage tracking (#682).
+//!
+//! Debugging a multi-step anchor workflow is difficult when requests carry no
+//! record of where they came from or what triggered them. This module
+//! introduces a [`ProvenanceRecord`] that every request can carry, capturing
+//! its origin, immediate parent, and the chain of ancestors that led to it.
+//!
+//! # Design
+//!
+//! * **Lineage chain.** A [`ProvenanceRecord`] holds a `parent_id` (the
+//!   request that directly spawned this one) and an `ancestors` list (the
+//!   full chain back to the root). This lets operators reconstruct the entire
+//!   call tree from any node.
+//! * **Origin metadata.** Records carry the originating service name, an
+//!   optional operation label, and a creation timestamp so the time between
+//!   hops is visible.
+//! * **Immutable once built.** Records are created at request entry and
+//!   threaded through the call chain read-only. Child records are derived via
+//!   [`ProvenanceRecord::child`], which copies the lineage chain and appends
+//!   the current record's ID.
+//! * **No `std` dependency.** Works in `no_std + alloc`.
+//!
+//! # Example
+//!
+//! ```rust
+//! use anchorkit::request_provenance::ProvenanceRecord;
+//!
+//! // Root request created by the gateway.
+//! let root = ProvenanceRecord::root("gateway", "deposit-initiate", 1000).unwrap();
+//! assert!(root.parent_id().is_none());
+//! assert_eq!(root.depth(), 0);
+//!
+//! // Downstream service derives a child.
+//! let child = root.child("anchor-service", "sep6-deposit", 1001).unwrap();
+//! assert_eq!(child.parent_id(), Some(root.request_id()));
+//! assert_eq!(child.depth(), 1);
+//!
+//! // Grandchild keeps the full lineage.
+//! let grandchild = child.child("webhook-dispatcher", "notify", 1002).unwrap();
+//! assert_eq!(grandchild.depth(), 2);
+//! assert_eq!(grandchild.ancestors()[0], root.request_id());
+//! assert_eq!(grandchild.ancestors()[1], child.request_id());
+//! ``
+//! Request provenance and lineage tracking (#682).
+//!
+//! Debugging a multi-step anchor workflow is difficult when requests carry no
+//! record of where they came from or what triggered them. This module
+//! introduces a [`ProvenanceRecord`] that every request can carry, capturing
+//! its origin, immediate parent, and the chain of ancestors that led to it.
+//!
+//! # Design
+//!
+//! * **Lineage chain.** A [`ProvenanceRecord`] holds a `parent_id` (the
+//!   request that directly spawned this one) and an `ancestors` list (the
+//!   full chain back to the root). This lets operators reconstruct the entire
+//!   call tree from any node.
+//! * **Origin metadata.** Records carry the originating service name, an
+//!   optional operation label, and a creation timestamp so the time between
+//!   hops is visible.
+//! * **Immutable once built.** Records are created at request entry and
+//!   threaded through the call chain read-only. Child records are derived via
+//!   [`ProvenanceRecord::child`], which copies the lineage chain and appends
+//!   the current record's ID.
+//! * **No `std` dependency.** Works in `no_std + alloc`.
+//!
+//! # Example
+//!
+//! ```rust
+//! use anchorkit::request_provenance::ProvenanceRecord;
+//!
+//! // Root request created by the gateway.
+//! let root = ProvenanceRecord::root("gateway", "deposit-initiate", 1000).unwrap();
+//! assert!(root.parent_id().is_none());
+//! assert_eq!(root.depth(), 0);
+//!
+//! // Downstream service derives a child.
+//! let child = root.child("anchor-service", "sep6-deposit", 1001).unwrap();
+//! assert_eq!(child.parent_id(), Some(root.request_id()));
+//! assert_eq!(child.depth(), 1);
+//!
+//! // Grandchild keeps the full lineage.
+//! let grandchild = child.child("webhook-dispatcher", "notify", 1002).unwrap();
+//! assert_eq!(grandchild.depth(), 2);
+//! assert_eq!(grandchild.ancestors()[0], root.request_id());
+//! assert_eq!(grandchild.ancestors()[1], child.request_id());
+//! ``

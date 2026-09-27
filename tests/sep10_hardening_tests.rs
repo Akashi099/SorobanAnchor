@@ -14,7 +14,7 @@ mod sep10_hardening_tests {
     use crate::sep10_test_util::{
         build_sep10_jwt, build_sep10_jwt_with_iat, build_sep10_jwt_with_iss,
         build_sep10_jwt_with_future_iat, build_sep10_jwt_whitespace_iss,
-        build_sep10_jwt_empty_sub,
+        build_sep10_jwt_empty_sub, build_sep10_jwt_with_jti_and_iss,
     };
 
     fn make_env() -> Env {
@@ -476,6 +476,63 @@ mod sep10_hardening_tests {
         let token = String::from_str(&env, &jwt);
         client.verify_sep10_token(&token, &issuer); // first — OK
         client.verify_sep10_token(&token, &issuer); // second — must panic
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #2: JTI replay state must not be written for invalid tokens.
+    // A token that fails iss validation must not consume the JTI so that a
+    // later valid token sharing the same JTI can still be accepted once.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn invalid_issuer_token_does_not_poison_jti_for_valid_token() {
+        let env = make_env();
+        let contract_id = make_contract_id(&env);
+        ledger(&env, 1_000);
+        let sk = SigningKey::generate(&mut OsRng);
+        let pk = Bytes::from_slice(&env, sk.verifying_key().as_bytes());
+        let sub = Address::generate(&env).to_string();
+        let sub_str: std::string::String = sub.to_string();
+
+        let shared_jti = "hardening-shared-jti-001";
+        let exp = 5_000u64;
+
+        // First: a token with a BAD issuer (empty — triggers iss check failure)
+        // and the shared JTI.  This must be rejected AND must not write the JTI.
+        let bad_token_jwt = build_sep10_jwt_with_jti_and_iss(
+            &sk, &sub_str, exp, shared_jti, "   ", // whitespace-only iss → invalid
+        );
+        let bad_token = String::from_str(&env, &bad_token_jwt);
+
+        env.as_contract(&contract_id, || {
+            assert!(
+                verify_sep10_jwt(&env, &bad_token, &pk, None).is_err(),
+                "token with invalid iss must be rejected"
+            );
+        });
+
+        // Second: a valid token with the same JTI and a proper issuer.
+        // Because the first token was invalid and did NOT write to the JTI store,
+        // this valid first use must be accepted.
+        let good_token_jwt = build_sep10_jwt_with_jti_and_iss(
+            &sk, &sub_str, exp, shared_jti, "https://anchor.example.com",
+        );
+        let good_token = String::from_str(&env, &good_token_jwt);
+
+        env.as_contract(&contract_id, || {
+            assert!(
+                verify_sep10_jwt(&env, &good_token, &pk, None).is_ok(),
+                "valid first use of JTI must be accepted after invalid token was rejected"
+            );
+        });
+
+        // Third: replay the same valid token — must now be rejected.
+        env.as_contract(&contract_id, || {
+            assert!(
+                verify_sep10_jwt(&env, &good_token, &pk, None).is_err(),
+                "replayed valid token must be rejected"
+            );
+        });
     }
 
     // -----------------------------------------------------------------------
