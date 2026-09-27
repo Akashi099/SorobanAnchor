@@ -331,4 +331,20 @@ AdminAuditLog::log_change(
 2. Check that the anchor address is correct
 3. Verify storage is not full
 
-### Rollback N
+### Rollback Not Working
+
+**Problem**: Rollback does not restore the previous state.
+
+**Solutions**:
+1. Verify the snapshot ID is valid
+2. Check that the snapshot was created before the changes
+3. Ensure the snapshot contains the expected services
+
+### Blank Descriptions Rejected
+
+**Problem**: `schedule_window` rejects a maintenance description.
+
+**Solutions**:
+1. Descriptions must not be empty after trimming whitespace
+2. Provide a nonblank description (e.g. `"scheduled maintenance"`)
+3. Nonblank descriptions are preserved exactly as provided

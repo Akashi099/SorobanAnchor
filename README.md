@@ -469,8 +469,11 @@ MIT
 
 ## Handsoff notes
 
-<!-- handsoff-issue-1098 -->
-- #1098: 52. Enforce service dependencies on enable
+<!-- handsoff-issue-1105 -->
+- #1105: 59. Bound maintenance-window scans
 
-<!-- handsoff-issue-1103 -->
-- #1103: 57. Reject inverted maintenance windows
+<!-- handsoff-issue-1106 -->
+- #1106: 60. Reject zero streaming intervals
+
+<!-- handsoff-issue-1107 -->
+- #1107: 61. Prevent streaming cycle wrap
