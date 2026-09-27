@@ -327,40 +327,18 @@ AdminAuditLog::log_change(
 
 ### Rollback Not Working
 
-**Problem**: Rollback to snapshot fails.
+**Problem**: Rollback does not restore the previous state.
 
 **Solutions**:
-1. Verify snapshot exists: `ServiceManager::get_snapshot(&env, snapshot_id)`
-2. Check snapshot ID is correct
-3. Ensure snapshot was created for the correct anchor
+1. Verify the snapshot ID is valid
+2. Check that the snapshot was created before the changes
+3. Ensure the snapshot contains the expected services
 
-### Snapshot Not Found
+### Blank Descriptions Rejected
 
-**Problem**: `get_snapshot()` returns `None`.
+**Problem**: `schedule_window` rejects a maintenance description.
 
 **Solutions**:
-1. Verify snapshot ID is correct
-2. Check snapshot count: `ServiceManager::get_snapshot_count(&env)`
-3. Ensure snapshot was created before querying
-
-## Testing
-
-The service management system includes comprehensive tests:
-
-```bash
-# Run all service management tests
-cargo test service_management_tests
-
-# Run specific test
-cargo test service_management_tests::service_can_be_enabled
-
-# Run with output
-cargo test service_management_tests -- --nocapture
-```
-
-## References
-
-- [Service Management API](../src/service_management.rs)
-- [Service Management Tests](../tests/service_management_tests.rs)
-- [Admin Audit Log](./admin-audit-log.md)
-- [Governance and Security](./governance-and-security.md)
+1. Descriptions must not be empty after trimming whitespace
+2. Provide a nonblank description (e.g. `"scheduled maintenance"`)
+3. Nonblank descriptions are preserved exactly as provided
