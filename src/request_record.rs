@@ -28,7 +28,47 @@
 //! final export before deletion.
 
 extern crate alloc;
-
+//! Request deduplication for repeated operations (#681).
+//!
+//! Repeated submissions of the same logical request (e.g. a deposit initiation
+//! retried by a client after a network hiccup) can produce duplicate work and
+//! redundant side-effects. This module provides a lightweight deduplication
+//! layer that collapses identical requests into a single execution path by
+//! tracking a deduplicated key → cached result mapping.
+//!
+//! # Design
+//!
+//! * **Key-based deduplication.** A [`DeduplicationKey`] uniquely identifies a
+//!   logical operation. Keys are intentionally caller-constructed so the
+//!   deduplication policy is decoupled from transport concerns.
+//! * **Result caching.** The first execution of a key stores either the
+//!   success value or the error kind. Subsequent calls with the same key
+//!   receive the cached outcome without re-running the operation.
+//! * **TTL / expiry.** Each entry carries an expiry timestamp so stale
+//!   results are not served indefinitely. [`DeduplicationStore::purge_expired`]
+//!   cleans up entries older than their TTL.
+//! * **No `std` dependency.** Uses `alloc::collections::BTreeMap` so the
+//!   module can be compiled for `no_std` targets if needed.
+//!
+//! # Example
+//!
+//! ```rust
+//! use anchorkit::request_deduplication::{DeduplicationStore, DeduplicationKey, DeduplicationResult};
+//!
+//! let mut store = DeduplicationStore::new(300); // 5-minute TTL
+//! let key = DeduplicationKey::new("deposit", "txn-001");
+//!
+//! // First call — not deduplicated, run the operation.
+//! assert!(!store.is_duplicate(&key, 1_000));
+//! store.record_success(&key, "pending_external", 1_000);
+//!
+//! // Second call — deduplicated, returns cached outcome.
+//! assert!(store.is_duplicate(&key, 1_001));
+//! assert_eq!(
+//!     store.cached_result(&key, 1_001),
+//!     Some(DeduplicationResult::Success("pending_external".into())),
+//! );
+//! 
 use alloc::{string::String, vec::Vec};
 
 // ---------------------------------------------------------------------------

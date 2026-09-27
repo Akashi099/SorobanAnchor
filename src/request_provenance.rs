@@ -1,4 +1,44 @@
-//! Request provenance and lineage tracking (#682).
+//! Request deduplication for repeated operations (#681).
+//!
+//! Repeated submissions of the same logical request (e.g. a deposit initiation
+//! retried by a client after a network hiccup) can produce duplicate work and
+//! redundant side-effects. This module provides a lightweight deduplication
+//! layer that collapses identical requests into a single execution path by
+//! tracking a deduplicated key → cached result mapping.
+//!
+//! # Design
+//!
+//! * **Key-based deduplication.** A [`DeduplicationKey`] uniquely identifies a
+//!   logical operation. Keys are intentionally caller-constructed so the
+//!   deduplication policy is decoupled from transport concerns.
+//! * **Result caching.** The first execution of a key stores either the
+//!   success value or the error kind. Subsequent calls with the same key
+//!   receive the cached outcome without re-running the operation.
+//! * **TTL / expiry.** Each entry carries an expiry timestamp so stale
+//!   results are not served indefinitely. [`DeduplicationStore::purge_expired`]
+//!   cleans up entries older than their TTL.
+//! * **No `std` dependency.** Uses `alloc::collections::BTreeMap` so the
+//!   module can be compiled for `no_std` targets if needed.
+//!
+//! # Example
+//!
+//! ```rust
+//! use anchorkit::request_deduplication::{DeduplicationStore, DeduplicationKey, DeduplicationResult};
+//!
+//! let mut store = DeduplicationStore::new(300); // 5-minute TTL
+//! let key = DeduplicationKey::new("deposit", "txn-001");
+//!
+//! // First call — not deduplicated, run the operation.
+//! assert!(!store.is_duplicate(&key, 1_000));
+//! store.record_success(&key, "pending_external", 1_000);
+//!
+//! // Second call — deduplicated, returns cached outcome.
+//! assert!(store.is_duplicate(&key, 1_001));
+//! assert_eq!(
+//!     store.cached_result(&key, 1_001),
+//!     Some(DeduplicationResult::Success("pending_external".into())),
+//! );
+//! //! Request provenance and lineage tracking (#682).
 //!
 //! Debugging a multi-step anchor workflow is difficult when requests carry no
 //! record of where they came from or what triggered them. This module
@@ -64,6 +104,14 @@ pub enum ProvenanceError {
         len: usize,
         max: usize,
     },
+    /// A caller-supplied request ID was rejected because it exceeded
+    /// [`MAX_ID_LEN`] bytes or contained ASCII control characters (0x00–0x1F,
+    /// 0x7F). Such IDs cannot be safely embedded in HTTP headers or log lines.
+    InvalidId,
+    /// The operation label was empty or contained only whitespace. Every
+    /// provenance record must carry a non-blank operation name so that records
+    /// can be meaningfully classified in audit logs.
+    EmptyOperation,
 }
 
 impl core::fmt::Display for ProvenanceError {
@@ -74,6 +122,16 @@ impl core::fmt::Display for ProvenanceError {
             }
             ProvenanceError::MetadataTooLong { len, max } => {
                 write!(f, "provenance metadata length {len} exceeds limit of {max} bytes")
+            }
+            ProvenanceError::InvalidId => {
+                write!(
+                    f,
+                    "caller-supplied request ID exceeds {} bytes or contains control characters",
+                    MAX_ID_LEN
+                )
+            }
+            ProvenanceError::EmptyOperation => {
+                write!(f, "provenance operation label must not be empty or whitespace-only")
             }
         }
     }
@@ -88,6 +146,12 @@ pub const MAX_METADATA_LEN: usize = 1024;
 
 /// Backward-compatible alias for [`MAX_METADATA_LEN`].
 pub const MAX_METADATA_LENGTH: usize = MAX_METADATA_LEN;
+
+/// Maximum allowed length in bytes for a caller-supplied request ID.
+///
+/// IDs longer than this cannot be safely embedded in HTTP headers or
+/// structured log lines without risk of truncation or injection.
+pub const MAX_ID_LEN: usize = 128;
 
 /// Provenance and lineage record for a single request.
 ///
@@ -120,6 +184,10 @@ impl ProvenanceRecord {
     ///
     /// Returns [`ProvenanceError::EmptyActor`] when `origin_service` is empty
     /// or contains only whitespace. Every record must be attributable.
+    ///
+    /// Returns [`ProvenanceError::EmptyOperation`] when `operation` is empty
+    /// or contains only whitespace. Every record must carry a classifiable
+    /// operation label.
     pub fn root(
         origin_service: impl Into<String>,
         operation: impl Into<String>,
@@ -130,6 +198,9 @@ impl ProvenanceRecord {
             return Err(ProvenanceError::EmptyActor);
         }
         let op = operation.into();
+        if op.trim().is_empty() {
+            return Err(ProvenanceError::EmptyOperation);
+        }
         let id = derive_request_id(&format!("root:{}:{}:{}", svc, op, created_at));
         Ok(ProvenanceRecord {
             request_id: id,
@@ -146,7 +217,14 @@ impl ProvenanceRecord {
     ///
     /// # Errors
     ///
+    /// Returns [`ProvenanceError::InvalidId`] when `request_id` exceeds
+    /// [`MAX_ID_LEN`] bytes or contains ASCII control characters (0x00–0x1F,
+    /// 0x7F). Such IDs cannot be safely propagated in HTTP headers or logs.
+    ///
     /// Returns [`ProvenanceError::EmptyActor`] when `origin_service` is empty
+    /// or contains only whitespace.
+    ///
+    /// Returns [`ProvenanceError::EmptyOperation`] when `operation` is empty
     /// or contains only whitespace.
     pub fn root_with_id(
         request_id: impl Into<String>,
@@ -154,16 +232,22 @@ impl ProvenanceRecord {
         operation: impl Into<String>,
         created_at: u64,
     ) -> Result<Self, ProvenanceError> {
+        let id = request_id.into();
+        validate_caller_id(&id)?;
         let svc = origin_service.into();
         if svc.trim().is_empty() {
             return Err(ProvenanceError::EmptyActor);
         }
+        let op = operation.into();
+        if op.trim().is_empty() {
+            return Err(ProvenanceError::EmptyOperation);
+        }
         Ok(ProvenanceRecord {
-            request_id: request_id.into(),
+            request_id: id,
             parent_id: None,
             ancestors: Vec::new(),
             origin_service: svc,
-            operation: Some(operation.into()),
+            operation: Some(op),
             metadata: None,
             created_at,
         })
@@ -224,6 +308,9 @@ impl ProvenanceRecord {
     ///
     /// # Errors
     ///
+    /// Returns [`ProvenanceError::InvalidId`] when `child_id` exceeds
+    /// [`MAX_ID_LEN`] bytes or contains ASCII control characters.
+    ///
     /// Returns [`ProvenanceError::EmptyActor`] when `child_service` is empty
     /// or contains only whitespace.
     pub fn child_with_id(
@@ -233,6 +320,8 @@ impl ProvenanceRecord {
         operation: impl Into<String>,
         created_at: u64,
     ) -> Result<Self, ProvenanceError> {
+        let id = child_id.into();
+        validate_caller_id(&id)?;
         let svc = child_service.into();
         if svc.trim().is_empty() {
             return Err(ProvenanceError::EmptyActor);
@@ -241,7 +330,7 @@ impl ProvenanceRecord {
         ancestors.push(self.request_id.clone());
 
         Ok(ProvenanceRecord {
-            request_id: child_id.into(),
+            request_id: id,
             parent_id: Some(self.request_id.clone()),
             ancestors,
             origin_service: svc,
@@ -494,6 +583,22 @@ pub const METADATA_HEADER: &str = "X-Request-Metadata";
 // Private helpers
 // ---------------------------------------------------------------------------
 
+/// Validate a caller-supplied request ID.
+///
+/// An ID is rejected when it:
+/// * exceeds [`MAX_ID_LEN`] bytes (would truncate or overflow headers), or
+/// * contains an ASCII control character in the range 0x00–0x1F or 0x7F
+///   (would corrupt header fields and structured log lines).
+fn validate_caller_id(id: &str) -> Result<(), ProvenanceError> {
+    if id.len() > MAX_ID_LEN {
+        return Err(ProvenanceError::InvalidId);
+    }
+    if id.bytes().any(|b| b < 0x20 || b == 0x7F) {
+        return Err(ProvenanceError::InvalidId);
+    }
+    Ok(())
+}
+
 fn derive_request_id(seed: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -693,6 +798,176 @@ mod tests {
             root.child("  ", "sub-op", 1),
             Err(ProvenanceError::EmptyActor),
         );
+    }
+
+    // ── root_with_id ID validation ────────────────────────────────────────
+
+    /// A well-formed caller ID is stored unchanged.
+    #[test]
+    fn root_with_id_accepts_valid_id() {
+        let r = ProvenanceRecord::root_with_id("req-abc-123", "svc", "op", 0).unwrap();
+        assert_eq!(r.request_id(), "req-abc-123");
+    }
+
+    /// An ID whose byte length equals MAX_ID_LEN is still valid.
+    #[test]
+    fn root_with_id_accepts_id_at_max_len() {
+        let id = "a".repeat(MAX_ID_LEN);
+        let r = ProvenanceRecord::root_with_id(id.as_str(), "svc", "op", 0).unwrap();
+        assert_eq!(r.request_id(), id.as_str());
+    }
+
+    /// An ID one byte over MAX_ID_LEN must be rejected.
+    #[test]
+    fn root_with_id_rejects_oversized_id() {
+        let id = "x".repeat(MAX_ID_LEN + 1);
+        assert_eq!(
+            ProvenanceRecord::root_with_id(id.as_str(), "svc", "op", 0),
+            Err(ProvenanceError::InvalidId),
+            "IDs longer than MAX_ID_LEN must be rejected"
+        );
+    }
+
+    /// A significantly oversized ID (e.g. 4 KiB) must also be rejected.
+    #[test]
+    fn root_with_id_rejects_very_long_id() {
+        let id = "z".repeat(4096);
+        assert_eq!(
+            ProvenanceRecord::root_with_id(id.as_str(), "svc", "op", 0),
+            Err(ProvenanceError::InvalidId),
+        );
+    }
+
+    /// An ID containing a NUL byte (0x00) must be rejected.
+    #[test]
+    fn root_with_id_rejects_nul_byte() {
+        let id = "req\x00id";
+        assert_eq!(
+            ProvenanceRecord::root_with_id(id, "svc", "op", 0),
+            Err(ProvenanceError::InvalidId),
+            "NUL byte in ID must be rejected"
+        );
+    }
+
+    /// An ID containing a newline (0x0A) must be rejected.
+    #[test]
+    fn root_with_id_rejects_newline() {
+        let id = "req\nid";
+        assert_eq!(
+            ProvenanceRecord::root_with_id(id, "svc", "op", 0),
+            Err(ProvenanceError::InvalidId),
+            "newline in ID must be rejected"
+        );
+    }
+
+    /// An ID containing a carriage-return (0x0D) must be rejected.
+    #[test]
+    fn root_with_id_rejects_carriage_return() {
+        let id = "req\rid";
+        assert_eq!(
+            ProvenanceRecord::root_with_id(id, "svc", "op", 0),
+            Err(ProvenanceError::InvalidId),
+        );
+    }
+
+    /// An ID containing DEL (0x7F) must be rejected.
+    #[test]
+    fn root_with_id_rejects_del_control_char() {
+        let id = "req\x7fid";
+        assert_eq!(
+            ProvenanceRecord::root_with_id(id, "svc", "op", 0),
+            Err(ProvenanceError::InvalidId),
+            "DEL (0x7F) in ID must be rejected"
+        );
+    }
+
+    /// An ID containing a tab (0x09) must be rejected.
+    #[test]
+    fn root_with_id_rejects_tab() {
+        let id = "req\tid";
+        assert_eq!(
+            ProvenanceRecord::root_with_id(id, "svc", "op", 0),
+            Err(ProvenanceError::InvalidId),
+            "horizontal tab in ID must be rejected"
+        );
+    }
+
+    /// child_with_id applies the same ID validation.
+    #[test]
+    fn child_with_id_rejects_oversized_id() {
+        let root = ProvenanceRecord::root("gateway", "op", 0).unwrap();
+        let id = "y".repeat(MAX_ID_LEN + 1);
+        assert_eq!(
+            root.child_with_id(id.as_str(), "svc", "op", 1),
+            Err(ProvenanceError::InvalidId),
+        );
+    }
+
+    /// child_with_id rejects control characters too.
+    #[test]
+    fn child_with_id_rejects_control_char() {
+        let root = ProvenanceRecord::root("gateway", "op", 0).unwrap();
+        assert_eq!(
+            root.child_with_id("child\x01id", "svc", "op", 1),
+            Err(ProvenanceError::InvalidId),
+        );
+    }
+
+    // ── Empty-operation rejection ─────────────────────────────────────────
+
+    /// An empty operation label must be rejected before IDs are allocated.
+    #[test]
+    fn root_rejects_empty_operation() {
+        assert_eq!(
+            ProvenanceRecord::root("svc", "", 0),
+            Err(ProvenanceError::EmptyOperation),
+            "empty operation must be rejected before record creation"
+        );
+    }
+
+    /// A whitespace-only operation label is equally meaningless and must be
+    /// rejected.
+    #[test]
+    fn root_rejects_whitespace_only_operation() {
+        assert_eq!(
+            ProvenanceRecord::root("svc", "   ", 0),
+            Err(ProvenanceError::EmptyOperation),
+            "whitespace-only operation must be rejected"
+        );
+        assert_eq!(
+            ProvenanceRecord::root("svc", "\t\n", 0),
+            Err(ProvenanceError::EmptyOperation),
+        );
+    }
+
+    /// root_with_id applies the same empty-operation guard.
+    #[test]
+    fn root_with_id_rejects_empty_operation() {
+        assert_eq!(
+            ProvenanceRecord::root_with_id("some-id", "svc", "", 0),
+            Err(ProvenanceError::EmptyOperation),
+        );
+        assert_eq!(
+            ProvenanceRecord::root_with_id("some-id", "svc", "  ", 0),
+            Err(ProvenanceError::EmptyOperation),
+        );
+    }
+
+    /// A non-blank operation is stored as-is (trimming must not alter the value).
+    #[test]
+    fn root_preserves_valid_operation() {
+        let r = ProvenanceRecord::root("svc", "deposit-initiate", 0).unwrap();
+        assert_eq!(r.operation(), Some("deposit-initiate"),
+            "valid operation must be stored without modification");
+    }
+
+    /// Rejection happens before any ID or timestamp is allocated, so two calls
+    /// with blank operations do not accidentally share state.
+    #[test]
+    fn root_empty_operation_rejected_before_id_allocated() {
+        // Both calls must fail; neither should panic or return Ok.
+        assert!(ProvenanceRecord::root("svc", "", 42).is_err());
+        assert!(ProvenanceRecord::root("svc", "\n", 42).is_err());
     }
 }
 //! Request provenance and lineage tracking (#682).
