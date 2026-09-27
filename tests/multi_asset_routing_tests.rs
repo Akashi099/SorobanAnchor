@@ -585,3 +585,114 @@ fn test_route_quote_id_and_rate_propagated() {
     assert_eq!(result.filled[0].rate, 2_500_000);
     assert_eq!(result.filled[0].fee_percentage, 10);
 }
+
+// ── Zero-rate candidate rejection ─────────────────────────────────────────────
+
+/// A CandidateQuote with rate == 0 cannot produce a valid conversion.
+/// It must be filtered out before scoring and must never become the selected
+/// route, even when it is the only candidate for a corridor.
+#[test]
+fn test_zero_rate_candidate_never_selected() {
+    let quotes = vec![
+        // Zero-rate candidate — must be rejected before scoring.
+        make_quote(1, "anchor-zero", "XLM", "USDC", 5, 0, 90, 10, 1, 0, NOW + 3600),
+        // Valid positive-rate candidate — must win.
+        make_quote(2, "anchor-valid", "XLM", "USDC", 20, 1_000_000, 80, 60, 1, 0, NOW + 3600),
+    ];
+    let requests = vec![req("XLM", "USDC", 100, "LowestFee")];
+    let result = route_multi_asset(&requests, &quotes, NOW).unwrap();
+
+    assert_eq!(result.filled.len(), 1, "positive-rate candidate must fill the corridor");
+    assert_eq!(result.filled[0].anchor, "anchor-valid",
+        "zero-rate anchor must not be selected");
+    assert_eq!(result.filled[0].rate, 1_000_000);
+}
+
+/// When the only available candidate has rate == 0 the corridor is unfilled,
+/// not erroneously filled with an unusable quote.
+#[test]
+fn test_zero_rate_only_candidate_produces_unfilled() {
+    let quotes = vec![
+        make_quote(1, "anchor-zero", "XLM", "USDC", 5, 0, 90, 10, 1, 0, NOW + 3600),
+    ];
+    let requests = vec![req("XLM", "USDC", 100, "LowestFee")];
+    let result = route_multi_asset(&requests, &quotes, NOW).unwrap();
+
+    assert_eq!(result.filled.len(), 0, "zero-rate-only corridor must be unfilled");
+    assert_eq!(result.unfilled, vec!["XLM/USDC".to_string()]);
+}
+
+// ── WeightedScore: score ordering is independent of pool composition ──────────
+
+/// Adding a poor (high-fee, slow, low-reputation) candidate to an existing
+/// pool must not change the relative ordering of the pre-existing candidates.
+/// This verifies that normalization uses fixed domain bounds, not candidate
+/// maxima.
+#[test]
+fn test_weighted_score_ordering_stable_with_poor_candidate_added() {
+    // Base pool: three candidates with distinct profiles.
+    let base_pool = vec![
+        make_quote(1, "anchor-a", "XLM", "USDC", 10, 1_000_000, 90, 20, 1, 0, NOW + 3600),
+        make_quote(2, "anchor-b", "XLM", "USDC", 30, 1_000_000, 70, 40, 1, 0, NOW + 3600),
+        make_quote(3, "anchor-c", "XLM", "USDC", 50, 1_000_000, 80, 60, 1, 0, NOW + 3600),
+    ];
+
+    // Extended pool: base pool + a clearly inferior candidate.
+    let mut extended_pool = base_pool.clone();
+    extended_pool.push(
+        make_quote(99, "anchor-poor", "XLM", "USDC", 99, 1_000_000, 1, 9_999, 1, 0, NOW + 3600),
+    );
+
+    let requests = vec![req("XLM", "USDC", 100, "WeightedScore")];
+
+    let result_base = route_multi_asset(&requests, &base_pool, NOW).unwrap();
+    let result_extended = route_multi_asset(&requests, &extended_pool, NOW).unwrap();
+
+    assert_eq!(result_base.filled.len(), 1);
+    assert_eq!(result_extended.filled.len(), 1);
+
+    // The winner from the base pool must be identical after adding a poor candidate.
+    assert_eq!(
+        result_base.filled[0].anchor,
+        result_extended.filled[0].anchor,
+        "adding a poor candidate must not change the WeightedScore winner"
+    );
+
+    // The poor candidate itself must never win.
+    assert_ne!(
+        result_extended.filled[0].anchor, "anchor-poor",
+        "the poor candidate must not be selected"
+    );
+}
+multi_asset_routing.rs — Multi-asset quote routing helpers (#656).
+//
+// This module extends the base routing layer so callers can evaluate and
+// select quotes across multiple asset pairs in a single pass.  It is compiled
+// as part of the host (non-WASM) build and is re-exported from `lib.rs`.
+//
+// # Design
+//
+// The core abstraction is `MultiAssetRoutingRequest`, which bundles one or
+// more `AssetPairRequest` entries.  Each entry carries an independent routing
+// strategy so callers can mix LowestFee for one corridor with
+// HighestReputation for another in the same call.
+//
+// `MultiAssetRoutingResult` groups the winning quotes per pair and a list of
+// any pairs that produced no candidates (`unfilled`).
+//
+// # Asset normalisation
+//
+// Asset codes are normalised to uppercase before comparison so that `usdc`,
+// `USDC`, and `Usdc` all resolve to the same corridor.  Only ASCII letters are
+// case-folded, so no non-ASCII spelling can alias a valid code.
+//
+// # Invalid combinations
+//
+// `validate_asset_pair_request` rejects a request when:
+//   - either asset code is empty, exceeds 12 characters, or contains anything
+//     other than ASCII letters and digits (`InvalidAssetCode`)
+//   - `base_asset == quote_asset` (circular corridor, `InvalidAssetPair`)
+//   - `amount == 0` (`InvalidAmount`)
+//   - `strategy` is not one of `ROUTING_STRATEGIES` (`ValidationError`)
+
+extern crate alloc;

@@ -28,6 +28,63 @@
 //   - `base_asset == quote_asset` (circular corridor, `InvalidAssetPair`)
 //   - `amount == 0` (`InvalidAmount`)
 //   - `strategy` is not one of `ROUTING_STRATEGIES` (`ValidationError`)
+// tests/multi_asset_routing_tests.rs
+//
+// Integration tests for multi-asset quote routing (#656).
+//
+// Tests cover:
+//   - Single and multi-pair routing (happy path)
+//   - Each routing strategy (LowestFee, FastestSettlement, HighestReputation, WeightedScore)
+//   - Asset code normalisation (mixed case, whitespace)
+//   - Expired-quote filtering
+//   - Amount boundary enforcement (min/max)
+//   - Reputation filter
+//   - Unfilled pairs
+//   - Invalid asset combinations (same base/quote, empty code, too long, zero amount)
+//   - Mixed valid/invalid pairs — invalid entry propagates error immediately
+
+// tests/multi_asset_routing_tests.rs
+//
+// Integration tests for multi-asset quote routing (#656).
+//
+// Tests cover:
+//   - Single and multi-pair routing (happy path)
+//   - Each routing strategy (LowestFee, FastestSettlement, HighestReputation, WeightedScore)
+//   - Asset code normalisation (mixed case, whitespace)
+//   - Expired-quote filtering
+//   - Amount boundary enforcement (min/max)
+//   - Reputation filter
+//   - Unfilled pairs
+//   - Invalid asset combinations (same base/quote, empty code, too long, zero amount)
+//   - Mixed valid/invalid pairs — invalid entry propagates error immediately
+// tests/multi_asset_routing_tests.rs
+//
+// Integration tests for multi-asset quote routing (#656).
+//
+// Tests cover:
+//   - Single and multi-pair routing (happy path)
+//   - Each routing strategy (LowestFee, FastestSettlement, HighestReputation, WeightedScore)
+//   - Asset code normalisation (mixed case, whitespace)
+//   - Expired-quote filtering
+//   - Amount boundary enforcement (min/max)
+//   - Reputation filter
+//   - Unfilled pairs
+//   - Invalid asset combinations (same base/quote, empty code, too long, zero amount)
+//   - Mixed valid/invalid pairs — invalid entry propagates error immediately
+// tests/multi_asset_routing_tests.rs
+//
+// Integration tests for multi-asset quote routing (#656).
+//
+// Tests cover:
+//   - Single and multi-pair routing (happy path)
+//   - Each routing strategy (LowestFee, FastestSettlement, HighestReputation, WeightedScore)
+//   - Asset code normalisation (mixed case, whitespace)
+//   - Expired-quote filtering
+//   - Amount boundary enforcement (min/max)
+//   - Reputation filter
+//   - Unfilled pairs
+//   - Invalid asset combinations (same base/quote, empty code, too long, zero amount)
+//   - Mixed valid/invalid pairs — invalid entry propagates error immediately
 
 extern crate alloc;
 
@@ -195,22 +252,28 @@ pub fn select_best<'a>(
             .max_by_key(|q| q.reputation_score),
 
         "WeightedScore" => {
-            let max_fee: f32 = candidates
-                .iter()
-                .map(|q| q.fee_percentage as f32)
-                .fold(0.0_f32, f32::max);
-            let max_time: f32 = candidates
-                .iter()
-                .map(|q| q.average_settlement_time as f32)
-                .fold(0.0_f32, f32::max);
-            let max_rep: f32 = candidates
-                .iter()
-                .map(|q| q.reputation_score as f32)
-                .fold(0.0_f32, f32::max);
+            // Use fixed domain ceilings rather than candidate-derived maxima.
+            // Deriving the ceiling from the current candidate set makes scores
+            // relative to the pool: adding a poor candidate can lower every
+            // other candidate's normalised score and change the winner.
+            // Fixed ceilings make each candidate's score independent of who
+            // else is in the pool.
+            //
+            // fee_percentage is expressed as an integer percentage (0–100).
+            // average_settlement_time has no protocol-level upper bound, so
+            // we cap the normalised representation at f32::MAX to avoid NaN.
+            // reputation_score is on a 0–100 scale.
+            const MAX_FEE: f32 = 100.0_f32;
+            const MAX_REP: f32 = 100.0_f32;
+            // Settlement time: use f32::MAX as the ceiling so the score is
+            // always well-defined regardless of the actual values present.
+            // Candidates with very large times will score near 0 for speed,
+            // which is the correct outcome.
+            const MAX_TIME: f32 = f32::MAX;
 
             candidates.iter().max_by(|a, b| {
-                let score_a = weighted_score(a, fee_weight, speed_weight, reputation_weight, max_fee, max_time, max_rep);
-                let score_b = weighted_score(b, fee_weight, speed_weight, reputation_weight, max_fee, max_time, max_rep);
+                let score_a = weighted_score(a, fee_weight, speed_weight, reputation_weight, MAX_FEE, MAX_TIME, MAX_REP);
+                let score_b = weighted_score(b, fee_weight, speed_weight, reputation_weight, MAX_FEE, MAX_TIME, MAX_REP);
                 score_a.partial_cmp(&score_b).unwrap_or(core::cmp::Ordering::Equal)
             })
         }
@@ -281,6 +344,8 @@ pub fn route_multi_asset(
         // Self-routes (base_asset == quote_asset) are excluded: a candidate
         // that quotes an asset against itself has no conversion value and must
         // not win selection regardless of how its other fields score.
+        // Zero-or-negative rates are also excluded: a rate of 0 cannot
+        // produce a valid conversion and would yield an unusable quote.
         let candidates: Vec<&CandidateQuote> = all_quotes
             .iter()
             .filter(|q| {
@@ -289,6 +354,7 @@ pub fn route_multi_asset(
                 q_base != q_quote                              // exclude self-routes
                     && q_base == base
                     && q_quote == quote
+                    && q.rate > 0                              // exclude zero-rate candidates
                     && q.valid_until > now_timestamp
                     && req.amount >= q.minimum_amount
                     && (q.maximum_amount == 0 || req.amount <= q.maximum_amount)
@@ -448,3 +514,17 @@ mod tests {
         assert_eq!(err, Error::ValidationError);
     }
 }
+// tests/multi_asset_routing_tests.rs
+//
+// Integration tests for multi-asset quote routing (#656).
+//
+// Tests cover:
+//   - Single and multi-pair routing (happy path)
+//   - Each routing strategy (LowestFee, FastestSettlement, HighestReputation, WeightedScore)
+//   - Asset code normalisation (mixed case, whitespace)
+//   - Expired-quote filtering
+//   - Amount boundary enforcement (min/max)
+//   - Reputation filter
+//   - Unfilled pairs
+//   - Invalid asset combinations (same base/quote, empty code, too long, zero amount)
+//   - Mixed valid/invalid pairs — invalid entry propagates error immediately
