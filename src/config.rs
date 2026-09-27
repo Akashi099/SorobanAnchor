@@ -476,11 +476,31 @@ fn validate_runtime_config(config: &RuntimeConfig) -> Result<(), String> {
                         rate_limit.attestor
                     ));
                 }
+                // Issue #1126: reject zero rate limits
+                if rate_limit.requests_per_minute == 0 {
+                    return Err(format!(
+                        "rate limit for '{}': requests_per_minute must be positive (got 0)",
+                        rate_limit.attestor
+                    ));
+                }
+                if rate_limit.requests_per_hour == 0 {
+                    return Err(format!(
+                        "rate limit for '{}': requests_per_hour must be positive (got 0)",
+                        rate_limit.attestor
+                    ));
+                }
             }
         }
 
         if let Some(requirements) = &security.multisig_requirements {
             for requirement in requirements {
+                // Issue #1126: reject zero signature requirements
+                if requirement.required_signatures == 0 {
+                    return Err(format!(
+                        "multisig requirement for '{}': required_signatures must be positive (got 0)",
+                        requirement.operation
+                    ));
+                }
                 for signatory in &requirement.signatory_attestors {
                     if !attestors.contains(&signatory.as_str()) {
                         return Err(format!(
@@ -917,5 +937,116 @@ mod hot_reload_tests {
             !err.contains("blank"),
             "missing-file error must not say 'blank', got: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod config_validation_tests {
+    use super::*;
+
+    fn valid_config_json() -> String {
+        r#"{
+            "contract": {
+                "name": "TestAnchor",
+                "version": "1.0.0",
+                "network": "testnet"
+            },
+            "attestors": {
+                "registry": [{
+                    "name": "attestor-1",
+                    "address": "GABC123",
+                    "role": "primary",
+                    "enabled": true
+                }]
+            }
+        }"#.to_string()
+    }
+
+    #[test]
+    fn test_zero_rate_limit_requests_per_minute_rejected() {
+        let json = r#"{
+            "contract": {"name": "TestAnchor", "version": "1.0.0", "network": "testnet"},
+            "attestors": {"registry": [{"name": "attestor-1", "address": "GABC123", "role": "primary", "enabled": true}]},
+            "security": {
+                "rate_limits": [{
+                    "attestor": "attestor-1",
+                    "requests_per_minute": 0,
+                    "requests_per_hour": 100
+                }]
+            }
+        }"#;
+        let err = parse_runtime_config_str(json, ConfigFormat::Json).unwrap_err();
+        assert!(err.contains("requests_per_minute must be positive"), "got: {err}");
+        assert!(err.contains("got 0"), "got: {err}");
+    }
+
+    #[test]
+    fn test_zero_rate_limit_requests_per_hour_rejected() {
+        let json = r#"{
+            "contract": {"name": "TestAnchor", "version": "1.0.0", "network": "testnet"},
+            "attestors": {"registry": [{"name": "attestor-1", "address": "GABC123", "role": "primary", "enabled": true}]},
+            "security": {
+                "rate_limits": [{
+                    "attestor": "attestor-1",
+                    "requests_per_minute": 10,
+                    "requests_per_hour": 0
+                }]
+            }
+        }"#;
+        let err = parse_runtime_config_str(json, ConfigFormat::Json).unwrap_err();
+        assert!(err.contains("requests_per_hour must be positive"), "got: {err}");
+        assert!(err.contains("got 0"), "got: {err}");
+    }
+
+    #[test]
+    fn test_positive_rate_limits_accepted() {
+        let json = r#"{
+            "contract": {"name": "TestAnchor", "version": "1.0.0", "network": "testnet"},
+            "attestors": {"registry": [{"name": "attestor-1", "address": "GABC123", "role": "primary", "enabled": true}]},
+            "security": {
+                "rate_limits": [{
+                    "attestor": "attestor-1",
+                    "requests_per_minute": 10,
+                    "requests_per_hour": 100
+                }]
+            }
+        }"#;
+        let config = parse_runtime_config_str(json, ConfigFormat::Json).unwrap();
+        assert_eq!(config.security.unwrap().rate_limits.unwrap()[0].requests_per_minute, 10);
+    }
+
+    #[test]
+    fn test_zero_multisig_required_signatures_rejected() {
+        let json = r#"{
+            "contract": {"name": "TestAnchor", "version": "1.0.0", "network": "testnet"},
+            "attestors": {"registry": [{"name": "attestor-1", "address": "GABC123", "role": "primary", "enabled": true}]},
+            "security": {
+                "multisig_requirements": [{
+                    "operation": "high_value_transfer",
+                    "required_signatures": 0,
+                    "signatory_attestors": ["attestor-1"]
+                }]
+            }
+        }"#;
+        let err = parse_runtime_config_str(json, ConfigFormat::Json).unwrap_err();
+        assert!(err.contains("required_signatures must be positive"), "got: {err}");
+        assert!(err.contains("got 0"), "got: {err}");
+    }
+
+    #[test]
+    fn test_positive_multisig_required_signatures_accepted() {
+        let json = r#"{
+            "contract": {"name": "TestAnchor", "version": "1.0.0", "network": "testnet"},
+            "attestors": {"registry": [{"name": "attestor-1", "address": "GABC123", "role": "primary", "enabled": true}]},
+            "security": {
+                "multisig_requirements": [{
+                    "operation": "high_value_transfer",
+                    "required_signatures": 2,
+                    "signatory_attestors": ["attestor-1"]
+                }]
+            }
+        }"#;
+        let config = parse_runtime_config_str(json, ConfigFormat::Json).unwrap();
+        assert_eq!(config.security.unwrap().multisig_requirements.unwrap()[0].required_signatures, 2);
     }
 }

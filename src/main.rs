@@ -76,6 +76,8 @@ enum NetworkProfileError {
     MalformedJson(String),
     /// A profile entry failed field-level validation.
     InvalidProfile { index: usize, reason: String },
+    /// The networks.json file is missing.
+    MissingFile,
 }
 
 impl std::fmt::Display for NetworkProfileError {
@@ -87,6 +89,8 @@ impl std::fmt::Display for NetworkProfileError {
                 write!(f, "networks.json contains invalid JSON: {msg}"),
             NetworkProfileError::InvalidProfile { index, reason } =>
                 write!(f, "network profile at index {index} is invalid: {reason}"),
+            NetworkProfileError::MissingFile =>
+                write!(f, "networks.json is missing (expected at ~/.anchorkit/networks.json)"),
         }
     }
 }
@@ -112,25 +116,58 @@ fn validate_network_profile(profile: &NetworkProfile) -> Result<(), String> {
     if profile.rpc_url.trim().is_empty() {
         return Err("'rpc_url' must not be empty".to_string());
     }
-    if !profile.rpc_url.starts_with("https://") && !profile.rpc_url.starts_with("http://") {
-        return Err(format!(
-            "'rpc_url' must start with 'https://' or 'http://': '{}'",
-            profile.rpc_url
-        ));
-    }
+    // Issue #1129: Use structural URL validation via url crate
+    validate_url_structural(&profile.rpc_url).map_err(|e| {
+        format!("'rpc_url' is not a valid HTTP(S) URL: {}", e)
+    })?;
     if profile.network_passphrase.trim().is_empty() {
         return Err("'network_passphrase' must not be empty".to_string());
     }
     if let Some(ref h) = profile.horizon_url {
-        if !h.trim().is_empty()
-            && !h.starts_with("https://")
-            && !h.starts_with("http://")
-        {
-            return Err(format!(
-                "'horizon_url' must start with 'https://' or 'http://': '{h}'"
-            ));
+        if !h.trim().is_empty() {
+            // Issue #1129: Use structural URL validation for horizon_url
+            validate_url_structural(h).map_err(|e| {
+                format!("'horizon_url' is not a valid HTTP(S) URL: {}", e)
+            })?;
         }
     }
+    Ok(())
+}
+
+/// Structural URL validation using the `url` crate parser.
+///
+/// Validates that a URL:
+/// - Parses correctly
+/// - Has a valid authority (host)
+/// - Uses http or https scheme
+/// - Does not contain credentials in the authority
+/// - Does not contain control characters
+fn validate_url_structural(input: &str) -> Result<(), String> {
+    use url::Url;
+    
+    let parsed = Url::parse(input).map_err(|e| format!("malformed URL: {}", e))?;
+    
+    // Must use http or https
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(format!("scheme must be http or https, got: {}", scheme));
+    }
+    
+    // Must have a host
+    if parsed.host().is_none() {
+        return Err("missing host/authority".to_string());
+    }
+    
+    // Reject embedded credentials
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("embedded credentials not allowed in URL".to_string());
+    }
+    
+    // Check for control characters in the original input
+    if input.chars().any(|c| c.is_control()) {
+        return Err("control characters not allowed in URL".to_string());
+    }
+    
     Ok(())
 }
 
@@ -145,8 +182,9 @@ fn validate_network_profile(profile: &NetworkProfile) -> Result<(), String> {
 /// file is treated as an empty profile set (not an error).
 fn load_network_profiles_with_diagnostics() -> (Vec<NetworkProfile>, Vec<NetworkProfileError>) {
     let path = networks_path();
+    // Issue #1127: return diagnostic when file is missing
     if !path.exists() {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), vec![NetworkProfileError::MissingFile]);
     }
 
     let content = match std::fs::read_to_string(&path) {
@@ -209,6 +247,12 @@ fn load_network_profiles_with_diagnostics() -> (Vec<NetworkProfile>, Vec<Network
                 }
             }
         }
+    }
+
+    // Issue #1128: Fail when file exists with profiles but all are invalid
+    if !raw_array.is_empty() && valid_profiles.is_empty() && !errors.is_empty() {
+        // All profiles were invalid - convert to a single fatal error
+        return (Vec::new(), errors);
     }
 
     (valid_profiles, errors)
