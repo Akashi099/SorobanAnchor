@@ -258,10 +258,16 @@ fn load_network_profiles_with_diagnostics() -> (Vec<NetworkProfile>, Vec<Network
     (valid_profiles, errors)
 }
 
-fn networks_path() -> std::path::PathBuf {
+fn networks_path() -> Result<std::path::PathBuf, NetworkProfileError> {
     let dir = dirs_home().join(".anchorkit");
-    std::fs::create_dir_all(&dir).ok();
-    dir.join("networks.json")
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        NetworkProfileError::IoError(format!(
+            "cannot create directory '{}': {}",
+            dir.display(),
+            e
+        ))
+    })?;
+    Ok(dir.join("networks.json"))
 }
 
 fn dirs_home() -> std::path::PathBuf {
@@ -285,7 +291,13 @@ fn load_network_profiles() -> Vec<NetworkProfile> {
 }
 
 fn save_network_profiles(profiles: &[NetworkProfile]) {
-    let path = networks_path();
+    let path = match networks_path() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("warning: {e}");
+            return;
+        }
+    };
     let json = match serde_json::to_string_pretty(profiles) {
         Ok(j) => j,
         Err(e) => {

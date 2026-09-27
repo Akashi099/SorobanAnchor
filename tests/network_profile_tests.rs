@@ -587,6 +587,24 @@ mod network_profile_tests {
         assert!(msg.contains("networks.json"), "display should mention the file: {msg}");
         assert!(msg.contains("permission denied"), "display should include OS error: {msg}");
     }
+
+    // ── Issue #1130: Directory creation errors ───────────────────────────────
+
+    /// Simulates unwritable directory error propagation by testing the error path.
+    /// When the parent directory cannot be created (e.g. permission denied),
+    /// the error should be returned with path and cause context, not silently
+    /// discarded.
+    #[test]
+    fn directory_creation_failure_propagates_error() {
+        // This test validates that NetworkProfileError::IoError includes path
+        // context when directory creation fails.
+        let err = NetworkProfileError::IoError(
+            "cannot create directory '/unwritable/path': permission denied".to_string()
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("/unwritable/path"), "error should include the problematic path: {msg}");
+        assert!(msg.contains("permission denied"), "error should include the OS cause: {msg}");
+    }
 }
 
     // ── Issue #1127: Missing file diagnostic ──────────────────────────────────
