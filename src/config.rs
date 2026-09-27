@@ -291,9 +291,21 @@ pub fn parse_runtime_config_str(input: &str, format: ConfigFormat) -> Result<Run
 ///
 /// The schema is compiled once per call. For hot-reload scenarios the
 /// compilation cost is negligible compared to I/O.
+#[cfg(feature = "std")]
 fn validate_against_schema(value: &serde_json::Value) -> Result<(), String> {
-    // Schema validation temporarily disabled due to dependency issues
-    // TODO: Re-enable once jsonschema crate resolution is fixed
+    const SCHEMA_TEXT: &str = include_str!("../config_schema.json");
+    let schema_json: serde_json::Value =
+        serde_json::from_str(SCHEMA_TEXT).map_err(|e| format!("schema parse error: {e}"))?;
+    let compiled = jsonschema::JSONSchema::compile(&schema_json)
+        .map_err(|e| format!("schema compile error: {e}"))?;
+    compiled.validate(value).map_err(|errors| {
+        let messages: alloc::vec::Vec<String> = errors.map(|e| e.to_string()).collect();
+        format!("schema validation failed:\n{}", messages.join("\n"))
+    })
+}
+
+#[cfg(not(feature = "std"))]
+fn validate_against_schema(_value: &serde_json::Value) -> Result<(), String> {
     Ok(())
 }
 
@@ -439,20 +451,29 @@ impl ConfigFormat {
 }
 
 fn validate_runtime_config(config: &RuntimeConfig) -> Result<(), String> {
-    if config.contract.name.is_empty() {
-        return Err("contract.name cannot be empty".to_string());
+    if config.contract.name.trim().is_empty() {
+        return Err("contract.name cannot be empty or whitespace".to_string());
     }
 
     if config.attestors.registry.is_empty() {
         return Err("attestors.registry cannot be empty".to_string());
     }
 
-    let attestors: Vec<&str> = config
-        .attestors
-        .registry
-        .iter()
-        .map(|attestor| attestor.name.as_str())
-        .collect();
+    // Collect attestor names, rejecting duplicates.
+    let mut seen_names: alloc::collections::BTreeSet<&str> = alloc::collections::BTreeSet::new();
+    for attestor in &config.attestors.registry {
+        if attestor.name.trim().is_empty() {
+            return Err("attestor name cannot be empty or whitespace".to_string());
+        }
+        if !seen_names.insert(attestor.name.as_str()) {
+            return Err(format!(
+                "duplicate attestor name '{}': each attestor name must be unique",
+                attestor.name
+            ));
+        }
+    }
+
+    let attestors: alloc::vec::Vec<&str> = seen_names.iter().copied().collect();
 
     if let Some(operations) = &config.operations {
         if let Some(templates) = &operations.templates {
@@ -509,15 +530,15 @@ mod proxy_config_tests {
         alloc::format!(
             r#"{{
                 "contract": {{
-                    "name": "TestAnchor",
+                    "name": "test-anchor",
                     "version": "1.0.0",
-                    "network": "testnet"
+                    "network": "stellar-testnet"
                 }},
                 "attestors": {{
                     "registry": [{{
                         "name": "attestor-1",
-                        "address": "GABC123",
-                        "role": "primary",
+                        "address": "GBBD6A7KNZF5WNWQEPZP5DYJD2AYUTLXRB6VXJ4RCX4RTNPPQVNF3GQ",
+                        "role": "kyc-issuer",
                         "enabled": true
                     }}]
                 }}
