@@ -589,4 +589,175 @@ mod sep10_hardening_tests {
             );
         });
     }
+
+    // -----------------------------------------------------------------------
+    // Helpers for custom header / nbf fixtures (#1115, #1116).
+    // -----------------------------------------------------------------------
+
+    fn build_jwt_custom(sk: &SigningKey, header: &str, payload: &str) -> std::string::String {
+        let header_b64 = URL_SAFE_NO_PAD.encode(header);
+        let payload_b64 = URL_SAFE_NO_PAD.encode(payload);
+        let signing_input = format!("{}.{}", header_b64, payload_b64);
+        let sig = sk.sign(signing_input.as_bytes());
+        format!("{}.{}", signing_input, URL_SAFE_NO_PAD.encode(sig.to_bytes()))
+    }
+
+    fn payload_with_nbf(sub: &str, iat: u64, exp: u64, nbf: u64) -> std::string::String {
+        format!(
+            r#"{{"sub":"{}","iat":{},"exp":{},"nbf":{},"iss":"https://anchor.example.com"}}"#,
+            sub, iat, exp, nbf
+        )
+    }
+
+    fn default_payload(sub: &str, iat: u64, exp: u64) -> std::string::String {
+        format!(
+            r#"{{"sub":"{}","iat":{},"exp":{},"iss":"https://anchor.example.com"}}"#,
+            sub, iat, exp
+        )
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #1115: the alg claim must be parsed and compared exactly.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rejects_token_with_eddsa_only_in_other_header_field() {
+        let env = make_env();
+        let contract_id = make_contract_id(&env);
+        ledger(&env, 1_000);
+        let sk = SigningKey::generate(&mut OsRng);
+        let pk = Bytes::from_slice(&env, sk.verifying_key().as_bytes());
+        let sub_str: std::string::String = Address::generate(&env).to_string().to_string();
+
+        let header = r#"{"alg":"HS512x","typ":"JWT","kid":"EdDSA"}"#;
+        let jwt = build_jwt_custom(&sk, header, &default_payload(&sub_str, 900, 5_000));
+        let token = String::from_str(&env, &jwt);
+
+        env.as_contract(&contract_id, || {
+            assert!(
+                verify_sep10_jwt(&env, &token, &pk, None).is_err(),
+                "EdDSA outside the alg claim must not satisfy the algorithm check"
+            );
+        });
+    }
+
+    #[test]
+    fn rejects_token_without_alg_claim_even_if_header_mentions_eddsa() {
+        let env = make_env();
+        let contract_id = make_contract_id(&env);
+        ledger(&env, 1_000);
+        let sk = SigningKey::generate(&mut OsRng);
+        let pk = Bytes::from_slice(&env, sk.verifying_key().as_bytes());
+        let sub_str: std::string::String = Address::generate(&env).to_string().to_string();
+
+        let header = r#"{"typ":"JWT","note":"EdDSA"}"#;
+        let jwt = build_jwt_custom(&sk, header, &default_payload(&sub_str, 900, 5_000));
+        let token = String::from_str(&env, &jwt);
+
+        env.as_contract(&contract_id, || {
+            assert!(verify_sep10_jwt(&env, &token, &pk, None).is_err());
+        });
+    }
+
+    #[test]
+    fn rejects_token_with_alg_prefixed_by_eddsa() {
+        let env = make_env();
+        let contract_id = make_contract_id(&env);
+        ledger(&env, 1_000);
+        let sk = SigningKey::generate(&mut OsRng);
+        let pk = Bytes::from_slice(&env, sk.verifying_key().as_bytes());
+        let sub_str: std::string::String = Address::generate(&env).to_string().to_string();
+
+        let header = r#"{"alg":"EdDSA2","typ":"JWT"}"#;
+        let jwt = build_jwt_custom(&sk, header, &default_payload(&sub_str, 900, 5_000));
+        let token = String::from_str(&env, &jwt);
+
+        env.as_contract(&contract_id, || {
+            assert!(verify_sep10_jwt(&env, &token, &pk, None).is_err());
+        });
+    }
+
+    #[test]
+    fn accepts_token_with_exact_eddsa_alg() {
+        let env = make_env();
+        let contract_id = make_contract_id(&env);
+        ledger(&env, 1_000);
+        let sk = SigningKey::generate(&mut OsRng);
+        let pk = Bytes::from_slice(&env, sk.verifying_key().as_bytes());
+        let sub_str: std::string::String = Address::generate(&env).to_string().to_string();
+
+        let header = r#"{"alg": "EdDSA","typ":"JWT"}"#;
+        let jwt = build_jwt_custom(&sk, header, &default_payload(&sub_str, 900, 5_000));
+        let token = String::from_str(&env, &jwt);
+
+        env.as_contract(&contract_id, || {
+            assert!(verify_sep10_jwt(&env, &token, &pk, None).is_ok());
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #1116: nbf uses the same bounded clock-skew rule as exp.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn accepts_token_with_nbf_within_skew() {
+        let env = make_env();
+        let contract_id = make_contract_id(&env);
+        ledger(&env, 1_000);
+        let sk = SigningKey::generate(&mut OsRng);
+        let pk = Bytes::from_slice(&env, sk.verifying_key().as_bytes());
+        let sub_str: std::string::String = Address::generate(&env).to_string().to_string();
+
+        // nbf = now + 30 (within default 60 s skew)
+        let header = r#"{"alg":"EdDSA","typ":"JWT"}"#;
+        let jwt = build_jwt_custom(&sk, header, &payload_with_nbf(&sub_str, 900, 5_000, 1_030));
+        let token = String::from_str(&env, &jwt);
+
+        env.as_contract(&contract_id, || {
+            assert!(
+                verify_sep10_jwt(&env, &token, &pk, None).is_ok(),
+                "nbf within skew should be accepted"
+            );
+        });
+    }
+
+    #[test]
+    fn accepts_token_with_nbf_at_skew_boundary() {
+        let env = make_env();
+        let contract_id = make_contract_id(&env);
+        ledger(&env, 1_000);
+        let sk = SigningKey::generate(&mut OsRng);
+        let pk = Bytes::from_slice(&env, sk.verifying_key().as_bytes());
+        let sub_str: std::string::String = Address::generate(&env).to_string().to_string();
+
+        let header = r#"{"alg":"EdDSA","typ":"JWT"}"#;
+        let jwt = build_jwt_custom(&sk, header, &payload_with_nbf(&sub_str, 900, 5_000, 1_060));
+        let token = String::from_str(&env, &jwt);
+
+        env.as_contract(&contract_id, || {
+            assert!(verify_sep10_jwt(&env, &token, &pk, None).is_ok());
+        });
+    }
+
+    #[test]
+    fn rejects_token_with_nbf_beyond_skew() {
+        let env = make_env();
+        let contract_id = make_contract_id(&env);
+        ledger(&env, 1_000);
+        let sk = SigningKey::generate(&mut OsRng);
+        let pk = Bytes::from_slice(&env, sk.verifying_key().as_bytes());
+        let sub_str: std::string::String = Address::generate(&env).to_string().to_string();
+
+        // nbf = now + 61 (just beyond default 60 s skew)
+        let header = r#"{"alg":"EdDSA","typ":"JWT"}"#;
+        let jwt = build_jwt_custom(&sk, header, &payload_with_nbf(&sub_str, 900, 5_000, 1_061));
+        let token = String::from_str(&env, &jwt);
+
+        env.as_contract(&contract_id, || {
+            assert!(
+                verify_sep10_jwt(&env, &token, &pk, None).is_err(),
+                "nbf beyond skew must be rejected"
+            );
+        });
+    }
 }

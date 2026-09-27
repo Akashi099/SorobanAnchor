@@ -183,6 +183,9 @@ pub enum ProbeOutcome {
     SlowSuccess,
     /// Probe failed (network error, unexpected response, timeout, etc.).
     Failure(String),
+    /// Probe failed and also took longer than `latency_threshold_ms`.
+    /// Carries the underlying failure reason.
+    SlowFailure(String),
 }
 
 impl ProbeOutcome {
@@ -195,7 +198,9 @@ impl ProbeOutcome {
     pub fn to_endpoint_outcome(&self) -> EndpointOutcome {
         match self {
             ProbeOutcome::Success | ProbeOutcome::SlowSuccess => EndpointOutcome::Success,
-            ProbeOutcome::Failure(r) => EndpointOutcome::Failure(r.clone()),
+            ProbeOutcome::Failure(r) | ProbeOutcome::SlowFailure(r) => {
+                EndpointOutcome::Failure(r.clone())
+            }
         }
     }
 }

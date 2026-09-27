@@ -98,10 +98,6 @@ pub fn base64url_decode(input: &[u8]) -> Result<Vec<u8>, ()> {
     Ok(out)
 }
 
-fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.windows(needle.len()).any(|w| w == needle)
-}
-
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() {
         return Some(0);
@@ -218,6 +214,28 @@ fn parse_json_iss(payload: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
+/// Parse the header `"alg":"..."` string value (first occurrence). Returns `None` if absent.
+fn parse_json_alg(header: &[u8]) -> Option<Vec<u8>> {
+    let key = b"\"alg\":";
+    let pos = find_bytes(header, key)?;
+    let mut i = pos + key.len();
+    while i < header.len() && header[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= header.len() || header[i] != b'"' {
+        return None;
+    }
+    i += 1;
+    let start = i;
+    while i < header.len() {
+        if header[i] == b'"' {
+            return Some(header[start..i].to_vec());
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Parse first `"sub":"..."` string value (no escape sequences inside value).
 fn parse_json_sub(env: &Env, payload: &[u8]) -> Result<String, ()> {
     let key = b"\"sub\":";
@@ -246,10 +264,10 @@ fn parse_json_sub(env: &Env, payload: &[u8]) -> Result<String, ()> {
 /// Performs the following checks in order:
 /// 1. Token length is within the configured maximum (default [`MAX_JWT_LEN`]).
 /// 2. Token has exactly two `.` separators (three parts).
-/// 3. Header contains `"EdDSA"`.
+/// 3. Header `alg` claim is exactly `"EdDSA"`.
 /// 4. Signature is 64 bytes and passes Ed25519 verification against `anchor_public_key`.
 /// 5. `exp` claim is present and in the future.
-/// 6. `nbf` claim (if present) is not in the future.
+/// 6. `nbf` claim (if present) is not in the future beyond the clock skew.
 /// 7. `jti` claim (if present) has not been seen before (replay protection).
 /// 8. `sub` claim is present and, if `expected_sub` is `Some`, matches it.
 ///
@@ -343,15 +361,11 @@ pub fn verify_sep10_jwt(
     let sig_b64 = &buf[d1 + 1..n_usize];
 
     let header_dec = base64url_decode(header_b64).map_err(|_| ())?;
-    if !contains_subslice(&header_dec, b"EdDSA") {
-        return Err(());
-    }
-    // Reject tokens that claim a non-EdDSA algorithm alongside EdDSA (e.g. "alg":"RS256")
-    // by requiring the header to NOT contain any of the common non-EdDSA algorithm names.
-    for forbidden in &[b"RS256" as &[u8], b"RS384", b"RS512", b"HS256", b"HS384", b"HS512", b"ES256", b"ES384", b"ES512", b"none"] {
-        if contains_subslice(&header_dec, forbidden) {
-            return Err(());
-        }
+    // The `alg` claim must be exactly "EdDSA"; text elsewhere in the header
+    // must not satisfy the check.
+    match parse_json_alg(&header_dec) {
+        Some(alg) if alg.as_slice() == b"EdDSA" => {}
+        _ => return Err(()),
     }
 
     let sig_dec = base64url_decode(sig_b64).map_err(|_| ())?;
@@ -404,9 +418,10 @@ pub fn verify_sep10_jwt(
         return Err(());
     }
 
-    // Issue #61: reject tokens whose nbf is in the future
+    // Issue #61: reject tokens whose nbf is in the future, allowing the same
+    // clock-skew tolerance applied to exp and iat.
     if let Some(nbf) = parse_json_nbf(&payload_dec) {
-        if nbf > now {
+        if nbf > now.saturating_add(skew) {
             return Err(());
         }
     }

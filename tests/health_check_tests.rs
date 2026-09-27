@@ -417,3 +417,109 @@ mod counter_underflow_tests {
         assert_eq!(w.success_count, 4);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Synthetic probe latency classification (#1113) and p50 median (#1114)
+// ---------------------------------------------------------------------------
+
+mod probe_latency_classification_tests {
+    use anchorkit::synthetic_probe::{
+        probe_results_to_health_window, ProbeConfig, ProbeKind, ProbeOutcome, ProbeResult,
+        SyntheticProbeRunner,
+    };
+
+    fn run_one(result: ProbeResult) -> ProbeOutcome {
+        let probe = ProbeConfig::new(1, ProbeKind::Ping, "https://anchor.example.com")
+            .unwrap()
+            .with_latency_threshold(1_000)
+            .unwrap();
+        let runner = SyntheticProbeRunner::new(vec![probe]);
+        let mut result = Some(result);
+        let reports = runner.run_all(|_| Ok(result.take().unwrap()), || 0);
+        reports[0].result.outcome.clone()
+    }
+
+    #[test]
+    fn slow_failure_retains_reason_and_records_latency() {
+        let outcome = run_one(ProbeResult::failure(1, 5_000, "HTTP 503"));
+        assert_eq!(outcome, ProbeOutcome::SlowFailure("HTTP 503".into()));
+        assert!(!outcome.is_ok());
+    }
+
+    #[test]
+    fn fast_failure_stays_failure() {
+        let outcome = run_one(ProbeResult::failure(1, 100, "HTTP 503"));
+        assert_eq!(outcome, ProbeOutcome::Failure("HTTP 503".into()));
+    }
+
+    #[test]
+    fn slow_success_stays_slow_success() {
+        assert_eq!(run_one(ProbeResult::success(1, 5_000)), ProbeOutcome::SlowSuccess);
+    }
+
+    #[test]
+    fn fast_success_stays_success() {
+        assert_eq!(run_one(ProbeResult::success(1, 100)), ProbeOutcome::Success);
+    }
+
+    #[test]
+    fn slow_failure_counts_as_failure_in_health_window() {
+        let probes = vec![
+            ProbeConfig::new(1, ProbeKind::Ping, "a").unwrap().with_latency_threshold(1_000).unwrap(),
+            ProbeConfig::new(2, ProbeKind::Ping, "b").unwrap().with_latency_threshold(1_000).unwrap(),
+        ];
+        let runner = SyntheticProbeRunner::new(probes);
+        let reports = runner.run_all(
+            |c| {
+                if c.id == 1 {
+                    Ok(ProbeResult::failure(c.id, 5_000, "timeout"))
+                } else {
+                    Ok(ProbeResult::success(c.id, 100))
+                }
+            },
+            || 0,
+        );
+        let w = probe_results_to_health_window(&reports);
+        assert_eq!(w.success_count, 1);
+        assert_eq!(w.failure_count, 1);
+    }
+
+    fn window_for(latencies: &[u64]) -> anchorkit::anchor_health::HealthWindow {
+        let probes: Vec<ProbeConfig> = (0..latencies.len() as u64)
+            .map(|i| ProbeConfig::new(i, ProbeKind::Ping, "a").unwrap())
+            .collect();
+        let runner = SyntheticProbeRunner::new(probes);
+        let reports = runner.run_all(
+            |c| Ok(ProbeResult::success(c.id, latencies[c.id as usize])),
+            || 0,
+        );
+        probe_results_to_health_window(&reports)
+    }
+
+    #[test]
+    fn p50_even_sample_averages_two_middle_values() {
+        // sorted: [100, 200, 400, 800] → (200 + 400) / 2 = 300
+        let w = window_for(&[400, 100, 800, 200]);
+        assert!((w.p50_latency_ms - 300.0).abs() < 1e-9);
+        assert_eq!(w.success_count, 4);
+        assert_eq!(w.failure_count, 0);
+    }
+
+    #[test]
+    fn p50_two_samples_is_their_mean() {
+        let w = window_for(&[100, 201]);
+        assert!((w.p50_latency_ms - 150.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn p50_odd_sample_is_middle_value() {
+        let w = window_for(&[300, 100, 500]);
+        assert!((w.p50_latency_ms - 300.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn p50_single_sample_is_that_value() {
+        let w = window_for(&[250]);
+        assert!((w.p50_latency_ms - 250.0).abs() < 1e-9);
+    }
+}
