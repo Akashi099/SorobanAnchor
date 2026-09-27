@@ -291,9 +291,21 @@ pub fn parse_runtime_config_str(input: &str, format: ConfigFormat) -> Result<Run
 ///
 /// The schema is compiled once per call. For hot-reload scenarios the
 /// compilation cost is negligible compared to I/O.
+#[cfg(feature = "std")]
 fn validate_against_schema(value: &serde_json::Value) -> Result<(), String> {
-    // Schema validation temporarily disabled due to dependency issues
-    // TODO: Re-enable once jsonschema crate resolution is fixed
+    const SCHEMA_TEXT: &str = include_str!("../config_schema.json");
+    let schema_json: serde_json::Value =
+        serde_json::from_str(SCHEMA_TEXT).map_err(|e| format!("schema parse error: {e}"))?;
+    let compiled = jsonschema::JSONSchema::compile(&schema_json)
+        .map_err(|e| format!("schema compile error: {e}"))?;
+    compiled.validate(value).map_err(|errors| {
+        let messages: alloc::vec::Vec<String> = errors.map(|e| e.to_string()).collect();
+        format!("schema validation failed:\n{}", messages.join("\n"))
+    })
+}
+
+#[cfg(not(feature = "std"))]
+fn validate_against_schema(_value: &serde_json::Value) -> Result<(), String> {
     Ok(())
 }
 
@@ -439,20 +451,29 @@ impl ConfigFormat {
 }
 
 fn validate_runtime_config(config: &RuntimeConfig) -> Result<(), String> {
-    if config.contract.name.is_empty() {
-        return Err("contract.name cannot be empty".to_string());
+    if config.contract.name.trim().is_empty() {
+        return Err("contract.name cannot be empty or whitespace".to_string());
     }
 
     if config.attestors.registry.is_empty() {
         return Err("attestors.registry cannot be empty".to_string());
     }
 
-    let attestors: Vec<&str> = config
-        .attestors
-        .registry
-        .iter()
-        .map(|attestor| attestor.name.as_str())
-        .collect();
+    // Collect attestor names, rejecting duplicates.
+    let mut seen_names: alloc::collections::BTreeSet<&str> = alloc::collections::BTreeSet::new();
+    for attestor in &config.attestors.registry {
+        if attestor.name.trim().is_empty() {
+            return Err("attestor name cannot be empty or whitespace".to_string());
+        }
+        if !seen_names.insert(attestor.name.as_str()) {
+            return Err(format!(
+                "duplicate attestor name '{}': each attestor name must be unique",
+                attestor.name
+            ));
+        }
+    }
+
+    let attestors: alloc::vec::Vec<&str> = seen_names.iter().copied().collect();
 
     if let Some(operations) = &config.operations {
         if let Some(templates) = &operations.templates {
@@ -476,11 +497,31 @@ fn validate_runtime_config(config: &RuntimeConfig) -> Result<(), String> {
                         rate_limit.attestor
                     ));
                 }
+                // Issue #1126: reject zero rate limits
+                if rate_limit.requests_per_minute == 0 {
+                    return Err(format!(
+                        "rate limit for '{}': requests_per_minute must be positive (got 0)",
+                        rate_limit.attestor
+                    ));
+                }
+                if rate_limit.requests_per_hour == 0 {
+                    return Err(format!(
+                        "rate limit for '{}': requests_per_hour must be positive (got 0)",
+                        rate_limit.attestor
+                    ));
+                }
             }
         }
 
         if let Some(requirements) = &security.multisig_requirements {
             for requirement in requirements {
+                // Issue #1126: reject zero signature requirements
+                if requirement.required_signatures == 0 {
+                    return Err(format!(
+                        "multisig requirement for '{}': required_signatures must be positive (got 0)",
+                        requirement.operation
+                    ));
+                }
                 for signatory in &requirement.signatory_attestors {
                     if !attestors.contains(&signatory.as_str()) {
                         return Err(format!(
@@ -509,15 +550,15 @@ mod proxy_config_tests {
         alloc::format!(
             r#"{{
                 "contract": {{
-                    "name": "TestAnchor",
+                    "name": "test-anchor",
                     "version": "1.0.0",
-                    "network": "testnet"
+                    "network": "stellar-testnet"
                 }},
                 "attestors": {{
                     "registry": [{{
                         "name": "attestor-1",
-                        "address": "GABC123",
-                        "role": "primary",
+                        "address": "GBBD6A7KNZF5WNWQEPZP5DYJD2AYUTLXRB6VXJ4RCX4RTNPPQVNF3GQ",
+                        "role": "kyc-issuer",
                         "enabled": true
                     }}]
                 }}
@@ -917,5 +958,116 @@ mod hot_reload_tests {
             !err.contains("blank"),
             "missing-file error must not say 'blank', got: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod config_validation_tests {
+    use super::*;
+
+    fn valid_config_json() -> String {
+        r#"{
+            "contract": {
+                "name": "TestAnchor",
+                "version": "1.0.0",
+                "network": "testnet"
+            },
+            "attestors": {
+                "registry": [{
+                    "name": "attestor-1",
+                    "address": "GABC123",
+                    "role": "primary",
+                    "enabled": true
+                }]
+            }
+        }"#.to_string()
+    }
+
+    #[test]
+    fn test_zero_rate_limit_requests_per_minute_rejected() {
+        let json = r#"{
+            "contract": {"name": "TestAnchor", "version": "1.0.0", "network": "testnet"},
+            "attestors": {"registry": [{"name": "attestor-1", "address": "GABC123", "role": "primary", "enabled": true}]},
+            "security": {
+                "rate_limits": [{
+                    "attestor": "attestor-1",
+                    "requests_per_minute": 0,
+                    "requests_per_hour": 100
+                }]
+            }
+        }"#;
+        let err = parse_runtime_config_str(json, ConfigFormat::Json).unwrap_err();
+        assert!(err.contains("requests_per_minute must be positive"), "got: {err}");
+        assert!(err.contains("got 0"), "got: {err}");
+    }
+
+    #[test]
+    fn test_zero_rate_limit_requests_per_hour_rejected() {
+        let json = r#"{
+            "contract": {"name": "TestAnchor", "version": "1.0.0", "network": "testnet"},
+            "attestors": {"registry": [{"name": "attestor-1", "address": "GABC123", "role": "primary", "enabled": true}]},
+            "security": {
+                "rate_limits": [{
+                    "attestor": "attestor-1",
+                    "requests_per_minute": 10,
+                    "requests_per_hour": 0
+                }]
+            }
+        }"#;
+        let err = parse_runtime_config_str(json, ConfigFormat::Json).unwrap_err();
+        assert!(err.contains("requests_per_hour must be positive"), "got: {err}");
+        assert!(err.contains("got 0"), "got: {err}");
+    }
+
+    #[test]
+    fn test_positive_rate_limits_accepted() {
+        let json = r#"{
+            "contract": {"name": "TestAnchor", "version": "1.0.0", "network": "testnet"},
+            "attestors": {"registry": [{"name": "attestor-1", "address": "GABC123", "role": "primary", "enabled": true}]},
+            "security": {
+                "rate_limits": [{
+                    "attestor": "attestor-1",
+                    "requests_per_minute": 10,
+                    "requests_per_hour": 100
+                }]
+            }
+        }"#;
+        let config = parse_runtime_config_str(json, ConfigFormat::Json).unwrap();
+        assert_eq!(config.security.unwrap().rate_limits.unwrap()[0].requests_per_minute, 10);
+    }
+
+    #[test]
+    fn test_zero_multisig_required_signatures_rejected() {
+        let json = r#"{
+            "contract": {"name": "TestAnchor", "version": "1.0.0", "network": "testnet"},
+            "attestors": {"registry": [{"name": "attestor-1", "address": "GABC123", "role": "primary", "enabled": true}]},
+            "security": {
+                "multisig_requirements": [{
+                    "operation": "high_value_transfer",
+                    "required_signatures": 0,
+                    "signatory_attestors": ["attestor-1"]
+                }]
+            }
+        }"#;
+        let err = parse_runtime_config_str(json, ConfigFormat::Json).unwrap_err();
+        assert!(err.contains("required_signatures must be positive"), "got: {err}");
+        assert!(err.contains("got 0"), "got: {err}");
+    }
+
+    #[test]
+    fn test_positive_multisig_required_signatures_accepted() {
+        let json = r#"{
+            "contract": {"name": "TestAnchor", "version": "1.0.0", "network": "testnet"},
+            "attestors": {"registry": [{"name": "attestor-1", "address": "GABC123", "role": "primary", "enabled": true}]},
+            "security": {
+                "multisig_requirements": [{
+                    "operation": "high_value_transfer",
+                    "required_signatures": 2,
+                    "signatory_attestors": ["attestor-1"]
+                }]
+            }
+        }"#;
+        let config = parse_runtime_config_str(json, ConfigFormat::Json).unwrap();
+        assert_eq!(config.security.unwrap().multisig_requirements.unwrap()[0].required_signatures, 2);
     }
 }

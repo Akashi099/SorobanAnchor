@@ -146,3 +146,171 @@ fn runtime_parser_rejects_unknown_attestor_references() {
     let result = parse_runtime_config_str(bad, ConfigFormat::Json);
     assert!(result.is_err(), "unknown operation attestor should be rejected");
 }
+
+// ── Whitespace-name trimming ──────────────────────────────────────────────────
+
+#[test]
+fn whitespace_only_contract_name_is_rejected() {
+    let bad = r#"{
+  "contract": { "name": "   ", "version": "1.0.0", "network": "stellar-testnet" },
+  "attestors": {
+    "registry": [{
+      "name": "kyc-issuer",
+      "address": "GBBD6A7KNZF5WNWQEPZP5DYJD2AYUTLXRB6VXJ4RCX4RTNPPQVNF3GQ",
+      "role": "kyc-issuer",
+      "enabled": true
+    }]
+  }
+}"#;
+    // The schema enforces pattern ^[a-z0-9-]+$ so whitespace is also caught
+    // at the schema layer; the semantic layer provides the trim-aware message.
+    let result = parse_runtime_config_str(bad, ConfigFormat::Json);
+    assert!(result.is_err(), "whitespace-only contract name should be rejected");
+}
+
+#[test]
+fn ordinary_contract_name_is_accepted() {
+    let good = r#"{
+  "contract": { "name": "my-anchor", "version": "1.0.0", "network": "stellar-testnet" },
+  "attestors": {
+    "registry": [{
+      "name": "kyc-issuer",
+      "address": "GBBD6A7KNZF5WNWQEPZP5DYJD2AYUTLXRB6VXJ4RCX4RTNPPQVNF3GQ",
+      "role": "kyc-issuer",
+      "enabled": true
+    }]
+  }
+}"#;
+    let result = parse_runtime_config_str(good, ConfigFormat::Json);
+    assert!(result.is_ok(), "ordinary name should be accepted: {:?}", result);
+}
+
+// ── Duplicate attestor names ──────────────────────────────────────────────────
+
+#[test]
+fn duplicate_attestor_name_is_rejected() {
+    let bad = r#"{
+  "contract": { "name": "my-anchor", "version": "1.0.0", "network": "stellar-testnet" },
+  "attestors": {
+    "registry": [
+      {
+        "name": "kyc-issuer",
+        "address": "GBBD6A7KNZF5WNWQEPZP5DYJD2AYUTLXRB6VXJ4RCX4RTNPPQVNF3GQ",
+        "role": "kyc-issuer",
+        "enabled": true
+      },
+      {
+        "name": "kyc-issuer",
+        "address": "GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGBM3NMKL3YEI6CGMFA8QQ",
+        "role": "transfer-verifier",
+        "enabled": true
+      }
+    ]
+  }
+}"#;
+    let result = parse_runtime_config_str(bad, ConfigFormat::Json);
+    assert!(result.is_err(), "duplicate attestor name should be rejected");
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("kyc-issuer"),
+        "error should identify the conflicting name, got: {err}"
+    );
+}
+
+#[test]
+fn unique_attestor_names_are_accepted() {
+    let good = r#"{
+  "contract": { "name": "my-anchor", "version": "1.0.0", "network": "stellar-testnet" },
+  "attestors": {
+    "registry": [
+      {
+        "name": "kyc-issuer",
+        "address": "GBBD6A7KNZF5WNWQEPZP5DYJD2AYUTLXRB6VXJ4RCX4RTNPPQVNF3GQ",
+        "role": "kyc-issuer",
+        "enabled": true
+      },
+      {
+        "name": "transfer-verifier",
+        "address": "GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGBM3NMKL3YEI6CGMFA8QQ",
+        "role": "transfer-verifier",
+        "enabled": true
+      }
+    ]
+  }
+}"#;
+    let result = parse_runtime_config_str(good, ConfigFormat::Json);
+    assert!(result.is_ok(), "unique attestor names should be accepted: {:?}", result);
+}
+
+// ── Schema validation (validate_against_schema) ───────────────────────────────
+
+#[test]
+fn schema_rejects_wrong_type_for_contract_field() {
+    // "version" must be a string, not an integer
+    let bad = r#"{
+  "contract": { "name": "my-anchor", "version": 1, "network": "stellar-testnet" },
+  "attestors": {
+    "registry": [{
+      "name": "kyc-issuer",
+      "address": "GBBD6A7KNZF5WNWQEPZP5DYJD2AYUTLXRB6VXJ4RCX4RTNPPQVNF3GQ",
+      "role": "kyc-issuer",
+      "enabled": true
+    }]
+  }
+}"#;
+    let result = parse_runtime_config_str(bad, ConfigFormat::Json);
+    assert!(result.is_err(), "wrong type for version should be rejected by schema");
+}
+
+#[test]
+fn schema_rejects_missing_required_property() {
+    // "network" is required under contract
+    let bad = r#"{
+  "contract": { "name": "my-anchor", "version": "1.0.0" },
+  "attestors": {
+    "registry": [{
+      "name": "kyc-issuer",
+      "address": "GBBD6A7KNZF5WNWQEPZP5DYJD2AYUTLXRB6VXJ4RCX4RTNPPQVNF3GQ",
+      "role": "kyc-issuer",
+      "enabled": true
+    }]
+  }
+}"#;
+    let result = parse_runtime_config_str(bad, ConfigFormat::Json);
+    assert!(result.is_err(), "missing required 'network' field should be rejected by schema");
+}
+
+#[test]
+fn schema_rejects_unknown_top_level_property() {
+    let bad = r#"{
+  "contract": { "name": "my-anchor", "version": "1.0.0", "network": "stellar-testnet" },
+  "attestors": {
+    "registry": [{
+      "name": "kyc-issuer",
+      "address": "GBBD6A7KNZF5WNWQEPZP5DYJD2AYUTLXRB6VXJ4RCX4RTNPPQVNF3GQ",
+      "role": "kyc-issuer",
+      "enabled": true
+    }]
+  },
+  "unknown_field": "should_fail"
+}"#;
+    let result = parse_runtime_config_str(bad, ConfigFormat::Json);
+    assert!(result.is_err(), "unknown top-level field should be rejected by schema");
+}
+
+#[test]
+fn valid_config_still_parses_through_schema_path() {
+    let good = r#"{
+  "contract": { "name": "my-anchor", "version": "1.0.0", "network": "stellar-testnet" },
+  "attestors": {
+    "registry": [{
+      "name": "kyc-issuer",
+      "address": "GBBD6A7KNZF5WNWQEPZP5DYJD2AYUTLXRB6VXJ4RCX4RTNPPQVNF3GQ",
+      "role": "kyc-issuer",
+      "enabled": true
+    }]
+  }
+}"#;
+    let result = parse_runtime_config_str(good, ConfigFormat::Json);
+    assert!(result.is_ok(), "valid config should pass schema validation: {:?}", result);
+}

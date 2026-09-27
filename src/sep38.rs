@@ -336,7 +336,7 @@ fn is_valid_positive_decimal(s: &str) -> bool {
     if s.is_empty() {
         return false;
     }
-    // Allow optional leading digits, optional single '.', trailing digits
+    // Structural checks: only digits and at most one '.', no leading sign.
     let mut has_digit = false;
     let mut dot_count = 0u32;
     for ch in s.chars() {
@@ -354,9 +354,11 @@ fn is_valid_positive_decimal(s: &str) -> bool {
     if !has_digit {
         return false;
     }
-    // Must be > 0: reject "0", "0.0", "0.00", etc.
-    let v: f64 = s.parse().unwrap_or(0.0);
-    v > 0.0
+    // Must be > 0: use exact string comparison instead of f64 to avoid
+    // precision loss and to correctly reject values above f64::MAX.
+    // Split into integer and fractional parts and check that at least one
+    // non-zero digit exists anywhere in the string.
+    s.chars().any(|c| c != '.' && c != '0')
 }
 
 /// Validates a timestamp string and returns the parsed value.
@@ -2397,5 +2399,57 @@ mod partial_quote_tests {
         let partial = parse_partial_quote(raw_full());
         assert!(partial.is_complete(), "fully populated raw quote should be complete");
         assert!(partial.missing_fields.is_empty());
+    }
+
+    // ── is_valid_positive_decimal – exact/fixed-point checks ─────────────────
+
+    #[test]
+    fn test_decimal_above_f64_max_is_valid() {
+        // A value larger than f64::MAX (~1.8e308) would become infinity when
+        // parsed as f64, causing the old implementation to reject it.
+        // The string clearly represents a positive number, so it must be valid.
+        let huge = "99999999999999999999999999999999999999999999999999\
+                    99999999999999999999999999999999999999999999999999\
+                    99999999999999999999999999999999999999999999999999\
+                    99999999999999999999999999999999999999999999999999\
+                    99999999999999999999999999999999999999999999999999\
+                    99999999999999999999999999999999999999999999999999\
+                    9999999";
+        assert!(
+            is_valid_positive_decimal(huge),
+            "value above f64::MAX should be accepted as a valid positive decimal"
+        );
+    }
+
+    #[test]
+    fn test_precision_sensitive_decimal_is_valid() {
+        // 0.1 + 0.2 = 0.30000000000000004 in f64; the string "0.3" must stay
+        // exactly "0.3" and must be recognised as positive without rounding.
+        assert!(
+            is_valid_positive_decimal("0.3"),
+            "precision-sensitive decimal 0.3 should be valid"
+        );
+        // A very small value that f64 rounds toward zero must still be valid.
+        assert!(
+            is_valid_positive_decimal("0.000000000000000000000000000000000000000000000001"),
+            "tiny positive decimal should be valid"
+        );
+    }
+
+    #[test]
+    fn test_zero_variants_remain_invalid() {
+        assert!(!is_valid_positive_decimal("0"));
+        assert!(!is_valid_positive_decimal("0.0"));
+        assert!(!is_valid_positive_decimal("0.000"));
+        assert!(!is_valid_positive_decimal("0.00000000000000000000000"));
+    }
+
+    #[test]
+    fn test_malformed_decimals_remain_invalid() {
+        assert!(!is_valid_positive_decimal(""));
+        assert!(!is_valid_positive_decimal("abc"));
+        assert!(!is_valid_positive_decimal("1.2.3"));
+        assert!(!is_valid_positive_decimal("-1"));
+        assert!(!is_valid_positive_decimal("+1"));
     }
 }
