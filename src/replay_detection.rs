@@ -595,3 +595,46 @@ mod tests {
         assert!(!is_default_timestamp_valid(1_000_000 + 61, 1_000_000));
     }
 }
+//! Request provenance and lineage tracking (#682).
+//!
+//! Debugging a multi-step anchor workflow is difficult when requests carry no
+//! record of where they came from or what triggered them. This module
+//! introduces a [`ProvenanceRecord`] that every request can carry, capturing
+//! its origin, immediate parent, and the chain of ancestors that led to it.
+//!
+//! # Design
+//!
+//! * **Lineage chain.** A [`ProvenanceRecord`] holds a `parent_id` (the
+//!   request that directly spawned this one) and an `ancestors` list (the
+//!   full chain back to the root). This lets operators reconstruct the entire
+//!   call tree from any node.
+//! * **Origin metadata.** Records carry the originating service name, an
+//!   optional operation label, and a creation timestamp so the time between
+//!   hops is visible.
+//! * **Immutable once built.** Records are created at request entry and
+//!   threaded through the call chain read-only. Child records are derived via
+//!   [`ProvenanceRecord::child`], which copies the lineage chain and appends
+//!   the current record's ID.
+//! * **No `std` dependency.** Works in `no_std + alloc`.
+//!
+//! # Example
+//!
+//! ```rust
+//! use anchorkit::request_provenance::ProvenanceRecord;
+//!
+//! // Root request created by the gateway.
+//! let root = ProvenanceRecord::root("gateway", "deposit-initiate", 1000).unwrap();
+//! assert!(root.parent_id().is_none());
+//! assert_eq!(root.depth(), 0);
+//!
+//! // Downstream service derives a child.
+//! let child = root.child("anchor-service", "sep6-deposit", 1001).unwrap();
+//! assert_eq!(child.parent_id(), Some(root.request_id()));
+//! assert_eq!(child.depth(), 1);
+//!
+//! // Grandchild keeps the full lineage.
+//! let grandchild = child.child("webhook-dispatcher", "notify", 1002).unwrap();
+//! assert_eq!(grandchild.depth(), 2);
+//! assert_eq!(grandchild.ancestors()[0], root.request_id());
+//! assert_eq!(grandchild.ancestors()[1], child.request_id());
+//! ``
