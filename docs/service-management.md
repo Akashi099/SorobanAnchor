@@ -40,6 +40,12 @@ let result = ServiceManager::disable_service(&env, &anchor, SERVICE_DEPOSITS);
 assert!(result); // true if service was disabled, false if already disabled
 ```
 
+Disabling a service first runs the existing dependent check
+(`assert_no_active_dependents`). If the service is a prerequisite for other
+services that are still enabled, the call fails and the service remains
+enabled, so active dependents are never orphaned. Independent services and
+already-disabled services are unaffected and keep their current behavior.
+
 ### Check Service Status
 
 ```rust
