@@ -67,20 +67,32 @@ impl DomainPolicy {
     }
 
     /// Add an allow rule for `host_pattern` and return `self` for chaining.
+    ///
+    /// The pattern is trimmed and validated (blank patterns are rejected).
     pub fn with_allow(mut self, host_pattern: impl Into<String>) -> Self {
-        self.rules.push(DomainPolicyRule {
-            action: PolicyAction::Allow,
-            host_pattern: host_pattern.into(),
-        });
+        let pattern = host_pattern.into();
+        let trimmed = pattern.trim();
+        if !trimmed.is_empty() {
+            self.rules.push(DomainPolicyRule {
+                action: PolicyAction::Allow,
+                host_pattern: trimmed.to_string(),
+            });
+        }
         self
     }
 
     /// Add a deny rule for `host_pattern` and return `self` for chaining.
+    ///
+    /// The pattern is trimmed and validated (blank patterns are rejected).
     pub fn with_deny(mut self, host_pattern: impl Into<String>) -> Self {
-        self.rules.push(DomainPolicyRule {
-            action: PolicyAction::Deny,
-            host_pattern: host_pattern.into(),
-        });
+        let pattern = host_pattern.into();
+        let trimmed = pattern.trim();
+        if !trimmed.is_empty() {
+            self.rules.push(DomainPolicyRule {
+                action: PolicyAction::Deny,
+                host_pattern: trimmed.to_string(),
+            });
+        }
         self
     }
 
@@ -230,6 +242,15 @@ pub fn validate_anchor_domain(domain: &str) -> Result<(), AnchorKitError> {
         return Err(AnchorKitError::invalid_endpoint_format());
     }
 
+    // --- Malformed authority check (#1133) ---
+    // Reject unbracketed multi-colon authorities (ambiguous host:port:garbage).
+    // IPv6 addresses must be bracketed ([::1]) and are rejected by
+    // validate_url_characters. Any unbracketed authority with multiple colons
+    // cannot be parsed unambiguously.
+    if !authority.starts_with('[') && authority.matches(':').count() > 1 {
+        return Err(AnchorKitError::invalid_endpoint_format());
+    }
+
     // --- Path check ---
     // An anchor domain is an origin (scheme + host [+ port]), not an
     // endpoint URL. Reject any path other than empty or root ("/") so a
@@ -292,6 +313,11 @@ fn validate_host(host: &str) -> Result<(), AnchorKitError> {
         return Err(AnchorKitError::invalid_endpoint_format());
     }
 
+    // RFC 1035 §2.3.4: total hostname length must not exceed 253 bytes.
+    if domain_without_port.len() > 253 {
+        return Err(AnchorKitError::invalid_endpoint_format());
+    }
+
     // Must contain at least one dot — rejects bare hostnames like "localhost".
     if !domain_without_port.contains('.') {
         return Err(AnchorKitError::invalid_endpoint_format());
@@ -317,6 +343,11 @@ fn validate_host(host: &str) -> Result<(), AnchorKitError> {
 
     for label in &labels {
         if label.is_empty() {
+            return Err(AnchorKitError::invalid_endpoint_format());
+        }
+        
+        // RFC 1035 §2.3.4: each label must be at most 63 bytes.
+        if label.len() > 63 {
             return Err(AnchorKitError::invalid_endpoint_format());
         }
         
@@ -973,5 +1004,94 @@ mod tests {
         assert_eq!(extract_host("https://example.com:443/sep6"), "example.com");
         assert_eq!(extract_host("https://api.example.com?q=1"), "api.example.com");
         assert_eq!(extract_host("https://sub.example.com:9000/path?x=1#frag"), "sub.example.com");
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #1131: Trim domain allow/deny patterns
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_policy_patterns_are_trimmed() {
+        // Patterns with surrounding whitespace should be normalized.
+        let policy = DomainPolicy::allow_all().with_deny(" example.com ");
+        assert!(validate_anchor_domain_with_policy("https://example.com", Some(&policy)).is_err());
+        assert!(validate_anchor_domain_with_policy("https://sub.example.com", Some(&policy)).is_err());
+    }
+
+    #[test]
+    fn test_policy_blank_patterns_are_rejected() {
+        // Blank patterns (empty or whitespace-only) should be silently ignored.
+        let policy1 = DomainPolicy::allow_all().with_deny("");
+        let policy2 = DomainPolicy::allow_all().with_deny("   ");
+        
+        // No deny rule added, so all valid domains pass.
+        assert!(validate_anchor_domain_with_policy("https://example.com", Some(&policy1)).is_ok());
+        assert!(validate_anchor_domain_with_policy("https://example.com", Some(&policy2)).is_ok());
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #1132: Enforce hostname length limits
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_hostname_length_at_limit() {
+        // RFC 1035: max hostname length is 253 bytes.
+        // "https://" (8) + hostname (253) = 261 chars before path/port.
+        let hostname_253 = alloc::format!("{}.com", "a".repeat(249));
+        assert_eq!(hostname_253.len(), 253);
+        let url = alloc::format!("https://{}", hostname_253);
+        assert!(validate_anchor_domain(&url).is_ok());
+    }
+
+    #[test]
+    fn test_hostname_length_over_limit() {
+        // 254 bytes exceeds RFC 1035 limit.
+        let hostname_254 = alloc::format!("{}.com", "a".repeat(250));
+        assert_eq!(hostname_254.len(), 254);
+        let url = alloc::format!("https://{}", hostname_254);
+        assert!(validate_anchor_domain(&url).is_err());
+    }
+
+    #[test]
+    fn test_label_length_at_limit() {
+        // RFC 1035: max label length is 63 bytes.
+        let label_63 = "a".repeat(63);
+        let url = alloc::format!("https://{}.com", label_63);
+        assert!(validate_anchor_domain(&url).is_ok());
+    }
+
+    #[test]
+    fn test_label_length_over_limit() {
+        // 64 bytes exceeds RFC 1035 limit.
+        let label_64 = "a".repeat(64);
+        let url = alloc::format!("https://{}.com", label_64);
+        assert!(validate_anchor_domain(&url).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #1133: Reject malformed authorities
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_malformed_multi_colon_authority() {
+        // Unbracketed authorities with multiple colons are ambiguous.
+        assert!(validate_anchor_domain("https://host:8080:extra").is_err());
+        assert!(validate_anchor_domain("https://host:port:garbage").is_err());
+        assert!(validate_anchor_domain("https://a:b:c").is_err());
+    }
+
+    #[test]
+    fn test_valid_host_port_accepted() {
+        // Single colon for port is valid.
+        assert!(validate_anchor_domain("https://example.com:8080").is_ok());
+        assert!(validate_anchor_domain("https://api.example.com:443").is_ok());
+    }
+
+    #[test]
+    fn test_bracketed_ipv6_rejected() {
+        // IPv6 addresses (bracketed) are still rejected by character validation.
+        assert!(validate_anchor_domain("https://[::1]").is_err());
+        assert!(validate_anchor_domain("https://[2001:db8::1]").is_err());
+        assert!(validate_anchor_domain("https://[::1]:8080").is_err());
     }
 }
