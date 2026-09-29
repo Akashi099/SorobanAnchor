@@ -79,9 +79,9 @@ pub struct TransactionSummaryRecord {
     pub total_count: u32,
     /// Number of transactions with a `"completed"` status.
     pub completed_count: u32,
-    /// Number of transactions with a status containing `"pending"`.
+    /// Number of transactions whose status token is exactly `"pending"` or starts with `"pending_"`.
     pub pending_count: u32,
-    /// Number of transactions with a status containing `"error"` or `"failed"`.
+    /// Number of transactions whose status token is exactly `"error"`, `"failed"`, or `"failure"`.
     pub error_count: u32,
     /// Sum of all transaction amounts in this window.
     pub total_volume: u64,
@@ -132,8 +132,8 @@ pub struct CompactionResult {
 fn classify_status(status: &str) -> (bool, bool, bool) {
     let s = status.to_ascii_lowercase();
     let completed = s == "completed" || s == "complete";
-    let pending = s.contains("pending");
-    let error = s.contains("error") || s.contains("failed") || s.contains("failure");
+    let pending = s == "pending" || s.starts_with("pending_");
+    let error = s == "error" || s == "failed" || s == "failure";
     (completed, pending, error)
 }
 
@@ -183,6 +183,14 @@ pub fn compact_history(
         ));
     }
 
+    for i in 1..records.len() {
+        if records[i].timestamp < records[i - 1].timestamp {
+            return Err(AnchorKitError::validation_error(
+                "records must be in ascending timestamp order",
+            ));
+        }
+    }
+
     if records.is_empty() {
         return Ok(CompactionResult {
             windows: Vec::new(),
@@ -204,7 +212,9 @@ pub fn compact_history(
     // Determine the first window start by aligning to the window boundary.
     let first_ts = records[0].timestamp;
     let mut current_window_start = (first_ts / ws) * ws;
-    let mut current_window_end = current_window_start + ws;
+    let mut current_window_end = current_window_start
+        .checked_add(ws)
+        .ok_or_else(|| AnchorKitError::validation_error("timestamp window overflows u64"))?;
 
     // Scratch state for the window being built.
     let mut total_count: u32 = 0;
@@ -272,7 +282,9 @@ pub fn compact_history(
                 }
             }
             current_window_start = current_window_end;
-            current_window_end = current_window_start + ws;
+            current_window_end = current_window_start
+                .checked_add(ws)
+                .ok_or_else(|| AnchorKitError::validation_error("timestamp window overflows u64"))?;
             total_count = 0;
             completed_count = 0;
             pending_count = 0;
@@ -510,5 +522,54 @@ mod tests {
         assert_eq!(classify_status("error"), (false, false, true));
         assert_eq!(classify_status("failed"), (false, false, true));
         assert_eq!(classify_status("unknown"), (false, false, false));
+    }
+
+    // --- #1167: exact token matching ---
+
+    #[test]
+    fn not_failed_is_not_classified_as_error() {
+        assert_eq!(classify_status("not_failed"), (false, false, false));
+    }
+
+    #[test]
+    fn failure_pending_is_not_classified() {
+        assert_eq!(classify_status("failure_pending"), (false, false, false));
+    }
+
+    // --- #1168: timestamp overflow protection ---
+
+    #[test]
+    fn near_max_timestamp_overflow_rejected() {
+        let records = vec![rec("t1", u64::MAX, "completed", 1)];
+        let cfg = CompactionConfig { window_seconds: 1, retain_boundary_ids: false };
+        let err = compact_history(&records, &cfg).unwrap_err();
+        assert_eq!(err.code, ErrorCode::ValidationError);
+    }
+
+    // --- #1169: ascending order enforcement ---
+
+    #[test]
+    fn descending_input_rejected() {
+        let records = vec![
+            rec("t1", 200, "completed", 1),
+            rec("t2", 100, "completed", 1),
+        ];
+        let cfg = CompactionConfig::default();
+        let err = compact_history(&records, &cfg).unwrap_err();
+        assert_eq!(err.code, ErrorCode::ValidationError);
+        assert!(err.context.as_deref().unwrap_or("").contains("ascending"));
+    }
+
+    #[test]
+    fn ascending_input_compacts_unchanged() {
+        let records = vec![
+            rec("t1", 100, "completed", 10),
+            rec("t2", 200, "completed", 20),
+            rec("t3", 300, "completed", 30),
+        ];
+        let cfg = CompactionConfig { window_seconds: 3600, retain_boundary_ids: false };
+        let result = compact_history(&records, &cfg).unwrap();
+        assert_eq!(result.aggregate.total_count, 3);
+        assert_eq!(result.aggregate.total_volume, 60);
     }
 }
