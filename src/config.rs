@@ -477,7 +477,15 @@ fn validate_runtime_config(config: &RuntimeConfig) -> Result<(), String> {
 
     if let Some(operations) = &config.operations {
         if let Some(templates) = &operations.templates {
+            let mut seen_op_ids: alloc::collections::BTreeSet<&str> =
+                alloc::collections::BTreeSet::new();
             for template in templates {
+                if !seen_op_ids.insert(template.id.as_str()) {
+                    return Err(format!(
+                        "duplicate operation template id '{}': each template id must be unique",
+                        template.id
+                    ));
+                }
                 if !attestors.contains(&template.attestor.as_str()) {
                     return Err(format!(
                         "operation '{}' references unknown attestor '{}'",
@@ -1070,4 +1078,75 @@ mod config_validation_tests {
         let config = parse_runtime_config_str(json, ConfigFormat::Json).unwrap();
         assert_eq!(config.security.unwrap().multisig_requirements.unwrap()[0].required_signatures, 2);
     }
-}
+
+    // ── #1125: duplicate operation template IDs ───────────────────────────────
+
+    #[test]
+    fn test_duplicate_operation_template_id_rejected() {
+        let json = r#"{
+            "contract": {"name": "TestAnchor", "version": "1.0.0", "network": "testnet"},
+            "attestors": {"registry": [{"name": "attestor-1", "address": "GABC123", "role": "primary", "enabled": true}]},
+            "operations": {
+                "templates": [
+                    {
+                        "id": "op-deposit",
+                        "name": "Deposit",
+                        "attestor": "attestor-1",
+                        "operation_type": "deposit",
+                        "required_fields": ["amount"],
+                        "replay_protection": "nonce"
+                    },
+                    {
+                        "id": "op-deposit",
+                        "name": "Deposit Duplicate",
+                        "attestor": "attestor-1",
+                        "operation_type": "deposit",
+                        "required_fields": ["amount"],
+                        "replay_protection": "nonce"
+                    }
+                ]
+            }
+        }"#;
+        let err = parse_runtime_config_str(json, ConfigFormat::Json).unwrap_err();
+        assert!(
+            err.contains("duplicate operation template id"),
+            "expected duplicate-id error, got: {err}"
+        );
+        assert!(
+            err.contains("op-deposit"),
+            "error should name the duplicate id, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_unique_operation_template_ids_accepted() {
+        let json = r#"{
+            "contract": {"name": "TestAnchor", "version": "1.0.0", "network": "testnet"},
+            "attestors": {"registry": [{"name": "attestor-1", "address": "GABC123", "role": "primary", "enabled": true}]},
+            "operations": {
+                "templates": [
+                    {
+                        "id": "op-deposit",
+                        "name": "Deposit",
+                        "attestor": "attestor-1",
+                        "operation_type": "deposit",
+                        "required_fields": ["amount"],
+                        "replay_protection": "nonce"
+                    },
+                    {
+                        "id": "op-withdraw",
+                        "name": "Withdraw",
+                        "attestor": "attestor-1",
+                        "operation_type": "withdrawal",
+                        "required_fields": ["amount"],
+                        "replay_protection": "nonce"
+                    }
+                ]
+            }
+        }"#;
+        let config = parse_runtime_config_str(json, ConfigFormat::Json).unwrap();
+        let templates = config.operations.unwrap().templates.unwrap();
+        assert_eq!(templates.len(), 2);
+        assert_eq!(templates[0].id, "op-deposit");
+        assert_eq!(templates[1].id, "op-withdraw");
+    }
