@@ -72,7 +72,9 @@ else
       PASS=false
     fi
   else
-    echo "      WARNING: sha256sum / shasum not found; skipping checksum verification."
+    echo "      ERROR: sha256sum / shasum not found; cannot verify checksum."
+    echo "             Install coreutils (sha256sum) or shasum before verifying a release."
+    PASS=false
   fi
 fi
 
@@ -85,7 +87,8 @@ case "${BACKEND}" in
     for artifact in "${TARBALL}" "${CHECKSUM_FILE}"; do
       sig_file="${artifact}.sig"
       if [[ ! -f "${sig_file}" ]]; then
-        echo "      WARNING: signature file not found: ${sig_file}  (skipping)"
+        echo "      ERROR: signature file not found: ${sig_file}"
+        PASS=false
         continue
       fi
       gpg_out=$(gpg --verify "${sig_file}" "${artifact}" 2>&1) && rc=0 || rc=$?
@@ -110,16 +113,21 @@ case "${BACKEND}" in
     ;;
   minisign)
     if ! command -v minisign &>/dev/null; then
-      echo "      WARNING: minisign not found; skipping signature verification."
+      echo "      ERROR: minisign not found; cannot verify signature."
+      echo "             Install minisign before verifying a release."
+      PASS=false
     else
       pubkey_file="${ANCHORKIT_MINISIGN_PUBKEY:-${TARBALL_DIR}/anchorkit-release.pub}"
       if [[ ! -f "${pubkey_file}" ]]; then
-        echo "      WARNING: minisign public key not found at '${pubkey_file}'; skipping."
+        echo "      ERROR: minisign public key not found at '${pubkey_file}'."
+        echo "             Set ANCHORKIT_MINISIGN_PUBKEY or place the key alongside the tarball."
+        PASS=false
       else
         for artifact in "${TARBALL}" "${CHECKSUM_FILE}"; do
           sig_file="${artifact}.minisig"
           if [[ ! -f "${sig_file}" ]]; then
-            echo "      WARNING: minisign signature not found: ${sig_file}  (skipping)"
+            echo "      ERROR: minisign signature not found: ${sig_file}"
+            PASS=false
             continue
           fi
           if minisign -Vm "${artifact}" -p "${pubkey_file}" 2>&1; then

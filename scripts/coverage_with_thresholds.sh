@@ -129,9 +129,15 @@ for entry in files:
     print(f"{module}={pct}")
 PYEOF
   )
+  parse_output=$(python3 -c "$PARSE_SCRIPT" "$JSON_REPORT" 2>&1)
+  parse_rc=$?
+  if [[ $parse_rc -ne 0 ]]; then
+    echo "[coverage] ERROR: failed to parse coverage report: ${parse_output}"
+    exit 1
+  fi
   while IFS='=' read -r mod pct; do
     ACTUAL_PCT["$mod"]="$pct"
-  done < <(python3 -c "$PARSE_SCRIPT" "$JSON_REPORT" 2>/dev/null || true)
+  done <<< "$parse_output"
 else
   echo "[coverage] WARNING: python3 not found; per-module threshold checks will be skipped."
 fi
@@ -163,8 +169,10 @@ for mod in "${!THRESHOLDS[@]}"; do
   actual="${ACTUAL_PCT[$mod]:-UNKNOWN}"
 
   if [[ "$actual" == "UNKNOWN" ]]; then
-    echo "  ⚠  $mod.rs : coverage data not found in report (module may be excluded or renamed)."
-    RESULTS["$mod"]="UNKNOWN"
+    echo "  ✗  $mod.rs : coverage data not found in report — FAIL"
+    echo "     (module may be excluded or renamed; ensure it is compiled and tested)"
+    RESULTS["$mod"]="FAIL"
+    PASSED=false
     continue
   fi
 
