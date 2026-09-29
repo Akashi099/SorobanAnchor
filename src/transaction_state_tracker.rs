@@ -19,8 +19,8 @@ impl StorageBudgetMonitor {
 
     /// Record a new entry of `size_bytes`.
     pub fn record_entry(&mut self, size_bytes: u64) {
-        self.entry_count += 1;
-        self.approx_bytes += size_bytes;
+        self.entry_count = self.entry_count.saturating_add(1);
+        self.approx_bytes = self.approx_bytes.saturating_add(size_bytes);
     }
 
     /// Remove a tracked entry of `size_bytes`.
@@ -51,7 +51,11 @@ impl StorageBudgetMonitor {
 
     /// Return `Some(BudgetAlert)` when current usage exceeds either
     /// `threshold_entries` or `threshold_bytes`; `None` otherwise.
+    /// Zero thresholds are rejected and always return `None`.
     pub fn check_alert(&self, threshold_entries: u64, threshold_bytes: u64) -> Option<BudgetAlert> {
+        if threshold_entries == 0 || threshold_bytes == 0 {
+            return None;
+        }
         if self.entry_count >= threshold_entries || self.approx_bytes >= threshold_bytes {
             let status = if self.approx_bytes >= threshold_bytes.saturating_mul(2) {
                 BudgetStatus::Critical
@@ -3270,5 +3274,38 @@ mod tests {
         assert_eq!(last.from_state, TransactionState::Failed);
         assert_eq!(last.to_state, TransactionState::InProgress);
         assert!(last.success);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #1162 — saturating addition in StorageBudgetMonitor
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_budget_record_entry_saturates_at_max() {
+        let mut monitor = StorageBudgetMonitor {
+            entry_count: u64::MAX,
+            approx_bytes: u64::MAX,
+        };
+        monitor.record_entry(1);
+        assert_eq!(monitor.entry_count, u64::MAX, "entry_count must not wrap");
+        assert_eq!(monitor.approx_bytes, u64::MAX, "approx_bytes must not wrap");
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #1163 — zero thresholds rejected in check_alert
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_check_alert_zero_entry_threshold_returns_none() {
+        let mut monitor = StorageBudgetMonitor::new();
+        monitor.record_entry(100);
+        assert!(monitor.check_alert(0, 1000).is_none());
+    }
+
+    #[test]
+    fn test_check_alert_zero_byte_threshold_returns_none() {
+        let mut monitor = StorageBudgetMonitor::new();
+        monitor.record_entry(100);
+        assert!(monitor.check_alert(10, 0).is_none());
     }
 }

@@ -112,6 +112,12 @@ pub fn verify_archive_commitment(stored: &[u8; 32], transaction_ids: &[String]) 
 // In-memory archive manager
 // ---------------------------------------------------------------------------
 
+fn check_batch_len(len: usize) -> Result<u32, AnchorKitError> {
+    u32::try_from(len).map_err(|_| {
+        AnchorKitError::validation_error("transaction_ids length exceeds u32::MAX")
+    })
+}
+
 /// Manages a collection of [`TransactionArchive`] envelopes in memory.
 ///
 /// In production the archive index would be backed by persistent storage
@@ -143,7 +149,9 @@ impl TransactionArchiveManager {
     /// # Errors
     ///
     /// Returns [`AnchorKitError`] with [`ErrorCode::ValidationError`] when
-    /// `transaction_ids` is empty.
+    /// `transaction_ids` is empty or its length exceeds `u32::MAX`.
+    /// Returns [`AnchorKitError`] with [`ErrorCode::ArchiveCapacityExceeded`] when
+    /// the archive ID counter would overflow.
     pub fn archive(
         &mut self,
         transaction_ids: &[String],
@@ -162,17 +170,22 @@ impl TransactionArchiveManager {
             ));
         }
 
+        let next_next_id = self.next_id.checked_add(1).ok_or_else(|| {
+            AnchorKitError::from_code(ErrorCode::ArchiveCapacityExceeded)
+        })?;
+        let record_count = check_batch_len(transaction_ids.len())?;
+
         let commitment = compute_archive_commitment(transaction_ids);
         let archive = TransactionArchive {
             archive_id: self.next_id,
             archived_at,
-            record_count: transaction_ids.len() as u32,
+            record_count,
             commitment,
             label,
             retrieval_uri,
         };
 
-        self.next_id += 1;
+        self.next_id = next_next_id;
         self.archives.push(archive.clone());
         Ok(archive)
     }
@@ -338,5 +351,48 @@ mod tests {
         let list = mgr.list();
         assert_eq!(list[0].label, "first");
         assert_eq!(list[1].label, "second");
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #1164 — batch length exceeding u32::MAX is rejected
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn archive_manager_batch_too_large_rejected() {
+        let err = check_batch_len(u32::MAX as usize + 1).unwrap_err();
+        assert_eq!(err.code, ErrorCode::ValidationError);
+    }
+
+    #[test]
+    fn archive_manager_batch_len_at_max_u32_accepted() {
+        assert_eq!(check_batch_len(u32::MAX as usize).unwrap(), u32::MAX);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #1165 — archive ID overflow is rejected before writing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn archive_manager_id_overflow_rejected() {
+        let mut mgr = TransactionArchiveManager {
+            archives: Vec::new(),
+            next_id: u64::MAX,
+        };
+        let err = mgr.archive(&ids(&["t1"]), 1, "overflow".into(), None).unwrap_err();
+        assert_eq!(err.code, ErrorCode::ArchiveCapacityExceeded);
+        assert_eq!(mgr.archive_count(), 0, "no archive must be written on overflow");
+    }
+
+    #[test]
+    fn archive_manager_normal_ids_are_consecutive_after_seeded_start() {
+        let mut mgr = TransactionArchiveManager {
+            archives: Vec::new(),
+            next_id: 10,
+        };
+        let a = mgr.archive(&ids(&["t1"]), 1, "a".into(), None).unwrap();
+        let b = mgr.archive(&ids(&["t2"]), 2, "b".into(), None).unwrap();
+        assert_eq!(a.archive_id, 10);
+        assert_eq!(b.archive_id, 11);
     }
 }

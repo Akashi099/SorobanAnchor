@@ -188,6 +188,11 @@ pub enum ErrorCode {
     /// A registration request was rejected because a required text field is blank.
     InvalidRegistration       = 81,
 
+    // Archive capacity errors (82)
+    /// The archive batch ID counter has reached `u64::MAX`; a further increment
+    /// would wrap and reuse an existing archive identifier. The write is rejected.
+    ArchiveCapacityExceeded   = 82,
+
 }
 
 impl ErrorCode {
@@ -275,6 +280,8 @@ impl ErrorCode {
             ErrorCode::InvalidRetirementTransition => "Invalid retirement transition for current state",
             ErrorCode::FingerprintCollectionFailed => "Environment fingerprint collection failed",
             ErrorCode::AuditLogCapacityExceeded  => "Audit log record ID space exhausted; cannot allocate another unique record ID",
+            ErrorCode::ArchiveCapacityExceeded   => "Archive ID space exhausted; cannot allocate another unique archive identifier",
+            ErrorCode::InvalidRegistration       => "Registration rejected: a required field is blank",
         }
     }
 }
