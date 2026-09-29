@@ -157,10 +157,12 @@ impl AdminAuditLog {
             .get(&counter_key)
             .unwrap_or(0u64);
 
-        // Check if we've exceeded max entries
+        let entry_key = soroban_sdk::Symbol::new(env, "ADMIN_AUDIT");
+
+        // Evict the oldest entry when the log is at capacity (circular buffer).
         if config.max_entries > 0 && entry_id >= config.max_entries as u64 {
-            // Optionally: delete oldest entry or stop logging
-            // For now, we'll continue logging (circular buffer behavior)
+            let oldest_id = entry_id - config.max_entries as u64;
+            env.storage().instance().remove(&(entry_key.clone(), oldest_id));
         }
 
         // Create the audit event
@@ -185,7 +187,6 @@ impl AdminAuditLog {
             .unwrap_or_else(|_| panic_with_error!(env, ErrorCode::ValidationError));
 
         // Store the event using entry_id as part of the key
-        let entry_key = soroban_sdk::Symbol::new(env, "ADMIN_AUDIT");
         env.storage().instance().set(&(entry_key, entry_id), &event);
         env.storage()
             .instance()
@@ -292,5 +293,39 @@ mod tests {
         assert!(config.enabled);
         assert_eq!(config.max_entries, 10000);
         assert_eq!(config.ttl_seconds, 31_536_000);
+    }
+
+    #[test]
+    fn test_max_entries_enforced() {
+        let env = soroban_sdk::Env::default();
+        let admin =
+            <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
+        let contract_id =
+            env.register_contract(None, crate::contract::AnchorKitContract);
+
+        env.as_contract(&contract_id, &|| {
+            AdminAuditLog::set_config(
+                &env,
+                &AdminAuditLogConfig {
+                    enabled: true,
+                    max_entries: 2,
+                    ttl_seconds: 1000,
+                },
+            );
+
+            for _ in 0..3 {
+                AdminAuditLog::log_change(&env, &admin, "chg", "tgt", "old", "new");
+            }
+
+            // Entry 0 must have been evicted; entries 1 and 2 must survive.
+            assert!(AdminAuditLog::get_entry(&env, 0).is_none());
+            assert!(AdminAuditLog::get_entry(&env, 1).is_some());
+            assert!(AdminAuditLog::get_entry(&env, 2).is_some());
+            // No more than max_entries readable records remain.
+            let readable = (0..AdminAuditLog::get_entry_count(&env))
+                .filter(|id| AdminAuditLog::get_entry(&env, *id).is_some())
+                .count();
+            assert_eq!(readable, 2);
+        });
     }
 }
