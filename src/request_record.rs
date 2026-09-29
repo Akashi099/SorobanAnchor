@@ -211,7 +211,7 @@ pub struct ExportBatch {
 /// let mut store = RequestRecordStore::new(policy);
 ///
 /// for i in 0..10_u64 {
-///     store.push(RequestRecord::new(i, 1_000 + i, "attest", "GXXX", "accepted", None::<&str>));
+///     store.push(RequestRecord::new(i, 1_000 + i, "attest", "GXXX", "accepted", None::<&str>), 0);
 /// }
 /// // Only 5 most-recent records are kept.
 /// assert_eq!(store.len(), 5);
@@ -235,11 +235,12 @@ impl RequestRecordStore {
     /// Push a new record into the store.
     ///
     /// If `policy.prune_on_write` is `true`, the retention policy is enforced
-    /// immediately after insertion.
-    pub fn push(&mut self, record: RequestRecord) {
+    /// immediately after insertion. `now_secs` is the current Unix timestamp
+    /// used for age-based pruning; pass `0` to skip age pruning on this write.
+    pub fn push(&mut self, record: RequestRecord, now_secs: u64) {
         self.records.push(record);
         if self.policy.prune_on_write {
-            self.enforce_policy(0);
+            self.enforce_policy(now_secs);
         }
     }
 
@@ -478,7 +479,7 @@ mod tests {
         let policy = RequestRetentionPolicy::new(3, 0, true);
         let mut store = RequestRecordStore::new(policy);
         for i in 0..5_u64 {
-            store.push(make_record(i, 1_000 + i));
+            store.push(make_record(i, 1_000 + i), 0);
         }
         // Only the 3 most-recent records should remain.
         assert_eq!(store.len(), 3);
@@ -491,9 +492,24 @@ mod tests {
         let policy = RequestRetentionPolicy::new(0, 0, true);
         let mut store = RequestRecordStore::new(policy);
         for i in 0..50_u64 {
-            store.push(make_record(i, i));
+            store.push(make_record(i, i), 0);
         }
         assert_eq!(store.len(), 50);
+    }
+
+    #[test]
+    fn test_push_enforces_age_pruning_on_write() {
+        // max_age_seconds=100: records older than (now - 100) should be pruned on push.
+        let policy = RequestRetentionPolicy::new(0, 100, true);
+        let mut store = RequestRecordStore::new(policy);
+
+        // Push a record that is already older than the age limit at write time.
+        store.push(make_record(1, 800), 1_000); // cutoff = 900; ts=800 < 900 → pruned
+        assert_eq!(store.len(), 0, "record older than age limit must be pruned on write");
+
+        // Push a record that is within the age limit.
+        store.push(make_record(2, 950), 1_000); // ts=950 >= 900 → kept
+        assert_eq!(store.len(), 1, "record within age limit must be retained");
     }
 
     // ── enforce_policy (age-based) ───────────────────────────────────────────

@@ -131,7 +131,17 @@ pub struct DeduplicationStore {
 
 impl DeduplicationStore {
     /// Create a new store with the given default TTL (seconds).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `default_ttl_secs` is `0`. A zero TTL would cause every entry
+    /// to expire immediately, making deduplication ineffective. Use a positive
+    /// value; there is no "unlimited" TTL mode.
     pub fn new(default_ttl_secs: u64) -> Self {
+        assert!(
+            default_ttl_secs > 0,
+            "default_ttl_secs must be greater than zero; a zero TTL causes every entry to expire immediately"
+        );
         DeduplicationStore {
             default_ttl_secs,
             max_entries: 0,
@@ -144,7 +154,15 @@ impl DeduplicationStore {
     /// When `max_entries > 0` the insertion path evicts expired entries before
     /// adding a new key, and skips the insertion if the store is still full
     /// after eviction.  `max_entries == 0` disables the cap (same as [`new`]).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `default_ttl_secs` is `0` (same reason as [`new`]).
     pub fn with_capacity(default_ttl_secs: u64, max_entries: usize) -> Self {
+        assert!(
+            default_ttl_secs > 0,
+            "default_ttl_secs must be greater than zero; a zero TTL causes every entry to expire immediately"
+        );
         DeduplicationStore {
             default_ttl_secs,
             max_entries,
@@ -337,6 +355,18 @@ where
 mod tests {
     use super::*;
     use alloc::vec;
+
+    #[test]
+    #[should_panic(expected = "default_ttl_secs must be greater than zero")]
+    fn zero_ttl_is_rejected_by_new() {
+        let _ = DeduplicationStore::new(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "default_ttl_secs must be greater than zero")]
+    fn zero_ttl_is_rejected_by_with_capacity() {
+        let _ = DeduplicationStore::with_capacity(0, 10);
+    }
 
     #[test]
     fn first_call_is_not_duplicate() {
