@@ -20,6 +20,7 @@ extern crate alloc;
 use alloc::{string::String, vec::Vec};
 
 use crate::errors::{AnchorKitError, ErrorCode};
+use crate::url_normalizer::normalize_url;
 
 // ---------------------------------------------------------------------------
 // Core types
@@ -160,6 +161,14 @@ impl TransactionArchiveManager {
             return Err(AnchorKitError::validation_error(
                 "transaction_ids must not contain blank IDs",
             ));
+        }
+        if label.trim().is_empty() {
+            return Err(AnchorKitError::validation_error("label must not be blank"));
+        }
+        if let Some(uri) = &retrieval_uri {
+            normalize_url(uri).map_err(|_| {
+                AnchorKitError::validation_error("retrieval_uri: invalid URL shape")
+            })?;
         }
 
         let commitment = compute_archive_commitment(transaction_ids);
@@ -328,6 +337,45 @@ mod tests {
     fn set_retrieval_uri_returns_false_for_unknown_id() {
         let mut mgr = TransactionArchiveManager::new();
         assert!(!mgr.set_retrieval_uri(42, "uri".into()));
+    }
+
+    #[test]
+    fn archive_blank_label_rejected_before_storage() {
+        let mut mgr = TransactionArchiveManager::new();
+        let err = mgr
+            .archive(&ids(&["txn-001"]), 1000, "   ".into(), None)
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::ValidationError);
+        assert_eq!(mgr.archive_count(), 0);
+    }
+
+    #[test]
+    fn archive_malformed_retrieval_uri_rejected_before_storage() {
+        let mut mgr = TransactionArchiveManager::new();
+        let err = mgr
+            .archive(&ids(&["txn-001"]), 1000, "batch-1".into(), Some("not-a-uri".into()))
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::ValidationError);
+        assert_eq!(mgr.archive_count(), 0);
+    }
+
+    #[test]
+    fn archive_valid_metadata_stored_unchanged() {
+        let mut mgr = TransactionArchiveManager::new();
+        let archive = mgr
+            .archive(
+                &ids(&["txn-001"]),
+                1000,
+                "batch-1".into(),
+                Some("https://example.com/archive".into()),
+            )
+            .unwrap();
+        assert_eq!(archive.label, "batch-1");
+        assert_eq!(
+            archive.retrieval_uri.as_deref(),
+            Some("https://example.com/archive")
+        );
+        assert_eq!(mgr.archive_count(), 1);
     }
 
     #[test]
