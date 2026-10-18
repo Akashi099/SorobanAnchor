@@ -8,8 +8,8 @@
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
-use anchorkit::normalize_stellar_account_id;
 use anchorkit::config::{parse_runtime_config_str, ConfigFormat};
+use anchorkit::normalize_stellar_account_id;
 
 // ── SecretKey wrapper ─────────────────────────────────────────────────────────
 //
@@ -19,8 +19,12 @@ use anchorkit::config::{parse_runtime_config_str, ConfigFormat};
 struct SecretKey(String);
 
 impl SecretKey {
-    fn new(raw: impl Into<String>) -> Self { Self(raw.into()) }
-    fn expose(&self) -> &str { &self.0 }
+    fn new(raw: impl Into<String>) -> Self {
+        Self(raw.into())
+    }
+    fn expose(&self) -> &str {
+        &self.0
+    }
 }
 
 impl std::fmt::Debug for SecretKey {
@@ -37,11 +41,15 @@ impl std::fmt::Display for SecretKey {
 
 impl std::ops::Deref for SecretKey {
     type Target = str;
-    fn deref(&self) -> &str { &self.0 }
+    fn deref(&self) -> &str {
+        &self.0
+    }
 }
 
 impl AsRef<std::ffi::OsStr> for SecretKey {
-    fn as_ref(&self) -> &std::ffi::OsStr { self.0.as_ref() }
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.0.as_ref()
+    }
 }
 
 impl Drop for SecretKey {
@@ -83,14 +91,17 @@ enum NetworkProfileError {
 impl std::fmt::Display for NetworkProfileError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            NetworkProfileError::IoError(msg) =>
-                write!(f, "could not read networks.json: {msg}"),
-            NetworkProfileError::MalformedJson(msg) =>
-                write!(f, "networks.json contains invalid JSON: {msg}"),
-            NetworkProfileError::InvalidProfile { index, reason } =>
-                write!(f, "network profile at index {index} is invalid: {reason}"),
-            NetworkProfileError::MissingFile =>
-                write!(f, "networks.json is missing (expected at ~/.anchorkit/networks.json)"),
+            NetworkProfileError::IoError(msg) => write!(f, "could not read networks.json: {msg}"),
+            NetworkProfileError::MalformedJson(msg) => {
+                write!(f, "networks.json contains invalid JSON: {msg}")
+            },
+            NetworkProfileError::InvalidProfile { index, reason } => {
+                write!(f, "network profile at index {index} is invalid: {reason}")
+            },
+            NetworkProfileError::MissingFile => write!(
+                f,
+                "networks.json is missing (expected at ~/.anchorkit/networks.json)"
+            ),
         }
     }
 }
@@ -104,10 +115,17 @@ fn validate_network_profile(profile: &NetworkProfile) -> Result<(), String> {
         return Err("'name' must not be empty".to_string());
     }
     if profile.name.len() > 64 {
-        return Err(format!("'name' is too long ({} chars, max 64)", profile.name.len()));
+        return Err(format!(
+            "'name' is too long ({} chars, max 64)",
+            profile.name.len()
+        ));
     }
     // Names must be URL-safe identifiers: alphanumeric, hyphens, underscores.
-    if !profile.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+    if !profile
+        .name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
         return Err(format!(
             "'name' contains invalid characters (only alphanumeric, '-', '_' allowed): '{}'",
             profile.name
@@ -117,18 +135,16 @@ fn validate_network_profile(profile: &NetworkProfile) -> Result<(), String> {
         return Err("'rpc_url' must not be empty".to_string());
     }
     // Issue #1129: Use structural URL validation via url crate
-    validate_url_structural(&profile.rpc_url).map_err(|e| {
-        format!("'rpc_url' is not a valid HTTP(S) URL: {}", e)
-    })?;
+    validate_url_structural(&profile.rpc_url)
+        .map_err(|e| format!("'rpc_url' is not a valid HTTP(S) URL: {}", e))?;
     if profile.network_passphrase.trim().is_empty() {
         return Err("'network_passphrase' must not be empty".to_string());
     }
     if let Some(ref h) = profile.horizon_url {
         if !h.trim().is_empty() {
             // Issue #1129: Use structural URL validation for horizon_url
-            validate_url_structural(h).map_err(|e| {
-                format!("'horizon_url' is not a valid HTTP(S) URL: {}", e)
-            })?;
+            validate_url_structural(h)
+                .map_err(|e| format!("'horizon_url' is not a valid HTTP(S) URL: {}", e))?;
         }
     }
     Ok(())
@@ -144,30 +160,30 @@ fn validate_network_profile(profile: &NetworkProfile) -> Result<(), String> {
 /// - Does not contain control characters
 fn validate_url_structural(input: &str) -> Result<(), String> {
     use url::Url;
-    
+
     let parsed = Url::parse(input).map_err(|e| format!("malformed URL: {}", e))?;
-    
+
     // Must use http or https
     let scheme = parsed.scheme();
     if scheme != "http" && scheme != "https" {
         return Err(format!("scheme must be http or https, got: {}", scheme));
     }
-    
+
     // Must have a host
     if parsed.host().is_none() {
         return Err("missing host/authority".to_string());
     }
-    
+
     // Reject embedded credentials
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err("embedded credentials not allowed in URL".to_string());
     }
-    
+
     // Check for control characters in the original input
     if input.chars().any(|c| c.is_control()) {
         return Err("control characters not allowed in URL".to_string());
     }
-    
+
     Ok(())
 }
 
@@ -194,7 +210,7 @@ fn load_network_profiles_with_diagnostics() -> (Vec<NetworkProfile>, Vec<Network
                 Vec::new(),
                 vec![NetworkProfileError::IoError(e.to_string())],
             );
-        }
+        },
     };
 
     // An empty file is treated as an empty profile set.
@@ -211,7 +227,7 @@ fn load_network_profiles_with_diagnostics() -> (Vec<NetworkProfile>, Vec<Network
                 Vec::new(),
                 vec![NetworkProfileError::MalformedJson(e.to_string())],
             );
-        }
+        },
     };
 
     // The file must contain a JSON array at the top level.
@@ -237,15 +253,13 @@ fn load_network_profiles_with_diagnostics() -> (Vec<NetworkProfile>, Vec<Network
                     index,
                     reason: format!("deserialization failed: {e}"),
                 });
-            }
-            Ok(profile) => {
-                match validate_network_profile(&profile) {
-                    Ok(()) => valid_profiles.push(profile),
-                    Err(reason) => {
-                        errors.push(NetworkProfileError::InvalidProfile { index, reason });
-                    }
-                }
-            }
+            },
+            Ok(profile) => match validate_network_profile(&profile) {
+                Ok(()) => valid_profiles.push(profile),
+                Err(reason) => {
+                    errors.push(NetworkProfileError::InvalidProfile { index, reason });
+                },
+            },
         }
     }
 
@@ -296,14 +310,14 @@ fn save_network_profiles(profiles: &[NetworkProfile]) {
         Err(e) => {
             eprintln!("warning: {e}");
             return;
-        }
+        },
     };
     let json = match serde_json::to_string_pretty(profiles) {
         Ok(j) => j,
         Err(e) => {
             eprintln!("warning: could not serialize network profiles: {e}");
             return;
-        }
+        },
     };
     if let Err(e) = std::fs::write(&path, json) {
         eprintln!("warning: could not write {}: {e}", path.display());
@@ -355,7 +369,8 @@ fn passphrase_for(network: &str) -> String {
 
 fn default_network() -> String {
     let profiles = load_network_profiles();
-    profiles.iter()
+    profiles
+        .iter()
         .find(|p| p.is_default)
         .map(|p| p.name.clone())
         .unwrap_or_else(|| "testnet".to_string())
@@ -491,14 +506,16 @@ fn resolve_source(
         Ok(key) => SecretKey::new(key),
         Err(msg) if msg.starts_with("__keystore__") => {
             let name = &msg["__keystore__".len()..];
-            let password = rpassword::prompt_password("Keystore password: ")
-                .unwrap_or_else(|e| { eprintln!("error: failed to read password: {e}"); std::process::exit(1); });
+            let password = rpassword::prompt_password("Keystore password: ").unwrap_or_else(|e| {
+                eprintln!("error: failed to read password: {e}");
+                std::process::exit(1);
+            });
             keystore_get_decrypted(name, &password)
-        }
+        },
         Err(msg) => {
             eprintln!("error: {msg}");
             std::process::exit(1);
-        }
+        },
     }
 }
 
@@ -508,7 +525,7 @@ fn normalize_stellar_public_address(field: &str, address: &str) -> String {
         Err(err) => {
             eprintln!("error: invalid {field}: {0}", err.message);
             std::process::exit(1);
-        }
+        },
     }
 }
 
@@ -516,17 +533,17 @@ fn normalize_stellar_public_address(field: &str, address: &str) -> String {
 
 fn rpc_url(network: &str) -> &'static str {
     match network {
-        "mainnet"   => "https://horizon.stellar.org",
+        "mainnet" => "https://horizon.stellar.org",
         "futurenet" => "https://rpc-futurenet.stellar.org",
-        _           => "https://soroban-testnet.stellar.org",
+        _ => "https://soroban-testnet.stellar.org",
     }
 }
 
 fn passphrase(network: &str) -> &'static str {
     match network {
-        "mainnet"   => "Public Global Stellar Network ; September 2015",
+        "mainnet" => "Public Global Stellar Network ; September 2015",
         "futurenet" => "Test SDF Future Network ; October 2022",
-        _           => "Test SDF Network ; September 2015",
+        _ => "Test SDF Network ; September 2015",
     }
 }
 
@@ -625,68 +642,105 @@ enum Commands {
     },
     /// Register an attestor
     Register {
-        #[arg(long)] address: String,
-        #[arg(long, value_delimiter = ',')] services: Vec<String>,
-        #[arg(long)] contract_id: Option<String>,
-        #[arg(long, default_value = "testnet")] network: String,
-        #[arg(long)] secret_key: Option<String>,
-        #[arg(long)] keypair_file: Option<String>,
+        #[arg(long)]
+        address: String,
+        #[arg(long, value_delimiter = ',')]
+        services: Vec<String>,
+        #[arg(long)]
+        contract_id: Option<String>,
+        #[arg(long, default_value = "testnet")]
+        network: String,
+        #[arg(long)]
+        secret_key: Option<String>,
+        #[arg(long)]
+        keypair_file: Option<String>,
         /// Name of a credential stored in the keystore (alternative to --secret-key)
-        #[arg(long)] credential_name: Option<String>,
-        #[arg(long)] sep10_token: String,
-        #[arg(long)] sep10_issuer: String,
+        #[arg(long)]
+        credential_name: Option<String>,
+        #[arg(long)]
+        sep10_token: String,
+        #[arg(long)]
+        sep10_issuer: String,
     },
     /// Submit an attestation
     Attest {
-        #[arg(long)] subject: String,
-        #[arg(long)] payload_hash: String,
-        #[arg(long)] contract_id: Option<String>,
-        #[arg(long, default_value = "testnet")] network: String,
-        #[arg(long)] secret_key: Option<String>,
-        #[arg(long)] keypair_file: Option<String>,
+        #[arg(long)]
+        subject: String,
+        #[arg(long)]
+        payload_hash: String,
+        #[arg(long)]
+        contract_id: Option<String>,
+        #[arg(long, default_value = "testnet")]
+        network: String,
+        #[arg(long)]
+        secret_key: Option<String>,
+        #[arg(long)]
+        keypair_file: Option<String>,
         /// Name of a credential stored in the keystore (alternative to --secret-key)
-        #[arg(long)] credential_name: Option<String>,
-        #[arg(long)] issuer: String,
-        #[arg(long)] session_id: Option<u64>,
+        #[arg(long)]
+        credential_name: Option<String>,
+        #[arg(long)]
+        issuer: String,
+        #[arg(long)]
+        session_id: Option<u64>,
         /// Ed25519 secret key (Stellar 'S...' format) used to sign the payload.
         /// If omitted, the transaction source key (--secret-key / --keypair-file) is used.
-        #[arg(long)] signing_key: Option<String>,
+        #[arg(long)]
+        signing_key: Option<String>,
     },
     /// Get the best quote for a currency pair
     Quote {
         /// Source asset code (e.g. USDC)
-        #[arg(long)] from: String,
+        #[arg(long)]
+        from: String,
         /// Destination asset code (e.g. XLM)
-        #[arg(long)] to: String,
+        #[arg(long)]
+        to: String,
         /// Amount in base asset units
-        #[arg(long)] amount: u64,
-        #[arg(long)] contract_id: Option<String>,
-        #[arg(long, default_value = "testnet")] network: String,
-        #[arg(long)] secret_key: Option<String>,
-        #[arg(long)] keypair_file: Option<String>,
+        #[arg(long)]
+        amount: u64,
+        #[arg(long)]
+        contract_id: Option<String>,
+        #[arg(long, default_value = "testnet")]
+        network: String,
+        #[arg(long)]
+        secret_key: Option<String>,
+        #[arg(long)]
+        keypair_file: Option<String>,
         /// Name of a credential stored in the keystore (alternative to --secret-key)
-        #[arg(long)] credential_name: Option<String>,
+        #[arg(long)]
+        credential_name: Option<String>,
     },
     /// Fetch SEP-6 transaction status from an anchor URL
     Status {
         /// Transaction ID to look up
-        #[arg(long)] tx_id: String,
+        #[arg(long)]
+        tx_id: String,
         /// Anchor base URL (e.g. https://anchor.example.com)
-        #[arg(long)] anchor_url: String,
+        #[arg(long)]
+        anchor_url: String,
         /// Optional HTTP proxy URL for the request (e.g. http://proxy.corp.example.com:3128)
-        #[arg(long)] proxy_url: Option<String>,
+        #[arg(long)]
+        proxy_url: Option<String>,
         /// Comma-separated list of hosts that bypass the proxy (e.g. localhost,127.0.0.1)
-        #[arg(long)] no_proxy: Option<String>,
+        #[arg(long)]
+        no_proxy: Option<String>,
     },
     /// Revoke an attestor
     Revoke {
-        #[arg(long)] address: String,
-        #[arg(long)] contract_id: Option<String>,
-        #[arg(long, default_value = "testnet")] network: String,
-        #[arg(long)] secret_key: Option<String>,
-        #[arg(long)] keypair_file: Option<String>,
+        #[arg(long)]
+        address: String,
+        #[arg(long)]
+        contract_id: Option<String>,
+        #[arg(long, default_value = "testnet")]
+        network: String,
+        #[arg(long)]
+        secret_key: Option<String>,
+        #[arg(long)]
+        keypair_file: Option<String>,
         /// Name of a credential stored in the keystore (alternative to --secret-key)
-        #[arg(long)] credential_name: Option<String>,
+        #[arg(long)]
+        credential_name: Option<String>,
     },
     /// Manage stored credentials (encrypted secret keys)
     Credentials {
@@ -725,13 +779,17 @@ enum Commands {
     /// Fetch and display a stellar.toml from an anchor domain
     Discover {
         /// Anchor base URL (e.g. https://anchor.example.com)
-        #[arg(long)] anchor_url: String,
+        #[arg(long)]
+        anchor_url: String,
         /// Optional HTTP proxy URL (e.g. http://proxy.corp.example.com:3128)
-        #[arg(long)] proxy_url: Option<String>,
+        #[arg(long)]
+        proxy_url: Option<String>,
         /// Comma-separated no-proxy bypass list (e.g. localhost,127.0.0.1)
-        #[arg(long)] no_proxy: Option<String>,
+        #[arg(long)]
+        no_proxy: Option<String>,
         /// Request timeout in seconds (default: 30)
-        #[arg(long, default_value = "30")] timeout: u64,
+        #[arg(long, default_value = "30")]
+        timeout: u64,
     },
     /// Offline operations (config validation, workflow simulation) — no network required
     Offline {
@@ -766,14 +824,17 @@ enum OfflineAction {
     /// Validate config files without network access
     Validate {
         /// Path to a specific config file (validates all in configs/ when omitted)
-        #[arg(long)] config: Option<String>,
+        #[arg(long)]
+        config: Option<String>,
     },
     /// Simulate a named workflow without network access
     Simulate {
         /// Path to a config file (uses configs/ when omitted)
-        #[arg(long)] config: Option<String>,
+        #[arg(long)]
+        config: Option<String>,
         /// Workflow name: deploy | register | attest
-        #[arg(long)] workflow: String,
+        #[arg(long)]
+        workflow: String,
     },
 }
 
@@ -781,20 +842,26 @@ enum OfflineAction {
 enum NetworkAction {
     /// Add a custom network profile
     Add {
-        #[arg(long)] name: String,
-        #[arg(long)] rpc_url: String,
-        #[arg(long)] passphrase: String,
-        #[arg(long)] horizon_url: Option<String>,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        rpc_url: String,
+        #[arg(long)]
+        passphrase: String,
+        #[arg(long)]
+        horizon_url: Option<String>,
     },
     /// List all configured network profiles
     List,
     /// Remove a custom network profile
     Remove {
-        #[arg(long)] name: String,
+        #[arg(long)]
+        name: String,
     },
     /// Set the default network
     SetDefault {
-        #[arg(long)] name: String,
+        #[arg(long)]
+        name: String,
     },
 }
 
@@ -802,19 +869,23 @@ enum NetworkAction {
 enum CredentialsAction {
     /// Store an encrypted credential
     Add {
-        #[arg(long)] name: String,
+        #[arg(long)]
+        name: String,
         /// Secret key value (prompted if omitted)
-        #[arg(long)] value: Option<String>,
+        #[arg(long)]
+        value: Option<String>,
     },
     /// Retrieve and print a stored credential
     Get {
-        #[arg(long)] name: String,
+        #[arg(long)]
+        name: String,
     },
     /// List all stored credential names
     List,
     /// Remove a stored credential
     Remove {
-        #[arg(long)] name: String,
+        #[arg(long)]
+        name: String,
     },
     /// Rotate the keystore password, re-encrypting all stored credentials
     Rotate,
@@ -866,7 +937,9 @@ fn deployments_path() -> std::path::PathBuf {
 
 fn load_deployments() -> Vec<DeploymentRecord> {
     let path = deployments_path();
-    if !path.exists() { return Vec::new(); }
+    if !path.exists() {
+        return Vec::new();
+    }
     let content = std::fs::read_to_string(&path).unwrap_or_default();
     serde_json::from_str(&content).unwrap_or_default()
 }
@@ -931,12 +1004,19 @@ fn upgrade_contract(contract_id: &str, network: &str, source: &SecretKey) {
     println!("Building WASM...");
     let build = std::process::Command::new("cargo")
         .args([
-            "build", "--release",
-            "--target", "wasm32-unknown-unknown",
-            "--no-default-features", "--features", "wasm",
+            "build",
+            "--release",
+            "--target",
+            "wasm32-unknown-unknown",
+            "--no-default-features",
+            "--features",
+            "wasm",
         ])
         .status()
-        .unwrap_or_else(|e| { eprintln!("error: failed to run cargo build: {e}"); std::process::exit(1); });
+        .unwrap_or_else(|e| {
+            eprintln!("error: failed to run cargo build: {e}");
+            std::process::exit(1);
+        });
     if !build.success() {
         eprintln!("WASM build failed");
         std::process::exit(1);
@@ -965,20 +1045,29 @@ fn upgrade_contract(contract_id: &str, network: &str, source: &SecretKey) {
         std::process::exit(1);
     }
 
-    let new_wasm_hash = String::from_utf8_lossy(&upload_output.stdout).trim().to_string();
+    let new_wasm_hash = String::from_utf8_lossy(&upload_output.stdout)
+        .trim()
+        .to_string();
     println!("New WASM hash: {new_wasm_hash}");
 
     // Call upgrade() on the contract.
     println!("Calling upgrade() on contract {contract_id}...");
-    stellar_invoke(contract_id, source, network, &[
-        "upgrade",
-        "--new_wasm_hash", &new_wasm_hash,
-    ]);
+    stellar_invoke(
+        contract_id,
+        source,
+        network,
+        &["upgrade", "--new_wasm_hash", &new_wasm_hash],
+    );
 
     // Call migrate() to apply state-schema changes.
     // Pass new_schema_version = 1 for the initial migration after upgrade.
     println!("Calling migrate() on contract {contract_id}...");
-    stellar_invoke(contract_id, source, network, &["migrate", "--new_schema_version", "1"]);
+    stellar_invoke(
+        contract_id,
+        source,
+        network,
+        &["migrate", "--new_schema_version", "1"],
+    );
 
     println!("✅ Contract upgraded successfully.");
     println!("   Contract ID : {contract_id}");
@@ -1029,14 +1118,25 @@ fn confirm_mainnet_deploy(network: &str, yes: bool, no_interactive: bool) -> boo
     matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
-fn deploy(network: &str, source: &str, admin: Option<&str>, dry_run: bool, list: bool, yes: bool, no_interactive: bool) {
+fn deploy(
+    network: &str,
+    source: &str,
+    admin: Option<&str>,
+    dry_run: bool,
+    list: bool,
+    yes: bool,
+    no_interactive: bool,
+) {
     // --list: print deployment history and exit
     if list {
         let records = load_deployments();
         if records.is_empty() {
             println!("No deployments recorded.");
         } else {
-            println!("{}", serde_json::to_string_pretty(&records).unwrap_or_default());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&records).unwrap_or_default()
+            );
         }
         return;
     }
@@ -1068,11 +1168,24 @@ fn deploy(network: &str, source: &str, admin: Option<&str>, dry_run: bool, list:
     // Build WASM
     println!("Building WASM...");
     let build = std::process::Command::new("cargo")
-        .args(["build", "--release", "--target", "wasm32-unknown-unknown",
-               "--no-default-features", "--features", "wasm"])
+        .args([
+            "build",
+            "--release",
+            "--target",
+            "wasm32-unknown-unknown",
+            "--no-default-features",
+            "--features",
+            "wasm",
+        ])
         .status()
-        .unwrap_or_else(|e| { eprintln!("error: failed to run cargo build: {e}"); std::process::exit(1); });
-    if !build.success() { eprintln!("WASM build failed"); std::process::exit(1); }
+        .unwrap_or_else(|e| {
+            eprintln!("error: failed to run cargo build: {e}");
+            std::process::exit(1);
+        });
+    if !build.success() {
+        eprintln!("WASM build failed");
+        std::process::exit(1);
+    }
 
     let wasm = "target/wasm32-unknown-unknown/release/anchorkit.wasm";
     println!("Deploying {wasm} to {network}...");
@@ -1099,7 +1212,9 @@ fn deploy(network: &str, source: &str, admin: Option<&str>, dry_run: bool, list:
 
     // Save to deployments.json
     let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     let mut records = load_deployments();
     let mut record = DeploymentRecord {
         contract_id: contract_id.clone(),
@@ -1116,31 +1231,40 @@ fn deploy(network: &str, source: &str, admin: Option<&str>, dry_run: bool, list:
     let admin_addr = admin.unwrap_or("default");
     println!("Initializing contract with admin {admin_addr}...");
     let init_result = std::process::Command::new("stellar")
-        .args(["contract", "invoke",
-               "--id", &contract_id,
-               // SECURITY: `source` passed only as subprocess arg, not logged.
-               "--source", source,
-               "--rpc-url", &net_url,
-               "--network-passphrase", &net_phrase,
-               "--", "initialize",
-               "--admin", admin_addr])
+        .args([
+            "contract",
+            "invoke",
+            "--id",
+            &contract_id,
+            // SECURITY: `source` passed only as subprocess arg, not logged.
+            "--source",
+            source,
+            "--rpc-url",
+            &net_url,
+            "--network-passphrase",
+            &net_phrase,
+            "--",
+            "initialize",
+            "--admin",
+            admin_addr,
+        ])
         .output();
 
     match init_result {
         Ok(out) if out.status.success() => {
             println!("✅ Contract initialized.");
             record.initialized = true;
-        }
+        },
         Ok(out) => {
             eprintln!("⚠️  Post-deployment initialization failed:");
             eprintln!("{}", String::from_utf8_lossy(&out.stderr).trim());
             eprintln!("\nContract ID: {contract_id}");
             eprintln!("To initialize manually: stellar contract invoke --id {contract_id} --source <SIGNING_KEY_OR_ALIAS> -- initialize --admin <ADMIN_ADDRESS>");
-        }
+        },
         Err(e) => {
             eprintln!("⚠️  Could not run initialization: {e}");
             eprintln!("Contract ID: {contract_id}");
-        }
+        },
     }
 
     records.push(record);
@@ -1149,25 +1273,41 @@ fn deploy(network: &str, source: &str, admin: Option<&str>, dry_run: bool, list:
 }
 
 fn parse_services(services: &[String]) -> Vec<u32> {
-    services.iter().map(|s| match s.trim() {
-        "deposits"    => 1,
-        "withdrawals" => 2,
-        "quotes"      => 3,
-        "kyc"         => 4,
-        other => { eprintln!("Unknown service: {other}"); std::process::exit(1); }
-    }).collect()
+    services
+        .iter()
+        .map(|s| match s.trim() {
+            "deposits" => 1,
+            "withdrawals" => 2,
+            "quotes" => 3,
+            "kyc" => 4,
+            other => {
+                eprintln!("Unknown service: {other}");
+                std::process::exit(1);
+            },
+        })
+        .collect()
 }
 
 fn derive_ed25519_public_key_hex(source: &str) -> String {
     use stellar_strkey::Strkey;
-    let strkey = Strkey::from_string(source)
-        .unwrap_or_else(|e| { eprintln!("error: invalid secret key '{}': {e}", source); std::process::exit(1); });
+    let strkey = Strkey::from_string(source).unwrap_or_else(|e| {
+        eprintln!("error: invalid secret key '{}': {e}", source);
+        std::process::exit(1);
+    });
     let seed = match strkey {
         Strkey::PrivateKeyEd25519(k) => k.0,
-        _ => { eprintln!("error: expected an Ed25519 secret key (starts with 'S')"); std::process::exit(1); }
+        _ => {
+            eprintln!("error: expected an Ed25519 secret key (starts with 'S')");
+            std::process::exit(1);
+        },
     };
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
-    signing_key.verifying_key().as_bytes().iter().map(|b| format!("{:02x}", b)).collect()
+    signing_key
+        .verifying_key()
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect()
 }
 
 /// Decode a lowercase hex string to bytes, returning an error on invalid input.
@@ -1186,24 +1326,38 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
 /// `payload_hash` is decoded from hex if it is a valid even-length hex string;
 /// otherwise its UTF-8 bytes are signed directly.
 fn compute_ed25519_signature_hex(secret_key_str: &str, payload_hash: &str) -> String {
-    use stellar_strkey::Strkey;
     use ed25519_dalek::Signer;
-    let strkey = Strkey::from_string(secret_key_str)
-        .unwrap_or_else(|e| { eprintln!("error: invalid signing key: {e}"); std::process::exit(1); });
+    use stellar_strkey::Strkey;
+    let strkey = Strkey::from_string(secret_key_str).unwrap_or_else(|e| {
+        eprintln!("error: invalid signing key: {e}");
+        std::process::exit(1);
+    });
     let seed = match strkey {
         Strkey::PrivateKeyEd25519(k) => k.0,
-        _ => { eprintln!("error: signing key must be an Ed25519 secret key (starts with 'S')"); std::process::exit(1); }
+        _ => {
+            eprintln!("error: signing key must be an Ed25519 secret key (starts with 'S')");
+            std::process::exit(1);
+        },
     };
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
-    let payload_bytes = decode_hex(payload_hash)
-        .unwrap_or_else(|_| payload_hash.as_bytes().to_vec());
+    let payload_bytes =
+        decode_hex(payload_hash).unwrap_or_else(|_| payload_hash.as_bytes().to_vec());
     let signature = signing_key.sign(&payload_bytes);
-    signature.to_bytes().iter().map(|b| format!("{:02x}", b)).collect()
+    signature
+        .to_bytes()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect()
 }
 
 fn register(
-    address: &str, services: &[String], contract_id: &str,
-    network: &str, source: &SecretKey, sep10_token: &str, sep10_issuer: &str,
+    address: &str,
+    services: &[String],
+    contract_id: &str,
+    network: &str,
+    source: &SecretKey,
+    sep10_token: &str,
+    sep10_issuer: &str,
 ) {
     if let Err(e) = validate_services_arg(services) {
         eprintln!("error: {e}");
@@ -1213,33 +1367,60 @@ fn register(
     let address = normalize_stellar_public_address("attestor address", address);
     let sep10_issuer = normalize_stellar_public_address("SEP-10 issuer address", sep10_issuer);
     let service_ids = parse_services(services)
-        .iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
 
     let pk_hex = derive_ed25519_public_key_hex(source);
-    stellar_invoke(contract_id, source, network, &[
-        "register_attestor",
-        "--attestor", &address,
-        "--sep10_token", sep10_token,
-        "--sep10_issuer", &sep10_issuer,
-        "--public_key", &pk_hex,
-    ]);
-    stellar_invoke(contract_id, source, network, &[
-        "configure_services",
-        "--anchor", &address,
-        "--services", &service_ids,
-    ]);
+    stellar_invoke(
+        contract_id,
+        source,
+        network,
+        &[
+            "register_attestor",
+            "--attestor",
+            &address,
+            "--sep10_token",
+            sep10_token,
+            "--sep10_issuer",
+            &sep10_issuer,
+            "--public_key",
+            &pk_hex,
+        ],
+    );
+    stellar_invoke(
+        contract_id,
+        source,
+        network,
+        &[
+            "configure_services",
+            "--anchor",
+            &address,
+            "--services",
+            &service_ids,
+        ],
+    );
     println!("Attestor {address} registered and services configured.");
 }
 
 fn attest(
-    subject: &str, payload_hash: &str, contract_id: &str,
-    network: &str, source: &SecretKey, issuer: &str, session_id: Option<u64>,
+    subject: &str,
+    payload_hash: &str,
+    contract_id: &str,
+    network: &str,
+    source: &SecretKey,
+    issuer: &str,
+    session_id: Option<u64>,
     signing_key: Option<&str>,
 ) {
     let subject = normalize_stellar_public_address("subject address", subject);
     let issuer = normalize_stellar_public_address("issuer address", issuer);
     let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs().to_string();
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string();
 
     // Use the dedicated signing key when provided; fall back to the transaction source key,
     // which is the same key registered via `anchorkit register --public-key`.
@@ -1249,22 +1430,45 @@ fn attest(
     let session_str;
     let result = if let Some(sid) = session_id {
         session_str = sid.to_string();
-        stellar_invoke(contract_id, source, network, &[
-            "submit_attestation_with_session",
-            "--session_id", &session_str,
-            "--issuer", &issuer, "--subject", &subject,
-            "--timestamp", &timestamp,
-            "--payload_hash", payload_hash,
-            "--signature", &signature,
-        ])
+        stellar_invoke(
+            contract_id,
+            source,
+            network,
+            &[
+                "submit_attestation_with_session",
+                "--session_id",
+                &session_str,
+                "--issuer",
+                &issuer,
+                "--subject",
+                &subject,
+                "--timestamp",
+                &timestamp,
+                "--payload_hash",
+                payload_hash,
+                "--signature",
+                &signature,
+            ],
+        )
     } else {
-        stellar_invoke(contract_id, source, network, &[
-            "submit_attestation",
-            "--issuer", &issuer, "--subject", &subject,
-            "--timestamp", &timestamp,
-            "--payload_hash", payload_hash,
-            "--signature", &signature,
-        ])
+        stellar_invoke(
+            contract_id,
+            source,
+            network,
+            &[
+                "submit_attestation",
+                "--issuer",
+                &issuer,
+                "--subject",
+                &subject,
+                "--timestamp",
+                &timestamp,
+                "--payload_hash",
+                payload_hash,
+                "--signature",
+                &signature,
+            ],
+        )
     };
     println!("Attestation ID: {result}");
 }
@@ -1272,17 +1476,30 @@ fn attest(
 fn quote(from: &str, to: &str, amount: u64, contract_id: &str, network: &str, source: &SecretKey) {
     let amount_str = amount.to_string();
     // route_transaction takes a RoutingOptions XDR; pass individual fields via stellar CLI args
-    let raw = stellar_invoke(contract_id, source, network, &[
-        "route_transaction",
-        "--base_asset", from,
-        "--quote_asset", to,
-        "--amount", &amount_str,
-        "--operation_type", "1",   // 1 = deposit
-        "--strategy", "LowestFee",
-        "--min_reputation", "0",
-        "--max_anchors", "10",
-        "--require_kyc", "false",
-    ]);
+    let raw = stellar_invoke(
+        contract_id,
+        source,
+        network,
+        &[
+            "route_transaction",
+            "--base_asset",
+            from,
+            "--quote_asset",
+            to,
+            "--amount",
+            &amount_str,
+            "--operation_type",
+            "1", // 1 = deposit
+            "--strategy",
+            "LowestFee",
+            "--min_reputation",
+            "0",
+            "--max_anchors",
+            "10",
+            "--require_kyc",
+            "false",
+        ],
+    );
 
     // The stellar CLI returns XDR or JSON; parse as JSON first, fall back to raw print
     let out: QuoteOutput = serde_json::from_str(&raw).unwrap_or_else(|_| {
@@ -1292,12 +1509,19 @@ fn quote(from: &str, to: &str, amount: u64, contract_id: &str, network: &str, so
     });
     match serde_json::to_string_pretty(&out) {
         Ok(s) => println!("{s}"),
-        Err(e) => { eprintln!("error: failed to serialize quote output: {e}"); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("error: failed to serialize quote output: {e}");
+            std::process::exit(1);
+        },
     }
 }
 
 fn status(tx_id: &str, anchor_url: &str, proxy_url: Option<&str>, no_proxy: Option<&str>) {
-    let url = format!("{}/sep6/transaction?id={}", anchor_url.trim_end_matches('/'), tx_id);
+    let url = format!(
+        "{}/sep6/transaction?id={}",
+        anchor_url.trim_end_matches('/'),
+        tx_id
+    );
 
     // Build a proxy-aware client.
     let proxy_cfg = anchorkit::ProxyConfig {
@@ -1306,48 +1530,86 @@ fn status(tx_id: &str, anchor_url: &str, proxy_url: Option<&str>, no_proxy: Opti
         ..anchorkit::ProxyConfig::default()
     };
     let client = anchorkit::build_client(
-        if proxy_cfg.is_configured() { Some(&proxy_cfg) } else { None },
+        if proxy_cfg.is_configured() {
+            Some(&proxy_cfg)
+        } else {
+            None
+        },
         30,
     )
-    .unwrap_or_else(|e| { eprintln!("error: failed to build HTTP client: {e}"); std::process::exit(1); });
+    .unwrap_or_else(|e| {
+        eprintln!("error: failed to build HTTP client: {e}");
+        std::process::exit(1);
+    });
 
-    let resp = client
-        .get(&url)
-        .send()
-        .unwrap_or_else(|e| { eprintln!("error: request failed: {e}"); std::process::exit(1); });
+    let resp = client.get(&url).send().unwrap_or_else(|e| {
+        eprintln!("error: request failed: {e}");
+        std::process::exit(1);
+    });
 
     if !resp.status().is_success() {
         eprintln!("error: anchor returned HTTP {}", resp.status());
         std::process::exit(1);
     }
 
-    let body: serde_json::Value = resp.json()
-        .unwrap_or_else(|e| { eprintln!("error: invalid JSON from anchor: {e}"); std::process::exit(1); });
+    let body: serde_json::Value = resp.json().unwrap_or_else(|e| {
+        eprintln!("error: invalid JSON from anchor: {e}");
+        std::process::exit(1);
+    });
 
     // SEP-6 wraps the transaction under a "transaction" key
     let tx = body.get("transaction").unwrap_or(&body);
 
-    let kind = tx.get("kind").and_then(|v| v.as_str()).unwrap_or("deposit").to_string();
+    let kind = tx
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("deposit")
+        .to_string();
     let out = StatusOutput {
-        transaction_id: tx.get("id").and_then(|v| v.as_str()).unwrap_or(tx_id).to_string(),
+        transaction_id: tx
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or(tx_id)
+            .to_string(),
         kind,
-        status: tx.get("status").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
-        amount_in:  tx.get("amount_in").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()),
-        amount_out: tx.get("amount_out").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()),
-        amount_fee: tx.get("amount_fee").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()),
-        message:    tx.get("message").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        status: tx
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string(),
+        amount_in: tx
+            .get("amount_in")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse().ok()),
+        amount_out: tx
+            .get("amount_out")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse().ok()),
+        amount_fee: tx
+            .get("amount_fee")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse().ok()),
+        message: tx
+            .get("message")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
     };
     match serde_json::to_string_pretty(&out) {
         Ok(s) => println!("{s}"),
-        Err(e) => { eprintln!("error: failed to serialize status output: {e}"); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("error: failed to serialize status output: {e}");
+            std::process::exit(1);
+        },
     }
 }
 
 fn revoke(address: &str, contract_id: &str, network: &str, source: &SecretKey) {
-    stellar_invoke(contract_id, source, network, &[
-        "revoke_attestor",
-        "--attestor", &address,
-    ]);
+    stellar_invoke(
+        contract_id,
+        source,
+        network,
+        &["revoke_attestor", "--attestor", &address],
+    );
     println!("{{\"revoked\": true, \"address\": \"{address}\"}}");
 }
 
@@ -1361,24 +1623,51 @@ struct CheckResult {
 
 impl CheckResult {
     fn pass(msg: impl Into<String>) -> Self {
-        Self { passed: true, warning: false, message: msg.into() }
+        Self {
+            passed: true,
+            warning: false,
+            message: msg.into(),
+        }
     }
     fn fail(msg: impl Into<String>) -> Self {
-        Self { passed: false, warning: false, message: msg.into() }
+        Self {
+            passed: false,
+            warning: false,
+            message: msg.into(),
+        }
     }
     fn warn(msg: impl Into<String>) -> Self {
-        Self { passed: true, warning: true, message: msg.into() }
+        Self {
+            passed: true,
+            warning: true,
+            message: msg.into(),
+        }
     }
     fn icon(&self) -> &str {
-        if !self.passed { "✗" } else if self.warning { "⚠" } else { "✓" }
+        if !self.passed {
+            "✗"
+        } else if self.warning {
+            "⚠"
+        } else {
+            "✓"
+        }
     }
     fn color(&self) -> &str {
-        if !self.passed { "\x1b[31m" } else if self.warning { "\x1b[33m" } else { "\x1b[32m" }
+        if !self.passed {
+            "\x1b[31m"
+        } else if self.warning {
+            "\x1b[33m"
+        } else {
+            "\x1b[32m"
+        }
     }
 }
 
 fn check_stellar_cli() -> CheckResult {
-    match std::process::Command::new("stellar").arg("--version").output() {
+    match std::process::Command::new("stellar")
+        .arg("--version")
+        .output()
+    {
         Ok(output) => {
             let version_str = String::from_utf8_lossy(&output.stdout);
             if let Some(version_line) = version_str.lines().next() {
@@ -1388,13 +1677,16 @@ fn check_stellar_cli() -> CheckResult {
                         if major >= 21 {
                             return CheckResult::pass(format!("Stellar CLI {} installed", ver));
                         } else {
-                            return CheckResult::fail(format!("Stellar CLI {} found, but v21+ required", ver));
+                            return CheckResult::fail(format!(
+                                "Stellar CLI {} found, but v21+ required",
+                                ver
+                            ));
                         }
                     }
                 }
             }
             CheckResult::warn("Stellar CLI installed but version could not be parsed")
-        }
+        },
         Err(_) => CheckResult::fail("Stellar CLI not found in PATH"),
     }
 }
@@ -1403,7 +1695,7 @@ fn check_wasm_target(fix: bool) -> CheckResult {
     let output = std::process::Command::new("rustup")
         .args(["target", "list", "--installed"])
         .output();
-    
+
     match output {
         Ok(out) => {
             let targets = String::from_utf8_lossy(&out.stdout);
@@ -1422,14 +1714,17 @@ fn check_wasm_target(fix: bool) -> CheckResult {
             } else {
                 CheckResult::fail("wasm32-unknown-unknown target not installed (run: rustup target add wasm32-unknown-unknown)")
             }
-        }
+        },
         Err(_) => CheckResult::fail("rustup not found"),
     }
 }
 
 fn check_contract_id_env() -> CheckResult {
     match std::env::var("ANCHOR_CONTRACT_ID") {
-        Ok(id) if !id.is_empty() => CheckResult::pass(format!("ANCHOR_CONTRACT_ID set: {}", &id[..id.len().min(16)])),
+        Ok(id) if !id.is_empty() => CheckResult::pass(format!(
+            "ANCHOR_CONTRACT_ID set: {}",
+            &id[..id.len().min(16)]
+        )),
         _ => CheckResult::warn("ANCHOR_CONTRACT_ID not set (required for contract operations)"),
     }
 }
@@ -1439,14 +1734,16 @@ fn check_admin_secret_env() -> CheckResult {
         Ok(secret) if !secret.is_empty() && secret.starts_with('S') => {
             // Confirm presence and basic format only — never log the value.
             CheckResult::pass("ANCHOR_ADMIN_SECRET set and appears valid (starts with 'S')")
-        }
+        },
         Ok(secret) if !secret.is_empty() => {
             // Value present but does not look like a Stellar secret key.
             // Do NOT include the value or any prefix in the message.
             CheckResult::fail("ANCHOR_ADMIN_SECRET is set but does not appear to be a valid Stellar secret key (expected 'S...' format)")
-        }
+        },
         Ok(_) => CheckResult::warn("ANCHOR_ADMIN_SECRET is set but empty"),
-        Err(_) => CheckResult::warn("ANCHOR_ADMIN_SECRET not set (required for signing operations)"),
+        Err(_) => {
+            CheckResult::warn("ANCHOR_ADMIN_SECRET not set (required for signing operations)")
+        },
     }
 }
 
@@ -1467,20 +1764,30 @@ fn check_contract_deployment(contract_id: &str, network: &str) -> CheckResult {
 
     let source_str: &str = &*source; // coerce SecretKey → &str for uniform array element type
     let output = std::process::Command::new("stellar")
-        .args(["contract", "invoke",
-               "--id", contract_id,
-               "--source", source_str,
-               "--rpc-url", &rpc_url_for(network),
-               "--network-passphrase", &passphrase_for(network),
-               "--",
-               "is_initialized"])
+        .args([
+            "contract",
+            "invoke",
+            "--id",
+            contract_id,
+            "--source",
+            source_str,
+            "--rpc-url",
+            &rpc_url_for(network),
+            "--network-passphrase",
+            &passphrase_for(network),
+            "--",
+            "is_initialized",
+        ])
         .output();
 
     match output {
-        Ok(out) if out.status.success() => {
-            CheckResult::pass(format!("Contract {} is deployed and responding", &contract_id[..contract_id.len().min(16)]))
-        }
-        Ok(_) => CheckResult::fail("Contract exists but failed to respond (may not be initialized)"),
+        Ok(out) if out.status.success() => CheckResult::pass(format!(
+            "Contract {} is deployed and responding",
+            &contract_id[..contract_id.len().min(16)]
+        )),
+        Ok(_) => {
+            CheckResult::fail("Contract exists but failed to respond (may not be initialized)")
+        },
         Err(_) => CheckResult::fail("Failed to query contract"),
     }
 }
@@ -1510,15 +1817,23 @@ fn check_config_files_in(config_dir: &std::path::Path) -> CheckResult {
                 _ => continue,
             };
             total_count += 1;
-            let label = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            let label = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
             let content = match std::fs::read_to_string(&path) {
                 Ok(c) => c,
                 Err(e) => {
                     failures.push(format!("{label}: {e}"));
                     continue;
-                }
+                },
             };
-            let format = if ext == "json" { ConfigFormat::Json } else { ConfigFormat::Toml };
+            let format = if ext == "json" {
+                ConfigFormat::Json
+            } else {
+                ConfigFormat::Toml
+            };
             match parse_runtime_config_str(&content, format) {
                 Ok(_) => valid_count += 1,
                 Err(e) => failures.push(format!("{label}: {e}")),
@@ -1529,11 +1844,16 @@ fn check_config_files_in(config_dir: &std::path::Path) -> CheckResult {
     if total_count == 0 {
         CheckResult::warn("No config files found in configs/")
     } else if valid_count == total_count {
-        CheckResult::pass(format!("{} config file(s) validated against schema", total_count))
+        CheckResult::pass(format!(
+            "{} config file(s) validated against schema",
+            total_count
+        ))
     } else {
         CheckResult::fail(format!(
             "{}/{} config files are schema-valid — {}",
-            valid_count, total_count, failures.join("; ")
+            valid_count,
+            total_count,
+            failures.join("; ")
         ))
     }
 }
@@ -1594,7 +1914,35 @@ fn check_required_dependencies() -> CheckResult {
     if missing.is_empty() {
         CheckResult::pass("cargo and rustc found on PATH")
     } else {
-        CheckResult::fail(format!("missing required tool(s) on PATH: {}", missing.join(", ")))
+        CheckResult::fail(format!(
+            "missing required tool(s) on PATH: {}",
+            missing.join(", ")
+        ))
+    }
+}
+
+/// Check for an *optional* executable on PATH.
+///
+/// Unlike [`check_required_dependencies`], a missing optional tool produces a
+/// **warning** (`passed = true, warning = true`) rather than a failure. This
+/// keeps the doctor exit code green on clean contributor machines that have
+/// not installed every optional build-optimisation tool.
+///
+/// `name`    — the executable to probe (passed to `Command::new`).
+/// `purpose` — a short human-readable description shown in the report.
+fn check_optional_tool(name: &str, purpose: &str) -> CheckResult {
+    let found = std::process::Command::new(name)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if found {
+        CheckResult::pass(format!("{name} found on PATH ({purpose})"))
+    } else {
+        CheckResult::warn(format!(
+            "{name} not found on PATH ({purpose}) — optional, install to enable this feature"
+        ))
     }
 }
 
@@ -1612,33 +1960,55 @@ fn check_endpoint_proofs(contract_id: &str, network: &str) -> Vec<CheckResult> {
         return results;
     }
 
-    let list_str = stellar_invoke(contract_id, &source, network, &["list_registered_attestors"]);
+    let list_str = stellar_invoke(
+        contract_id,
+        &source,
+        network,
+        &["list_registered_attestors"],
+    );
     let attestors: Vec<String> = serde_json::from_str(&list_str).unwrap_or_default();
 
     for address in attestors {
-        let proof_raw = stellar_invoke(contract_id, &source, network, &["get_endpoint_proof", "--attestor", &address]);
-        
+        let proof_raw = stellar_invoke(
+            contract_id,
+            &source,
+            network,
+            &["get_endpoint_proof", "--attestor", &address],
+        );
+
         if proof_raw.trim() == "null" || proof_raw.trim().is_empty() {
-            results.push(CheckResult::warn(format!("No PoP registered for {}", address)));
+            results.push(CheckResult::warn(format!(
+                "No PoP registered for {}",
+                address
+            )));
             continue;
         }
 
         let val: serde_json::Value = match serde_json::from_str(&proof_raw) {
             Ok(v) => v,
             Err(_) => {
-                results.push(CheckResult::warn(format!("No PoP registered for {}", address)));
+                results.push(CheckResult::warn(format!(
+                    "No PoP registered for {}",
+                    address
+                )));
                 continue;
-            }
+            },
         };
 
         if let Some(verified) = val.get("verified").and_then(|v| v.as_bool()) {
             if verified {
                 results.push(CheckResult::pass(format!("PoP verified for {}", address)));
             } else {
-                results.push(CheckResult::warn(format!("PoP registered but unverified for {}", address)));
+                results.push(CheckResult::warn(format!(
+                    "PoP registered but unverified for {}",
+                    address
+                )));
             }
         } else {
-            results.push(CheckResult::warn(format!("No PoP registered for {}", address)));
+            results.push(CheckResult::warn(format!(
+                "No PoP registered for {}",
+                address
+            )));
         }
     }
 
@@ -1647,7 +2017,7 @@ fn check_endpoint_proofs(contract_id: &str, network: &str) -> Vec<CheckResult> {
 
 fn doctor(network: &str, fix: bool) {
     println!("\n🔍 SorobanAnchor Environment Check\n");
-    
+
     let checks = vec![
         ("Stellar CLI", check_stellar_cli()),
         ("Required Dependencies", check_required_dependencies()),
@@ -1656,9 +2026,15 @@ fn doctor(network: &str, fix: bool) {
         ("Contract ID", check_contract_id_env()),
         ("Admin Secret", check_admin_secret_env()),
         ("Network", check_network_connectivity(network)),
+        // Optional tooling: missing tools produce a warning, not a failure,
+        // so the doctor exit code stays green on clean contributor machines.
+        (
+            "wasm-opt (optional)",
+            check_optional_tool("wasm-opt", "Binaryen WASM size optimiser"),
+        ),
     ];
     let mut all_passed = true;
-    
+
     for (name, result) in &checks {
         println!("  {} {} {}", result.color(), result.icon(), name);
         println!("    {}\x1b[0m", result.message);
@@ -1666,17 +2042,21 @@ fn doctor(network: &str, fix: bool) {
             all_passed = false;
         }
     }
-    
+
     // Optional checks that require contract ID
     if let Ok(contract_id) = std::env::var("ANCHOR_CONTRACT_ID") {
         if !contract_id.is_empty() {
             let deployment_check = check_contract_deployment(&contract_id, network);
-            println!("  {} {} Contract Deployment", deployment_check.color(), deployment_check.icon());
+            println!(
+                "  {} {} Contract Deployment",
+                deployment_check.color(),
+                deployment_check.icon()
+            );
             println!("    {}\x1b[0m", deployment_check.message);
             if !deployment_check.passed {
                 all_passed = false;
             }
-            
+
             let pop_results = check_endpoint_proofs(&contract_id, network);
             if !pop_results.is_empty() {
                 println!("\n  Endpoint Proof of Possession (PoP):");
@@ -1687,9 +2067,13 @@ fn doctor(network: &str, fix: bool) {
             }
         }
     }
-    
+
     let config_check = check_config_files();
-    println!("  {} {} Config Files", config_check.color(), config_check.icon());
+    println!(
+        "  {} {} Config Files",
+        config_check.color(),
+        config_check.icon()
+    );
     println!("    {}\x1b[0m", config_check.message);
     if !config_check.passed {
         all_passed = false;
@@ -1698,11 +2082,14 @@ fn doctor(network: &str, fix: bool) {
     // ── Environment fingerprint ───────────────────────────────────────────
     println!("\n  Environment Fingerprint:");
     let fp = anchorkit::EnvironmentFingerprint::collect();
-    println!("{}", fp.summary()
-        .lines()
-        .map(|l| format!("  {}", l))
-        .collect::<std::vec::Vec<_>>()
-        .join("\n"));
+    println!(
+        "{}",
+        fp.summary()
+            .lines()
+            .map(|l| format!("  {}", l))
+            .collect::<std::vec::Vec<_>>()
+            .join("\n")
+    );
 
     println!();
     if all_passed {
@@ -1719,26 +2106,36 @@ fn doctor(network: &str, fix: bool) {
 
 // ── Health check command (#268) ───────────────────────────────────────────────
 
-fn health_check(contract_id: &str, network: &str, source: &SecretKey, anchor: Option<&str>, attestor: Option<&str>) {
+fn health_check(
+    contract_id: &str,
+    network: &str,
+    source: &SecretKey,
+    anchor: Option<&str>,
+    attestor: Option<&str>,
+) {
     println!("\n🏥 AnchorKit Health Check\n");
 
     // 1. Overall service health
     let status_raw = stellar_invoke(contract_id, source, network, &["get_health_status"]);
     let status_label = match status_raw.trim().trim_matches('"') {
-        "0" | "Healthy"     => "\x1b[32m✓ Healthy\x1b[0m",
-        "1" | "Degraded"    => "\x1b[33m⚠ Degraded\x1b[0m",
-        _                   => "\x1b[31m✗ Unavailable\x1b[0m",
+        "0" | "Healthy" => "\x1b[32m✓ Healthy\x1b[0m",
+        "1" | "Degraded" => "\x1b[33m⚠ Degraded\x1b[0m",
+        _ => "\x1b[31m✗ Unavailable\x1b[0m",
     };
     println!("  Service Status : {status_label}");
 
     // 2. Metadata freshness (optional — only when --anchor is supplied)
     if let Some(anchor_addr) = anchor {
-        let freshness_raw = stellar_invoke(contract_id, source, network, &[
-            "get_metadata_freshness",
-            "--anchor", anchor_addr,
-        ]);
+        let freshness_raw = stellar_invoke(
+            contract_id,
+            source,
+            network,
+            &["get_metadata_freshness", "--anchor", anchor_addr],
+        );
         // Parse the returned struct fields from JSON-like output
-        let state_label = if freshness_raw.contains("\"Fresh\"") || freshness_raw.contains("\"state\":0") {
+        let state_label = if freshness_raw.contains("\"Fresh\"")
+            || freshness_raw.contains("\"state\":0")
+        {
             "\x1b[32mFresh\x1b[0m"
         } else if freshness_raw.contains("\"Stale\"") || freshness_raw.contains("\"state\":2") {
             "\x1b[33mStale — refresh recommended\x1b[0m"
@@ -1753,11 +2150,14 @@ fn health_check(contract_id: &str, network: &str, source: &SecretKey, anchor: Op
 
     // 3. Rate limiter health (optional — only when --attestor is supplied)
     if let Some(attestor_addr) = attestor {
-        let rl_raw = stellar_invoke(contract_id, source, network, &[
-            "get_rate_limiter_health",
-            "--attestor", attestor_addr,
-        ]);
-        let throttled = rl_raw.contains("\"is_throttled\":true") || rl_raw.contains("is_throttled: true");
+        let rl_raw = stellar_invoke(
+            contract_id,
+            source,
+            network,
+            &["get_rate_limiter_health", "--attestor", attestor_addr],
+        );
+        let throttled =
+            rl_raw.contains("\"is_throttled\":true") || rl_raw.contains("is_throttled: true");
         let rl_label = if throttled {
             "\x1b[31m✗ Throttled\x1b[0m"
         } else {
@@ -1777,7 +2177,12 @@ fn health_check(contract_id: &str, network: &str, source: &SecretKey, anchor: Op
 
 fn network_cmd(action: NetworkAction) {
     match action {
-        NetworkAction::Add { name, rpc_url, passphrase, horizon_url } => {
+        NetworkAction::Add {
+            name,
+            rpc_url,
+            passphrase,
+            horizon_url,
+        } => {
             // Validate RPC URL connectivity before saving
             let check = check_network_connectivity_url(&rpc_url);
             if !check.passed {
@@ -1798,14 +2203,26 @@ fn network_cmd(action: NetworkAction) {
             });
             save_network_profiles(&profiles);
             println!("Network '{}' added.", name);
-        }
+        },
         NetworkAction::List => {
             let profiles = load_network_profiles();
             // Always show built-ins
             let builtins = [
-                ("testnet",   "https://soroban-testnet.stellar.org",  "Test SDF Network ; September 2015"),
-                ("mainnet",   "https://horizon.stellar.org",           "Public Global Stellar Network ; September 2015"),
-                ("futurenet", "https://rpc-futurenet.stellar.org",     "Test SDF Future Network ; October 2022"),
+                (
+                    "testnet",
+                    "https://soroban-testnet.stellar.org",
+                    "Test SDF Network ; September 2015",
+                ),
+                (
+                    "mainnet",
+                    "https://horizon.stellar.org",
+                    "Public Global Stellar Network ; September 2015",
+                ),
+                (
+                    "futurenet",
+                    "https://rpc-futurenet.stellar.org",
+                    "Test SDF Future Network ; October 2022",
+                ),
             ];
             println!("{:<16} {:<45} {}", "NAME", "RPC URL", "PASSPHRASE");
             for (name, url, phrase) in &builtins {
@@ -1813,9 +2230,12 @@ fn network_cmd(action: NetworkAction) {
             }
             for p in &profiles {
                 let default_marker = if p.is_default { " (default)" } else { "" };
-                println!("{:<16} {:<45} {}{}", p.name, p.rpc_url, p.network_passphrase, default_marker);
+                println!(
+                    "{:<16} {:<45} {}{}",
+                    p.name, p.rpc_url, p.network_passphrase, default_marker
+                );
             }
-        }
+        },
         NetworkAction::Remove { name } => {
             let mut profiles = load_network_profiles();
             let before = profiles.len();
@@ -1826,7 +2246,7 @@ fn network_cmd(action: NetworkAction) {
             }
             save_network_profiles(&profiles);
             println!("Network '{}' removed.", name);
-        }
+        },
         NetworkAction::SetDefault { name } => {
             let mut profiles = load_network_profiles();
             // Allow setting built-in names as default (stored as a marker profile)
@@ -1844,7 +2264,7 @@ fn network_cmd(action: NetworkAction) {
             }
             save_network_profiles(&profiles);
             println!("Default network set to '{}'.", name);
-        }
+        },
     }
 }
 
@@ -1856,8 +2276,12 @@ fn check_network_connectivity_url(url: &str) -> CheckResult {
     {
         Ok(resp) if resp.status().is_success() || resp.status().as_u16() == 404 => {
             CheckResult::pass(format!("RPC URL {} reachable", url))
-        }
-        Ok(resp) => CheckResult::warn(format!("RPC URL {} responded with HTTP {}", url, resp.status())),
+        },
+        Ok(resp) => CheckResult::warn(format!(
+            "RPC URL {} responded with HTTP {}",
+            url,
+            resp.status()
+        )),
         Err(e) => CheckResult::fail(format!("Cannot connect to {}: {}", url, e)),
     }
 }
@@ -1870,7 +2294,11 @@ fn discover(anchor_url: &str, proxy_url: Option<&str>, no_proxy: Option<&str>, t
         no_proxy: no_proxy.map(|s| s.to_string()),
         ..anchorkit::ProxyConfig::default()
     };
-    let proxy = if proxy_cfg.is_configured() { Some(&proxy_cfg) } else { None };
+    let proxy = if proxy_cfg.is_configured() {
+        Some(&proxy_cfg)
+    } else {
+        None
+    };
 
     match anchorkit::fetch_stellar_toml_with_proxy(anchor_url, proxy, timeout) {
         Ok(toml) => {
@@ -1895,21 +2323,24 @@ fn discover(anchor_url: &str, proxy_url: Option<&str>, no_proxy: Option<&str>, t
             });
             match serde_json::to_string_pretty(&output) {
                 Ok(s) => println!("{s}"),
-                Err(e) => { eprintln!("error: failed to serialize output: {e}"); std::process::exit(1); }
+                Err(e) => {
+                    eprintln!("error: failed to serialize output: {e}");
+                    std::process::exit(1);
+                },
             }
-        }
+        },
         Err(e) => {
             eprintln!("error: anchor discovery failed: {e}");
             std::process::exit(1);
-        }
+        },
     }
 }
 
 // ── Keystore (AES-256-GCM encrypted credential store) ─────────────────────────
 
-use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
 use aes_gcm::aead::rand_core::RngCore;
-use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
+use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit};
+use argon2::{password_hash::SaltString, Argon2, PasswordHasher};
 
 fn keystore_path() -> std::path::PathBuf {
     let dir = dirs_home().join(".anchorkit");
@@ -1919,7 +2350,9 @@ fn keystore_path() -> std::path::PathBuf {
 
 fn keystore_load() -> std::collections::HashMap<String, String> {
     let path = keystore_path();
-    if !path.exists() { return std::collections::HashMap::new(); }
+    if !path.exists() {
+        return std::collections::HashMap::new();
+    }
     let content = std::fs::read_to_string(&path).unwrap_or_default();
     serde_json::from_str(&content).unwrap_or_default()
 }
@@ -1937,10 +2370,15 @@ fn derive_key(password: &str, name: &str) -> [u8; 32] {
     let salt = SaltString::from_b64(&base64::Engine::encode(
         &base64::engine::general_purpose::STANDARD,
         salt_padded.as_bytes(),
-    )).unwrap_or_else(|_| SaltString::generate(&mut rand::thread_rng()));
+    ))
+    .unwrap_or_else(|_| SaltString::generate(&mut rand::thread_rng()));
     let argon2 = Argon2::default();
-    let hash = argon2.hash_password(password.as_bytes(), &salt)
-        .unwrap_or_else(|e| { eprintln!("error: key derivation failed: {e}"); std::process::exit(1); });
+    let hash = argon2
+        .hash_password(password.as_bytes(), &salt)
+        .unwrap_or_else(|e| {
+            eprintln!("error: key derivation failed: {e}");
+            std::process::exit(1);
+        });
     let hash_bytes = hash.hash.unwrap();
     let mut key = [0u8; 32];
     let bytes = hash_bytes.as_bytes();
@@ -1955,8 +2393,12 @@ fn keystore_encrypt(password: &str, name: &str, plaintext: &str) -> String {
     let mut nonce_bytes = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
     let nonce = aes_gcm::Nonce::from_slice(&nonce_bytes);
-    let ciphertext = cipher.encrypt(nonce, plaintext.as_bytes())
-        .unwrap_or_else(|e| { eprintln!("error: encryption failed: {e}"); std::process::exit(1); });
+    let ciphertext = cipher
+        .encrypt(nonce, plaintext.as_bytes())
+        .unwrap_or_else(|e| {
+            eprintln!("error: encryption failed: {e}");
+            std::process::exit(1);
+        });
     // Store as base64(nonce) + "." + base64(ciphertext)
     use base64::Engine;
     format!(
@@ -1973,42 +2415,57 @@ fn keystore_decrypt(password: &str, name: &str, stored: &str) -> Result<String, 
     if parts.len() != 2 {
         return Err("invalid stored credential format".to_string());
     }
-    let nonce_bytes = base64::engine::general_purpose::STANDARD.decode(parts[0])
+    let nonce_bytes = base64::engine::general_purpose::STANDARD
+        .decode(parts[0])
         .map_err(|e| format!("base64 decode nonce: {e}"))?;
-    let ciphertext = base64::engine::general_purpose::STANDARD.decode(parts[1])
+    let ciphertext = base64::engine::general_purpose::STANDARD
+        .decode(parts[1])
         .map_err(|e| format!("base64 decode ciphertext: {e}"))?;
     let key_bytes = derive_key(password, name);
     let cipher = Aes256Gcm::new(GenericArray::from_slice(&key_bytes));
     let nonce = aes_gcm::Nonce::from_slice(&nonce_bytes);
-    let plaintext = cipher.decrypt(nonce, ciphertext.as_ref())
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext.as_ref())
         .map_err(|_| "decryption failed — wrong password?".to_string())?;
     String::from_utf8(plaintext).map_err(|e| format!("utf8: {e}"))
 }
 
 fn keystore_get_decrypted(name: &str, password: &str) -> SecretKey {
     let store = keystore_load();
-    let stored = store.get(name)
-        .unwrap_or_else(|| { eprintln!("error: credential '{}' not found", name); std::process::exit(1); });
-    let plaintext = keystore_decrypt(password, name, stored)
-        .unwrap_or_else(|e| { eprintln!("error: failed to decrypt credential: {e}"); std::process::exit(1); });
+    let stored = store.get(name).unwrap_or_else(|| {
+        eprintln!("error: credential '{}' not found", name);
+        std::process::exit(1);
+    });
+    let plaintext = keystore_decrypt(password, name, stored).unwrap_or_else(|e| {
+        eprintln!("error: failed to decrypt credential: {e}");
+        std::process::exit(1);
+    });
     SecretKey::new(plaintext)
 }
 
 fn credentials_add(name: &str, value: Option<&str>, no_interactive: bool) {
     if no_interactive {
-        eprintln!("error: 'credentials add' requires interactive password prompts; \
-                   not supported with --no-interactive / ANCHORKIT_NO_INTERACTIVE");
+        eprintln!(
+            "error: 'credentials add' requires interactive password prompts; \
+                   not supported with --no-interactive / ANCHORKIT_NO_INTERACTIVE"
+        );
         std::process::exit(1);
     }
     let secret = match value {
         Some(v) => v.to_string(),
-        None => rpassword::prompt_password("Secret key value: ")
-            .unwrap_or_else(|e| { eprintln!("error: {e}"); std::process::exit(1); }),
+        None => rpassword::prompt_password("Secret key value: ").unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }),
     };
-    let password = rpassword::prompt_password("Keystore password: ")
-        .unwrap_or_else(|e| { eprintln!("error: {e}"); std::process::exit(1); });
-    let confirm = rpassword::prompt_password("Confirm password: ")
-        .unwrap_or_else(|e| { eprintln!("error: {e}"); std::process::exit(1); });
+    let password = rpassword::prompt_password("Keystore password: ").unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    });
+    let confirm = rpassword::prompt_password("Confirm password: ").unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    });
     if password != confirm {
         eprintln!("error: passwords do not match");
         std::process::exit(1);
@@ -2022,12 +2479,16 @@ fn credentials_add(name: &str, value: Option<&str>, no_interactive: bool) {
 
 fn credentials_get(name: &str, no_interactive: bool) {
     if no_interactive {
-        eprintln!("error: 'credentials get' requires an interactive password prompt; \
-                   not supported with --no-interactive / ANCHORKIT_NO_INTERACTIVE");
+        eprintln!(
+            "error: 'credentials get' requires an interactive password prompt; \
+                   not supported with --no-interactive / ANCHORKIT_NO_INTERACTIVE"
+        );
         std::process::exit(1);
     }
-    let password = rpassword::prompt_password("Keystore password: ")
-        .unwrap_or_else(|e| { eprintln!("error: {e}"); std::process::exit(1); });
+    let password = rpassword::prompt_password("Keystore password: ").unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    });
     let secret = keystore_get_decrypted(name, &password);
     println!("{}", secret.expose());
 }
@@ -2080,8 +2541,10 @@ fn rotate_keystore(
 
 fn credentials_rotate(no_interactive: bool) {
     if no_interactive {
-        eprintln!("error: 'credentials rotate' requires interactive password prompts; \
-                   not supported with --no-interactive / ANCHORKIT_NO_INTERACTIVE");
+        eprintln!(
+            "error: 'credentials rotate' requires interactive password prompts; \
+                   not supported with --no-interactive / ANCHORKIT_NO_INTERACTIVE"
+        );
         std::process::exit(1);
     }
     let store = keystore_load();
@@ -2089,12 +2552,20 @@ fn credentials_rotate(no_interactive: bool) {
         println!("No credentials stored; nothing to rotate.");
         return;
     }
-    let old_password = rpassword::prompt_password("Current keystore password: ")
-        .unwrap_or_else(|e| { eprintln!("error: {e}"); std::process::exit(1); });
-    let new_password = rpassword::prompt_password("New keystore password: ")
-        .unwrap_or_else(|e| { eprintln!("error: {e}"); std::process::exit(1); });
-    let confirm = rpassword::prompt_password("Confirm new keystore password: ")
-        .unwrap_or_else(|e| { eprintln!("error: {e}"); std::process::exit(1); });
+    let old_password =
+        rpassword::prompt_password("Current keystore password: ").unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        });
+    let new_password = rpassword::prompt_password("New keystore password: ").unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    });
+    let confirm =
+        rpassword::prompt_password("Confirm new keystore password: ").unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        });
     if new_password != confirm {
         eprintln!("error: new passwords do not match");
         std::process::exit(1);
@@ -2108,11 +2579,11 @@ fn credentials_rotate(no_interactive: bool) {
         Ok(rotated) => {
             keystore_save(&rotated);
             println!("Rotated {count} credential(s) to a new keystore password.");
-        }
+        },
         Err(e) => {
             eprintln!("error: rotation aborted, no credentials were modified: {e}");
             std::process::exit(1);
-        }
+        },
     }
 }
 
@@ -2144,7 +2615,7 @@ fn offline_validate_config(config_path: Option<&str>) -> bool {
             Err(e) => {
                 eprintln!("  error: cannot read configs/: {e}");
                 return false;
-            }
+            },
         }
     };
 
@@ -2161,7 +2632,7 @@ fn offline_validate_config(config_path: Option<&str>) -> bool {
                 eprintln!("  ✗ {}: {e}", path.display());
                 all_valid = false;
                 continue;
-            }
+            },
         };
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         let result: Result<(), String> = match ext {
@@ -2174,7 +2645,7 @@ fn offline_validate_config(config_path: Option<&str>) -> bool {
             Err(e) => {
                 eprintln!("  ✗ {}: {e}", path.display());
                 all_valid = false;
-            }
+            },
         }
     }
     all_valid
@@ -2197,27 +2668,26 @@ fn offline_simulate(config_path: Option<&str>, workflow: &str) {
             println!("[offline] Step 2: Network connectivity check (skipped — offline)");
             println!("[offline] Step 3: Simulate contract deploy (dry-run)");
             println!("[offline] ✓ Deploy simulation completed successfully.");
-        }
+        },
         "register" => {
             println!("[offline] Step 1: Simulate attestor registration (dry-run)");
             println!("[offline] Step 2: Simulate service configuration (dry-run)");
             println!("[offline] ✓ Register simulation completed successfully.");
-        }
+        },
         "attest" => {
             println!("[offline] Step 1: Simulate attestation submission (dry-run)");
             println!("[offline] ✓ Attest simulation completed successfully.");
-        }
+        },
         other => {
             eprintln!(
                 "error: unknown workflow '{other}'. Supported workflows: deploy, register, attest"
             );
             std::process::exit(1);
-        }
+        },
     }
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
-
 
 fn verify_attestation(
     id: Option<u64>,
@@ -2232,20 +2702,28 @@ fn verify_attestation(
         (Some(i), None) => {
             let id_str = Box::leak(i.to_string().into_boxed_str());
             (vec!["get_attestation", "--id", id_str], "id")
-        }
+        },
         (None, Some(h)) => (
-            vec!["get_attestation_by_hash", "--issuer", "", "--payload_hash", h],
+            vec![
+                "get_attestation_by_hash",
+                "--issuer",
+                "",
+                "--payload_hash",
+                h,
+            ],
             "hash",
         ),
         (Some(_), Some(_)) => {
             eprintln!("error: --id and --payload-hash are mutually exclusive");
             std::process::exit(1);
-        }
+        },
         (None, None) => {
             eprintln!("error: one of --id or --payload-hash is required");
-            eprintln!("hint:  anchorkit verify --id <N>  or  anchorkit verify --payload-hash <HEX>");
+            eprintln!(
+                "hint:  anchorkit verify --id <N>  or  anchorkit verify --payload-hash <HEX>"
+            );
             std::process::exit(1);
-        }
+        },
     };
 
     let _ = lookup_by; // used above for clarity
@@ -2261,11 +2739,23 @@ fn verify_attestation(
         std::process::exit(1);
     });
 
-    let attest_id    = parsed.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
-    let issuer       = parsed.get("issuer").and_then(|v| v.as_str()).unwrap_or("unknown");
-    let subject      = parsed.get("subject").and_then(|v| v.as_str()).unwrap_or("unknown");
-    let timestamp    = parsed.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0);
-    let stored_hash  = parsed.get("payload_hash").and_then(|v| v.as_str()).unwrap_or("");
+    let attest_id = parsed.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+    let issuer = parsed
+        .get("issuer")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let subject = parsed
+        .get("subject")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let timestamp = parsed
+        .get("timestamp")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let stored_hash = parsed
+        .get("payload_hash")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
 
     // Optional: compare local file hash against stored hash.
     let payload_match = if let Some(path) = payload_file {
@@ -2292,12 +2782,25 @@ fn verify_attestation(
     println!("├─────────────────────────────────────────────────────────────┤");
     println!("│ ID           : {:<45}│", attest_id);
     println!("│ Issuer       : {:<45}│", &issuer[..issuer.len().min(45)]);
-    println!("│ Subject      : {:<45}│", &subject[..subject.len().min(45)]);
+    println!(
+        "│ Subject      : {:<45}│",
+        &subject[..subject.len().min(45)]
+    );
     println!("│ Timestamp    : {:<45}│", timestamp);
-    println!("│ Payload Hash : {:<45}│", &stored_hash[..stored_hash.len().min(45)]);
+    println!(
+        "│ Payload Hash : {:<45}│",
+        &stored_hash[..stored_hash.len().min(45)]
+    );
     if let Some((matches, computed)) = &payload_match {
-        let label = if *matches { "✓ MATCH" } else { "✗ MISMATCH" };
-        println!("│ File Hash    : {:<45}│", &computed[..computed.len().min(45)]);
+        let label = if *matches {
+            "✓ MATCH"
+        } else {
+            "✗ MISMATCH"
+        };
+        println!(
+            "│ File Hash    : {:<45}│",
+            &computed[..computed.len().min(45)]
+        );
         println!("│ Match        : {:<45}│", label);
     }
     println!("└─────────────────────────────────────────────────────────────┘");
@@ -2320,90 +2823,211 @@ fn main() {
         n
     });
     match cli.command {
-        Commands::Deploy { network: cmd_net, source, admin, dry_run, list, upgrade, secret_key, keypair_file, yes } => {
+        Commands::Deploy {
+            network: cmd_net,
+            source,
+            admin,
+            dry_run,
+            list,
+            upgrade,
+            secret_key,
+            keypair_file,
+            yes,
+        } => {
             let net = cmd_net;
             if upgrade {
                 let contract_id = require_contract_id(global_contract_id, None, "deploy --upgrade");
                 let signing_source = resolve_source(
-                    ephemeral_token.as_deref(), secret_key.as_deref(), keypair_file.as_deref(),
-                    None, no_interactive,
+                    ephemeral_token.as_deref(),
+                    secret_key.as_deref(),
+                    keypair_file.as_deref(),
+                    None,
+                    no_interactive,
                 );
                 upgrade_contract(&contract_id, &net, &signing_source);
             } else {
-                deploy(&net, &source, admin.as_deref(), dry_run, list, yes, no_interactive);
+                deploy(
+                    &net,
+                    &source,
+                    admin.as_deref(),
+                    dry_run,
+                    list,
+                    yes,
+                    no_interactive,
+                );
             }
-        }
-        Commands::Register { address, services, contract_id, network: cmd_net, secret_key, keypair_file, credential_name, sep10_token, sep10_issuer } => {
+        },
+        Commands::Register {
+            address,
+            services,
+            contract_id,
+            network: cmd_net,
+            secret_key,
+            keypair_file,
+            credential_name,
+            sep10_token,
+            sep10_issuer,
+        } => {
             let cid = require_contract_id(global_contract_id, contract_id, "register");
             let net = cmd_net;
             let source = resolve_source(
-                ephemeral_token.as_deref(), secret_key.as_deref(), keypair_file.as_deref(),
-                credential_name.as_deref(), no_interactive,
+                ephemeral_token.as_deref(),
+                secret_key.as_deref(),
+                keypair_file.as_deref(),
+                credential_name.as_deref(),
+                no_interactive,
             );
-            register(&address, &services, &cid, &net, &source, &sep10_token, &sep10_issuer);
-        }
-        Commands::Attest { subject, payload_hash, contract_id, network: cmd_net, secret_key, keypair_file, credential_name, issuer, session_id, signing_key } => {
+            register(
+                &address,
+                &services,
+                &cid,
+                &net,
+                &source,
+                &sep10_token,
+                &sep10_issuer,
+            );
+        },
+        Commands::Attest {
+            subject,
+            payload_hash,
+            contract_id,
+            network: cmd_net,
+            secret_key,
+            keypair_file,
+            credential_name,
+            issuer,
+            session_id,
+            signing_key,
+        } => {
             let cid = require_contract_id(global_contract_id, contract_id, "attest");
             let source = resolve_source(
-                ephemeral_token.as_deref(), secret_key.as_deref(), keypair_file.as_deref(),
-                credential_name.as_deref(), no_interactive,
+                ephemeral_token.as_deref(),
+                secret_key.as_deref(),
+                keypair_file.as_deref(),
+                credential_name.as_deref(),
+                no_interactive,
             );
-            attest(&subject, &payload_hash, &cid, &cmd_net, &source, &issuer, session_id, signing_key.as_deref());
-        }
-        Commands::Quote { from, to, amount, contract_id, network: cmd_net, secret_key, keypair_file, credential_name } => {
+            attest(
+                &subject,
+                &payload_hash,
+                &cid,
+                &cmd_net,
+                &source,
+                &issuer,
+                session_id,
+                signing_key.as_deref(),
+            );
+        },
+        Commands::Quote {
+            from,
+            to,
+            amount,
+            contract_id,
+            network: cmd_net,
+            secret_key,
+            keypair_file,
+            credential_name,
+        } => {
             let cid = require_contract_id(global_contract_id, contract_id, "quote");
             let source = resolve_source(
-                ephemeral_token.as_deref(), secret_key.as_deref(), keypair_file.as_deref(),
-                credential_name.as_deref(), no_interactive,
+                ephemeral_token.as_deref(),
+                secret_key.as_deref(),
+                keypair_file.as_deref(),
+                credential_name.as_deref(),
+                no_interactive,
             );
             quote(&from, &to, amount, &cid, &cmd_net, &source);
-        }
-        Commands::Status { tx_id, anchor_url, proxy_url, no_proxy } => {
-            status(&tx_id, &anchor_url, proxy_url.as_deref(), no_proxy.as_deref());
-        }
-        Commands::Revoke { address, contract_id, network: cmd_net, secret_key, keypair_file, credential_name } => {
+        },
+        Commands::Status {
+            tx_id,
+            anchor_url,
+            proxy_url,
+            no_proxy,
+        } => {
+            status(
+                &tx_id,
+                &anchor_url,
+                proxy_url.as_deref(),
+                no_proxy.as_deref(),
+            );
+        },
+        Commands::Revoke {
+            address,
+            contract_id,
+            network: cmd_net,
+            secret_key,
+            keypair_file,
+            credential_name,
+        } => {
             let cid = require_contract_id(global_contract_id, contract_id, "revoke");
             let source = resolve_source(
-                ephemeral_token.as_deref(), secret_key.as_deref(), keypair_file.as_deref(),
-                credential_name.as_deref(), no_interactive,
+                ephemeral_token.as_deref(),
+                secret_key.as_deref(),
+                keypair_file.as_deref(),
+                credential_name.as_deref(),
+                no_interactive,
             );
             revoke(&address, &cid, &cmd_net, &source);
-        }
+        },
         Commands::Doctor { fix } => {
             doctor(&network, fix);
-        }
-        Commands::Health { contract_id, network: cmd_net, secret_key, keypair_file, anchor, attestor } => {
+        },
+        Commands::Health {
+            contract_id,
+            network: cmd_net,
+            secret_key,
+            keypair_file,
+            anchor,
+            attestor,
+        } => {
             let source = resolve_source(
-                ephemeral_token.as_deref(), secret_key.as_deref(), keypair_file.as_deref(),
-                None, no_interactive,
+                ephemeral_token.as_deref(),
+                secret_key.as_deref(),
+                keypair_file.as_deref(),
+                None,
+                no_interactive,
             );
-            health_check(&contract_id, &cmd_net, &source, anchor.as_deref(), attestor.as_deref());
-        }
+            health_check(
+                &contract_id,
+                &cmd_net,
+                &source,
+                anchor.as_deref(),
+                attestor.as_deref(),
+            );
+        },
         Commands::Network { action } => {
             network_cmd(action);
-        }
-        Commands::Discover { anchor_url, proxy_url, no_proxy, timeout } => {
-            discover(&anchor_url, proxy_url.as_deref(), no_proxy.as_deref(), timeout);
-        }
-        Commands::Credentials { action } => {
-            match action {
-                CredentialsAction::Add { name, value } => {
-                    credentials_add(&name, value.as_deref(), no_interactive);
-                }
-                CredentialsAction::Get { name } => {
-                    credentials_get(&name, no_interactive);
-                }
-                CredentialsAction::List => {
-                    credentials_list();
-                }
-                CredentialsAction::Remove { name } => {
-                    credentials_remove(&name);
-                }
-                CredentialsAction::Rotate => {
-                    credentials_rotate(no_interactive);
-                }
-            }
-        }
+        },
+        Commands::Discover {
+            anchor_url,
+            proxy_url,
+            no_proxy,
+            timeout,
+        } => {
+            discover(
+                &anchor_url,
+                proxy_url.as_deref(),
+                no_proxy.as_deref(),
+                timeout,
+            );
+        },
+        Commands::Credentials { action } => match action {
+            CredentialsAction::Add { name, value } => {
+                credentials_add(&name, value.as_deref(), no_interactive);
+            },
+            CredentialsAction::Get { name } => {
+                credentials_get(&name, no_interactive);
+            },
+            CredentialsAction::List => {
+                credentials_list();
+            },
+            CredentialsAction::Remove { name } => {
+                credentials_remove(&name);
+            },
+            CredentialsAction::Rotate => {
+                credentials_rotate(no_interactive);
+            },
+        },
         Commands::Offline { action } => match action {
             OfflineAction::Validate { config } => {
                 println!("\n[offline] Config validation\n");
@@ -2414,19 +3038,37 @@ fn main() {
                     eprintln!("\n❌ One or more config files failed validation.\n");
                     std::process::exit(1);
                 }
-            }
+            },
             OfflineAction::Simulate { config, workflow } => {
                 offline_simulate(config.as_deref(), &workflow);
-            }
+            },
         },
-        Commands::Verify { id, payload_hash, payload_file, contract_id, network: cmd_net, secret_key, keypair_file } => {
+        Commands::Verify {
+            id,
+            payload_hash,
+            payload_file,
+            contract_id,
+            network: cmd_net,
+            secret_key,
+            keypair_file,
+        } => {
             let cid = require_contract_id(global_contract_id, contract_id, "verify");
             let source = resolve_source(
-                ephemeral_token.as_deref(), secret_key.as_deref(), keypair_file.as_deref(),
-                None, no_interactive,
+                ephemeral_token.as_deref(),
+                secret_key.as_deref(),
+                keypair_file.as_deref(),
+                None,
+                no_interactive,
             );
-            verify_attestation(id, payload_hash.as_deref(), payload_file.as_deref(), &cid, &cmd_net, &source);
-        }
+            verify_attestation(
+                id,
+                payload_hash.as_deref(),
+                payload_file.as_deref(),
+                &cid,
+                &cmd_net,
+                &source,
+            );
+        },
     }
 }
 
@@ -2434,9 +3076,17 @@ fn main() {
 mod secret_resolution_tests {
     use super::*;
 
-    fn no_env(_: &str) -> Option<String> { None }
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
     fn env_with<'a>(key: &'a str, value: &'a str) -> impl Fn(&str) -> Option<String> + 'a {
-        move |k: &str| if k == key { Some(value.to_string()) } else { None }
+        move |k: &str| {
+            if k == key {
+                Some(value.to_string())
+            } else {
+                None
+            }
+        }
     }
 
     const VALID_KEY: &str = "SCZANGBA5IIPMEFXBI5LZU7RVJZOLBYHJYFJ2KYN3CQPUOVFRDPCNTY";
@@ -2461,7 +3111,11 @@ mod secret_resolution_tests {
     #[test]
     fn test_resolve_uses_explicit_secret_key_first() {
         let result = try_resolve_source(
-            None, Some(VALID_KEY), None, None, false,
+            None,
+            Some(VALID_KEY),
+            None,
+            None,
+            false,
             &env_with("ANCHOR_ADMIN_SECRET", VALID_KEY),
         );
         assert_eq!(result.unwrap(), VALID_KEY);
@@ -2469,22 +3123,32 @@ mod secret_resolution_tests {
 
     #[test]
     fn test_resolve_uses_ephemeral_token_over_secret_key() {
-        let result = try_resolve_source(
-            Some(VALID_KEY), Some("Sother"), None, None, false, &no_env,
-        );
+        let result =
+            try_resolve_source(Some(VALID_KEY), Some("Sother"), None, None, false, &no_env);
         assert_eq!(result.unwrap(), VALID_KEY);
     }
 
     #[test]
     fn test_resolve_falls_back_to_env_var() {
-        let result = try_resolve_source(None, None, None, None, false, &env_with("ANCHOR_ADMIN_SECRET", VALID_KEY));
+        let result = try_resolve_source(
+            None,
+            None,
+            None,
+            None,
+            false,
+            &env_with("ANCHOR_ADMIN_SECRET", VALID_KEY),
+        );
         assert_eq!(result.unwrap(), VALID_KEY);
     }
 
     #[test]
     fn test_resolve_errors_on_empty_env_var() {
         let err = try_resolve_source(
-            None, None, None, None, false,
+            None,
+            None,
+            None,
+            None,
+            false,
             &env_with("ANCHOR_ADMIN_SECRET", ""),
         )
         .unwrap_err();
@@ -2494,11 +3158,18 @@ mod secret_resolution_tests {
     #[test]
     fn test_resolve_errors_on_invalid_env_var_format() {
         let err = try_resolve_source(
-            None, None, None, None, false,
+            None,
+            None,
+            None,
+            None,
+            false,
             &env_with("ANCHOR_ADMIN_SECRET", "GABCDE123"),
         )
         .unwrap_err();
-        assert!(err.contains("'S...' format"), "expected format error in: {err}");
+        assert!(
+            err.contains("'S...' format"),
+            "expected format error in: {err}"
+        );
     }
 
     #[test]
@@ -2509,10 +3180,7 @@ mod secret_resolution_tests {
 
     #[test]
     fn test_resolve_errors_on_credential_name_in_non_interactive_mode() {
-        let err = try_resolve_source(
-            None, None, None, Some("my-cred"), true, &no_env,
-        )
-        .unwrap_err();
+        let err = try_resolve_source(None, None, None, Some("my-cred"), true, &no_env).unwrap_err();
         assert!(err.contains("non-interactive"), "got: {err}");
     }
 
@@ -2573,7 +3241,10 @@ mod offline_tests {
         std::fs::write(&path, r#"{"network":"testnet","admin":"GABC"}"#).unwrap();
         let result = offline_validate_config(Some(path.to_str().unwrap()));
         let _ = std::fs::remove_file(&path);
-        assert!(!result, "schema-invalid JSON must fail validation even though it parses");
+        assert!(
+            !result,
+            "schema-invalid JSON must fail validation even though it parses"
+        );
     }
 
     #[test]
@@ -2585,7 +3256,6 @@ mod offline_tests {
         let _ = std::fs::remove_file(&path);
         assert!(!result, "invalid JSON should fail validation");
     }
-
 }
 
 #[cfg(test)]
@@ -2618,20 +3288,35 @@ mod keystore_tests {
     fn test_encrypt_is_nondeterministic_due_to_random_nonce() {
         let a = keystore_encrypt("hunter2", "alice", "SECRET-VALUE");
         let b = keystore_encrypt("hunter2", "alice", "SECRET-VALUE");
-        assert_ne!(a, b, "ciphertext should differ across calls due to a fresh random nonce");
+        assert_ne!(
+            a, b,
+            "ciphertext should differ across calls due to a fresh random nonce"
+        );
     }
 
     #[test]
     fn test_rotate_keystore_reencrypts_all_entries_under_new_password() {
         let mut store = std::collections::HashMap::new();
-        store.insert("alice".to_string(), keystore_encrypt("old-pw", "alice", "SECRET-A"));
-        store.insert("bob".to_string(), keystore_encrypt("old-pw", "bob", "SECRET-B"));
+        store.insert(
+            "alice".to_string(),
+            keystore_encrypt("old-pw", "alice", "SECRET-A"),
+        );
+        store.insert(
+            "bob".to_string(),
+            keystore_encrypt("old-pw", "bob", "SECRET-B"),
+        );
 
         let rotated = rotate_keystore(&store, "old-pw", "new-pw").unwrap();
 
         assert_eq!(rotated.len(), 2);
-        assert_eq!(keystore_decrypt("new-pw", "alice", &rotated["alice"]).unwrap(), "SECRET-A");
-        assert_eq!(keystore_decrypt("new-pw", "bob", &rotated["bob"]).unwrap(), "SECRET-B");
+        assert_eq!(
+            keystore_decrypt("new-pw", "alice", &rotated["alice"]).unwrap(),
+            "SECRET-A"
+        );
+        assert_eq!(
+            keystore_decrypt("new-pw", "bob", &rotated["bob"]).unwrap(),
+            "SECRET-B"
+        );
         // Old password must no longer work post-rotation.
         assert!(keystore_decrypt("old-pw", "alice", &rotated["alice"]).is_err());
     }
@@ -2639,10 +3324,16 @@ mod keystore_tests {
     #[test]
     fn test_rotate_keystore_rejects_wrong_current_password_without_modifying_data() {
         let mut store = std::collections::HashMap::new();
-        store.insert("alice".to_string(), keystore_encrypt("old-pw", "alice", "SECRET-A"));
+        store.insert(
+            "alice".to_string(),
+            keystore_encrypt("old-pw", "alice", "SECRET-A"),
+        );
 
         let err = rotate_keystore(&store, "definitely-wrong", "new-pw").unwrap_err();
-        assert!(err.contains("alice"), "error should identify the failing credential: {err}");
+        assert!(
+            err.contains("alice"),
+            "error should identify the failing credential: {err}"
+        );
 
         // The original store passed in must be untouched by the failed attempt.
         assert_eq!(
@@ -2671,7 +3362,10 @@ mod doctor_tests {
     }"#;
 
     fn tempdir(label: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("anchorkit_doctor_test_{label}_{:?}", std::thread::current().id()));
+        let dir = std::env::temp_dir().join(format!(
+            "anchorkit_doctor_test_{label}_{:?}",
+            std::thread::current().id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -2692,7 +3386,10 @@ mod doctor_tests {
         let result = check_config_files_in(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         assert!(result.passed);
-        assert!(result.warning, "empty configs/ dir should warn (no files found)");
+        assert!(
+            result.warning,
+            "empty configs/ dir should warn (no files found)"
+        );
     }
 
     #[test]
@@ -2711,8 +3408,15 @@ mod doctor_tests {
         std::fs::write(dir.join("anchor.json"), r#"{"network":"testnet"}"#).unwrap();
         let result = check_config_files_in(&dir);
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(!result.passed, "schema-invalid config must fail the doctor check");
-        assert!(result.message.contains("anchor.json"), "got: {}", result.message);
+        assert!(
+            !result.passed,
+            "schema-invalid config must fail the doctor check"
+        );
+        assert!(
+            result.message.contains("anchor.json"),
+            "got: {}",
+            result.message
+        );
     }
 
     #[test]
@@ -2723,7 +3427,11 @@ mod doctor_tests {
         std::fs::write(dir.join("anchor.toml"), "this is not [valid toml").unwrap();
         let result = check_config_files_in(&dir);
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(!result.passed, "malformed TOML must now be caught, got: {}", result.message);
+        assert!(
+            !result.passed,
+            "malformed TOML must now be caught, got: {}",
+            result.message
+        );
     }
 
     #[test]
@@ -2763,6 +3471,64 @@ mod doctor_tests {
         let result = check_required_dependencies();
         assert!(result.passed && !result.warning, "got: {}", result.message);
     }
+
+    // ── Optional tool checks ──────────────────────────────────────────────────
+
+    /// `check_optional_tool` for a tool that is guaranteed to be absent on any
+    /// machine (we use a name that cannot exist as a real executable).
+    ///
+    /// Acceptance criteria:
+    /// - `passed` is `true`  — missing optional tooling must NOT cause a
+    ///   doctor failure; the overall check continues.
+    /// - `warning` is `true` — the absence is surfaced as a warning, not
+    ///   silently ignored.
+    /// - The message identifies the tool name and does not claim that an
+    ///   unrelated check failed.
+    #[test]
+    fn test_check_optional_tool_absent_is_warning_not_failure() {
+        // This executable name is deliberately nonsensical and will never
+        // exist on any real machine, making the test fully deterministic
+        // regardless of the host's installed tooling.
+        let result = check_optional_tool(
+            "__anchorkit_nonexistent_tool_xyzzy__",
+            "deterministic absence fixture",
+        );
+
+        assert!(
+            result.passed,
+            "a missing optional tool must not cause a doctor failure (passed must be true), got: {}",
+            result.message
+        );
+        assert!(
+            result.warning,
+            "a missing optional tool must be surfaced as a warning (warning must be true), got: {}",
+            result.message
+        );
+        assert!(
+            result
+                .message
+                .contains("__anchorkit_nonexistent_tool_xyzzy__"),
+            "the warning must identify the missing tool by name, got: {}",
+            result.message
+        );
+        assert!(
+            result.message.contains("optional"),
+            "the warning must make clear the tool is optional, got: {}",
+            result.message
+        );
+    }
+
+    /// `check_optional_tool` for `cargo`, which is guaranteed present whenever
+    /// this test suite runs, must return a pass (not a warning).
+    #[test]
+    fn test_check_optional_tool_present_passes() {
+        let result = check_optional_tool("cargo", "build tool");
+        assert!(
+            result.passed && !result.warning,
+            "a present tool must pass without a warning, got: {}",
+            result.message
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2788,7 +3554,10 @@ mod cli_validation_tests {
         // A syntactically valid Stellar public address (G... + valid checksum).
         let valid = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
         let result = validate_admin_arg(Some(valid));
-        assert!(result.is_ok(), "expected valid address to pass, got: {result:?}");
+        assert!(
+            result.is_ok(),
+            "expected valid address to pass, got: {result:?}"
+        );
     }
 
     #[test]
