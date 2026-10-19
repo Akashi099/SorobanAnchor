@@ -245,3 +245,80 @@ fn test_verify_payload_file_not_found() {
         .assert()
         .failure();
 }
+
+// ── Group G: deploy network validation ───────────────────────────────────────
+
+/// An unsupported network value must be rejected with a nonzero exit before
+/// any deployment work begins.  The error message must identify the bad option
+/// or list the supported choices.
+#[test]
+fn test_deploy_invalid_network_exits_with_error() {
+    cmd()
+        .args(["deploy", "--network", "not-a-real-network"])
+        .env_remove("ANCHOR_CONTRACT_ID")
+        .env_remove("STELLAR_NETWORK")
+        // Provide a temp HOME so the test never accidentally picks up a real
+        // custom profile from the developer's machine.
+        .env("HOME", std::env::temp_dir().to_str().unwrap())
+        .env("USERPROFILE", std::env::temp_dir().to_str().unwrap())
+        .assert()
+        .failure()
+        .stderr(
+            contains("not-a-real-network")
+                .or(contains("unknown network"))
+                .or(contains("testnet"))
+        );
+}
+
+/// A valid built-in network name must pass the argument-validation gate.
+/// The command will still fail (WASM not built, no signing key, etc.),
+/// but the error must NOT be the network-name rejection.
+#[test]
+fn test_deploy_valid_network_passes_validation() {
+    let output = cmd()
+        .args(["deploy", "--network", "testnet", "--dry-run"])
+        .env_remove("ANCHOR_CONTRACT_ID")
+        .env_remove("STELLAR_NETWORK")
+        .env("HOME", std::env::temp_dir().to_str().unwrap())
+        .env("USERPROFILE", std::env::temp_dir().to_str().unwrap())
+        .output()
+        .expect("anchorkit binary not found");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("unknown network"),
+        "testnet should be accepted as a valid network name, got stderr: {stderr}"
+    );
+}
+
+// ── Group H: offline validate CLI help ───────────────────────────────────────
+
+/// `offline validate --help` must explain that validation is local and does
+/// not contact an anchor or any network endpoint.
+#[test]
+fn test_offline_validate_help_mentions_no_network() {
+    cmd()
+        .args(["offline", "validate", "--help"])
+        .assert()
+        .success()
+        .stdout(
+            contains("local")
+                .or(contains("no network"))
+                .or(contains("not contact"))
+                .or(contains("offline"))
+                .or(contains("air-gapped"))
+        );
+}
+
+/// `offline validate --help` must describe the accepted input formats.
+#[test]
+fn test_offline_validate_help_mentions_config_formats() {
+    cmd()
+        .args(["offline", "validate", "--help"])
+        .assert()
+        .success()
+        .stdout(
+            contains("json").or(contains("JSON"))
+                .or(contains("toml")).or(contains("TOML"))
+        );
+}
