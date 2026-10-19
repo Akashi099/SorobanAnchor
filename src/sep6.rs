@@ -1704,6 +1704,62 @@ mod tests {
 
     // ── #834 Reject negative SEP-6 amount text ──────────────────────────────
 
+    // ── Deposit status regression table ────────────────────────────────────────
+    //
+    // Each row: (raw anchor string, expected TransactionStatus)
+    // Covers pending, completed, and unknown inputs across representative
+    // capitalisation variants. No new status aliases are introduced here;
+    // every accepted value must already be handled by TransactionStatus::from_str.
+
+    #[test]
+    fn test_deposit_status_table() {
+        use TransactionStatus::*;
+
+        let cases: &[(&str, TransactionStatus)] = &[
+            // ── pending variants ──────────────────────────────────────────────
+            ("pending",                     Pending),
+            ("PENDING",                     Pending),
+            ("pending_external",            PendingExternal),
+            ("PENDING_EXTERNAL",            PendingExternal),
+            ("Pending_External",            PendingExternal),
+            ("pending_anchor",              PendingAnchor),
+            ("pending_user",                PendingUser),
+            ("pending_user_transfer_start", PendingUser),
+            ("  pending_user  ",            PendingUser),
+            ("incomplete",                  Incomplete),
+            // ── completed variant ─────────────────────────────────────────────
+            ("completed",                   Completed),
+            ("COMPLETED",                   Completed),
+            ("  Completed  ",               Completed),
+            // ── unknown / unrecognised inputs ─────────────────────────────────
+            ("unrecognised_status",         Error),
+            ("",                            Error),
+            ("   ",                         Error),
+            ("TOTALLY_UNKNOWN",             Error),
+        ];
+
+        for (raw, expected) in cases {
+            let got = TransactionStatus::from_str(raw);
+            assert_eq!(
+                got, *expected,
+                "TransactionStatus::from_str({raw:?}) → {got:?}, want {expected:?}",
+            );
+        }
+    }
+
+    /// Unknown deposit status must not panic and must map to TransactionStatus::Error.
+    #[test]
+    fn test_deposit_status_unknown_does_not_panic() {
+        let mut raw = raw_deposit();
+        raw.status = Some("totally_unknown_status".to_string());
+        let resp = initiate_deposit(raw).unwrap();
+        assert_eq!(
+            resp.status,
+            TransactionStatus::Error,
+            "unknown deposit status must map to Error, not panic",
+        );
+    }
+
     #[test]
     fn test_parse_sep6_amount_rejects_negative() {
         for neg in ["-1", "-0", "-0.0", "  -100  ", "-999999999"] {

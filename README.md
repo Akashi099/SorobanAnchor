@@ -248,6 +248,38 @@ Anchor configs live in `configs/` as JSON or TOML. Validate them with:
 
 Schema reference: `config_schema.json`
 
+### Validating a config locally (no network or credentials required)
+
+You can check any config file offline using `anchorkit offline validate`.
+The command parses the file, validates it against the embedded JSON Schema,
+and checks cross-field constraints — no contract deployment, no network
+connection, and no credentials are needed.
+
+```bash
+# Validate a single file
+anchorkit offline validate --config configs/remittance-anchor.toml
+
+# Validate all files in configs/
+anchorkit offline validate
+```
+
+A passing run prints nothing and exits 0. An error prints a description of
+the first validation failure and exits non-zero, for example:
+
+```
+error: contract.name cannot be empty or whitespace
+```
+
+Both `.json` and `.toml` files are accepted. Any other extension produces:
+
+```
+error: unsupported config file extension '.yaml' (supported formats: .json, .toml)
+```
+
+This walkthrough does not require credentials or network access. For a
+full deployment walkthrough see
+[`examples/full_deployment_walkthrough.sh`](examples/full_deployment_walkthrough.sh).
+
 ### Runtime config hot-reload
 
 Long-running host processes (not the on-chain contract, which already
