@@ -1912,6 +1912,12 @@ mod tests {
     }
 
     #[test]
+    fn test_unknown_sep6_response_fields_are_tolerated() {
+        let body = r#"{"transaction":{"id":"txn-1","kind":"deposit","status":"pending","future_field":"anchor extension"}}"#;
+        assert!(validate_response_body(body, BodyRequirement::Required).is_ok());
+    }
+
+    #[test]
     fn test_malformed_json_object_rejected() {
         let result = validate_response_body("{broken", BodyRequirement::Required);
         assert!(result.is_err());
