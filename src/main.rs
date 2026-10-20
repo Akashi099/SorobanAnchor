@@ -613,6 +613,9 @@ struct Cli {
 enum Commands {
     /// Deploy contract to a network
     Deploy {
+        /// Target network: testnet | mainnet | futurenet | <custom profile name>.
+        /// Unknown names are rejected before any deployment work begins.
+        /// Mainnet deployments require interactive confirmation unless --yes is supplied.
         #[arg(long, default_value = "testnet")]
         network: String,
         #[arg(long, default_value = "default")]
@@ -636,7 +639,10 @@ enum Commands {
         /// Path to a JSON or plain-text keypair file (used when --secret-key is absent)
         #[arg(long)]
         keypair_file: Option<String>,
-        /// Skip the interactive mainnet confirmation prompt
+        /// Skip the interactive mainnet confirmation prompt.
+        /// When absent on a mainnet deploy, the CLI prompts on stderr and waits
+        /// for a 'y' or 'yes' reply.  If stdin is not a terminal (e.g. in CI),
+        /// the read fails and the deploy is aborted; pass --yes to bypass this.
         #[arg(long)]
         yes: bool,
     },
@@ -821,7 +827,16 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum OfflineAction {
-    /// Validate config files without network access
+    /// Validate one or more config files without network access.
+    ///
+    /// Reads each file, checks it against the JSON schema (config_schema.json),
+    /// and runs cross-field semantic checks (duplicate attestor names, unknown
+    /// attestor references in operations/rate-limits, malformed proxy URLs).
+    ///
+    /// Accepts both JSON (.json) and TOML (.toml) config formats.
+    ///
+    /// This command does not contact any anchor, RPC endpoint, or external
+    /// service — it is safe to run in air-gapped or pre-deployment environments.
     Validate {
         /// Path to a specific config file (validates all in configs/ when omitted)
         #[arg(long)]
@@ -1100,6 +1115,29 @@ fn validate_services_arg(services: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate that the supplied network name is either a built-in or matches an
+/// existing custom profile stored in `~/.anchorkit/networks.json`.
+///
+/// Returns `Ok(())` when the name is acceptable, or an error string that
+/// names the supported built-ins and hints at how to add a custom profile.
+/// Kept as a pure function (no `process::exit`) so it is unit-testable.
+fn validate_network_arg(network: &str) -> Result<(), String> {
+    if BUILTIN_NETWORKS.contains(&network) {
+        return Ok(());
+    }
+    let profiles = load_network_profiles();
+    if find_profile(&profiles, network).is_some() {
+        return Ok(());
+    }
+    Err(format!(
+        "unknown network '{}' — supported built-ins: {} \
+         (add a custom profile with: anchorkit network add --name {} --rpc-url <URL> --passphrase <PHRASE>)",
+        network,
+        BUILTIN_NETWORKS.join(", "),
+        network,
+    ))
+}
+
 /// Prompt the operator to confirm a mainnet deployment.
 ///
 /// Returns `true` when the deployment should proceed: either the user typed
@@ -1139,6 +1177,12 @@ fn deploy(
             );
         }
         return;
+    }
+
+    // Reject unknown network names before any deployment side effect.
+    if let Err(e) = validate_network_arg(network) {
+        eprintln!("error: {e}");
+        std::process::exit(1);
     }
 
     if let Err(e) = validate_admin_arg(admin) {
