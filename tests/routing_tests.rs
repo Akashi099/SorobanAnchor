@@ -645,6 +645,148 @@ mod routing_tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results.get(0).unwrap().anchor, with_quotes);
     }
+
+    // -----------------------------------------------------------------------
+    // #1268: Weight sum just outside tolerance
+    // WEIGHT_SUM_TOLERANCE = 0.01.  A sum of 0.0f32 + 0.0f32 + 1.011f32
+    // deviates by 0.011, which is strictly greater than the tolerance, so
+    // WeightedRoutingStrategy::validate() must return false.
+    //
+    // The integer route_anchors path enforces exact equality to 1000, so
+    // a sum of 1001 must also be rejected with InvalidWeights.
+    // -----------------------------------------------------------------------
+
+    /// Float weights whose sum exceeds 1.0 by just more than WEIGHT_SUM_TOLERANCE
+    /// (0.01) must be rejected by WeightedRoutingStrategy::validate().
+    ///
+    /// The tolerance is 0.01.  A total of 1.011 deviates by 0.011, which is
+    /// strictly outside the accepted range.  This test is derived from the
+    /// implemented constant, not an arbitrary epsilon.
+    #[test]
+    fn test_weighted_strategy_rejects_sum_just_outside_tolerance() {
+        // sum = 0.0 + 0.0 + 1.011 = 1.011  →  |1.011 - 1.0| = 0.011 > 0.01
+        let strategy = WeightedRoutingStrategy {
+            fee_weight: 0.0_f32,
+            speed_weight: 0.0_f32,
+            reputation_weight: 1.011_f32,
+        };
+        assert!(
+            !strategy.validate(),
+            "weight sum 1.011 is outside the 0.01 tolerance and must be rejected"
+        );
+    }
+
+    /// Float weights whose sum falls within WEIGHT_SUM_TOLERANCE must still be
+    /// accepted.  This control case guards against tightening the tolerance
+    /// accidentally.
+    ///
+    /// sum = 0.333 + 0.333 + 0.334 = 1.000  →  |1.000 - 1.0| = 0.0 < 0.01
+    #[test]
+    fn test_weighted_strategy_accepts_sum_within_tolerance() {
+        let strategy = WeightedRoutingStrategy {
+            fee_weight: 0.333_f32,
+            speed_weight: 0.333_f32,
+            reputation_weight: 0.334_f32,
+        };
+        assert!(
+            strategy.validate(),
+            "weight sum exactly 1.0 must be accepted"
+        );
+    }
+
+    /// The integer route_anchors path requires exact equality to 1000.
+    /// A sum of 1001 (one unit over) must panic with InvalidWeights.
+    #[test]
+    fn test_route_anchors_rejects_integer_weight_sum_just_over_1000() {
+        let env = make_env();
+        set_ledger(&env, 1_000_000);
+        let (client, _) = setup(&env);
+
+        // 334 + 333 + 334 = 1001 → exactly one unit beyond the required 1000.
+        let result = client.try_route_anchors(&334u32, &333u32, &334u32, &3u32, &0u32);
+        assert!(
+            result.is_err(),
+            "integer weight sum 1001 must be rejected with InvalidWeights"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #1267: No eligible quote — NoQuotesAvailable
+    // A quote for a different asset pair (EUR/GBP) exists in storage, but
+    // routing is requested for USD/USDC.  The non-matching quote must not be
+    // selected, and the result must be the documented NoQuotesAvailable error.
+    // -----------------------------------------------------------------------
+
+    /// When only a mismatched quote exists (EUR/GBP) but routing targets
+    /// USD/USDC, route_transaction must fail with NoQuotesAvailable.
+    ///
+    /// This is distinct from `test_route_excludes_mismatched_asset_pair`, which
+    /// has a second matching anchor.  Here there is *no* eligible quote at all.
+    #[test]
+    fn test_route_no_eligible_quote_returns_no_quotes_available() {
+        let env = make_env();
+        set_ledger(&env, 1_000_000);
+        let (client, _) = setup(&env);
+
+        let anchor = Address::generate(&env);
+        register_anchor(&env, &client, &anchor);
+        client.set_anchor_metadata(&anchor, &8000u32, &300u64, &8000u32, &9900u32, &1_000_000u64);
+
+        // The only available quote is for a completely different corridor.
+        client.submit_quote(
+            &anchor,
+            &String::from_str(&env, "EUR"),
+            &String::from_str(&env, "GBP"),
+            &10_000u64, &10u32, &100u64, &100_000u64, &1_003_600u64,
+        );
+
+        // Routing for USD/USDC must fail — the EUR/GBP quote is ineligible.
+        let options = lowest_fee_options(&env, "USD", "USDC", 5_000);
+        assert!(
+            client.try_route_transaction(&options).is_err(),
+            "routing with no eligible quote must return NoQuotesAvailable"
+        );
+    }
+
+    /// Control case: a matching USD/USDC quote remains reachable when both a
+    /// mismatched EUR/GBP quote and a valid USD/USDC quote are present.
+    #[test]
+    fn test_route_matching_quote_found_alongside_ineligible_quote() {
+        let env = make_env();
+        set_ledger(&env, 1_000_000);
+        let (client, _) = setup(&env);
+
+        let mismatched = Address::generate(&env);
+        let matching = Address::generate(&env);
+        register_anchor(&env, &client, &mismatched);
+        register_anchor(&env, &client, &matching);
+        for anchor in [&mismatched, &matching] {
+            client.set_anchor_metadata(anchor, &8000u32, &300u64, &8000u32, &9900u32, &1_000_000u64);
+        }
+
+        // Ineligible EUR/GBP quote.
+        client.submit_quote(
+            &mismatched,
+            &String::from_str(&env, "EUR"),
+            &String::from_str(&env, "GBP"),
+            &10_000u64, &5u32, &100u64, &100_000u64, &1_003_600u64,
+        );
+
+        // Eligible USD/USDC quote.
+        client.submit_quote(
+            &matching,
+            &String::from_str(&env, "USD"),
+            &String::from_str(&env, "USDC"),
+            &10_000u64, &30u32, &100u64, &100_000u64, &1_003_600u64,
+        );
+
+        let options = lowest_fee_options(&env, "USD", "USDC", 5_000);
+        let best = client.route_transaction(&options);
+        assert_eq!(
+            best.anchor, matching,
+            "the matching USD/USDC anchor must be selected when a valid quote exists"
+        );
+    }
 }
 
 // ── CrossAnchorFeeAggregator tests ────────────────────────────────────────────
