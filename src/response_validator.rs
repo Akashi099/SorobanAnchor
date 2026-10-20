@@ -1917,6 +1917,39 @@ mod tests {
         assert!(validate_response_body(body, BodyRequirement::Required).is_ok());
     }
 
+    // ── Issue #1248: extra-property policy for the deposit schema ────────────
+
+    /// The deposit response schema is open (equivalent to
+    /// `additionalProperties: true`): the body check only enforces JSON shape
+    /// and the field-level validator reads named fields, so an unknown property
+    /// is ignored rather than rejected. It must not mask a missing required field.
+    #[test]
+    fn test_deposit_extra_property_ignored_required_fields_enforced() {
+        fn validate(body: &str) -> Result<DepositResponse, Error> {
+            validate_response_body(body, BodyRequirement::Required)?;
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            let field = |k: &str| v.get(k).and_then(|f| f.as_str()).unwrap_or("");
+            validate_deposit_response(
+                field("transaction_id"),
+                field("status"),
+                field("deposit_address"),
+                0,
+                0,
+            )
+        }
+
+        let with_extra = r#"{"transaction_id":"d1","status":"pending","deposit_address":"GABC","unexpected_field":"x"}"#;
+        assert_eq!(
+            validate(with_extra).unwrap(),
+            validate_deposit_response("d1", "pending", "GABC", 0, 0).unwrap()
+        );
+
+        let missing_required = r#"{"status":"pending","deposit_address":"GABC","unexpected_field":"x"}"#;
+        let e = validate(missing_required).unwrap_err();
+        assert_eq!(e.code, crate::errors::ErrorCode::ValidationError);
+        assert!(e.context.as_deref().unwrap_or("").contains("transaction_id"));
+    }
+
     #[test]
     fn test_malformed_json_object_rejected() {
         let result = validate_response_body("{broken", BodyRequirement::Required);
@@ -1976,5 +2009,30 @@ mod tests {
     #[test]
     fn test_body_for_error_leaves_short_body_intact() {
         assert_eq!(body_for_error("{\"ok\":true}"), "{\"ok\":true}");
+    }
+
+    // ── Issue #1249: error context never embeds the raw payload ──────────────
+
+    const SENSITIVE_MARKER: &str = "SYNTHETIC-PII-MARKER-7f3a91";
+
+    /// Validation errors name the failure without copying user data. (Non-JSON
+    /// bodies are a deliberate exception: #830 echoes a bounded prefix, so this
+    /// test uses JSON-shaped and field-level input.)
+    #[test]
+    fn test_validation_error_context_excludes_raw_payload() {
+        let body = alloc::format!(
+            r#"{{"email":"{m}","password":"{m}",}}"#,
+            m = SENSITIVE_MARKER
+        );
+        let e = validate_response_body(&body, BodyRequirement::Required).unwrap_err();
+        assert_eq!(e.code, crate::errors::ErrorCode::ValidationError);
+        assert!(e.context.as_deref().unwrap_or("").contains("malformed JSON"));
+        assert!(!alloc::format!("{:?}", e).contains(SENSITIVE_MARKER));
+
+        // The rejected value itself is not echoed either.
+        let e = validate_deposit_response("d1", SENSITIVE_MARKER, "GABC", 0, 0).unwrap_err();
+        assert_eq!(e.code, crate::errors::ErrorCode::ValidationError);
+        assert!(e.context.as_deref().unwrap_or("").contains("status"));
+        assert!(!alloc::format!("{:?}", e).contains(SENSITIVE_MARKER));
     }
 }
