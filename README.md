@@ -248,6 +248,34 @@ Anchor configs live in `configs/` as JSON or TOML. Validate them with:
 
 Schema reference: `config_schema.json`
 
+### Strict unknown-field rejection
+
+The schema sets `additionalProperties: false` on every object section. Any key
+that is not explicitly listed in the schema causes validation to fail
+immediately. This catches typos in field names before a misconfigured anchor
+reaches production.
+
+For example, a misspelled top-level key is rejected with an actionable path:
+
+```json
+{
+  "contract": { "name": "my-anchor", "version": "1.0.0", "network": "stellar-testnet" },
+  "attestors": { "registry": [ ... ] },
+  "monitorring": {}
+}
+```
+
+```
+schema validation failed:
+(root): [additionalProperties] Additional properties are not allowed ('monitorring' was unexpected)
+```
+
+The fix is to correct the spelling to `monitoring`. Unknown keys are never
+silently ignored — if you need environment-specific values that should not be
+validated, keep them in a separate file (e.g. a `.env` file or a CI secret)
+and reference them by environment variable rather than embedding them in the
+anchor config.
+
 ### Runtime config hot-reload
 
 Long-running host processes (not the on-chain contract, which already
