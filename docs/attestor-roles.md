@@ -6,6 +6,113 @@ This document provides a comprehensive guide to the attestor roles supported by 
 
 Attestors are trusted entities that provide cryptographic attestations for various operations within the anchor ecosystem. Each attestor is assigned a specific role that determines what types of operations they can attest to and what permissions they have within the system.
 
+## The `enabled` Flag
+
+Every entry in `attestors.registry` carries a required `enabled` boolean field.
+
+### What `enabled` controls
+
+The `enabled` flag is a **configuration-layer marker** used to indicate
+whether an attestor should participate in normal workflows.  Its effect at
+each layer is:
+
+| Layer | Behaviour |
+|-------|-----------|
+| Config schema | `enabled` is **required** and must be a boolean. Omitting it causes `offline validate` to fail. |
+| Config loading (`parse_runtime_config_str`) | The field is parsed and stored as `AttestorConfig.enabled: bool`. No entries are dropped during loading — both `true` and `false` entries are retained in the parsed registry. |
+| CLI deploy / register path | The CLI does not filter entries by `enabled`. All registry entries are loaded equally; none are skipped or rejected based on this flag. |
+| Validation and error messages | A disabled entry does not trigger a validation error or a warning. Its fields are validated exactly like those of an enabled entry. |
+
+**Key point:** setting `enabled: false` does **not** prevent the entry from
+appearing in the parsed config, and it does not cause the CLI to skip that
+attestor when it reads the registry.  The flag is a human-readable signal for
+staged rollouts and future tooling — it does not currently affect runtime
+selection.
+
+### When to set `enabled: false`
+
+Use `enabled: false` to document an attestor that has been onboarded to the
+config file but should not yet be active.  This pattern is useful for:
+
+- Staged rollouts: commit the attestor to config review before activating it.
+- Graceful off-boarding: mark an attestor as disabled before removing it so
+  reviewers have a visible change history.
+- Environment-specific overrides: keep a disabled entry as a clear placeholder
+  for a provider that is not yet available in a given environment.
+
+### Snippet: disabled attestor in a config fragment
+
+The following is a valid, schema-conforming TOML config fragment showing a
+disabled attestor alongside an active one.  The offline validator accepts both
+entries; neither entry produces a warning.
+
+```toml
+[attestors]
+
+[[attestors.registry]]
+name        = "kyc-provider"
+address     = "GBBD6A7KNZF5WNWQEPZP5DYJD2AYUTLXRB6VXJ4RCX4RTNPPQVNF3GQ"
+description = "Primary KYC verification service"
+endpoint    = "https://kyc-provider.example.com/verify"
+role        = "kyc-issuer"
+enabled     = true
+
+# This attestor has been onboarded to the config for review but is not yet
+# active.  Setting enabled = false documents the staged-rollout intent.
+# The entry passes schema validation and is visible in the parsed registry,
+# but it is not currently selected by the runtime for any workflow.
+[[attestors.registry]]
+name        = "kyc-provider-backup"
+address     = "GBZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"
+description = "Backup KYC service — staged rollout, not yet active"
+endpoint    = "https://kyc-backup.example.com/verify"
+role        = "kyc-issuer"
+enabled     = false
+```
+
+The equivalent JSON fragment:
+
+```json
+{
+  "attestors": {
+    "registry": [
+      {
+        "name": "kyc-provider",
+        "address": "GBBD6A7KNZF5WNWQEPZP5DYJD2AYUTLXRB6VXJ4RCX4RTNPPQVNF3GQ",
+        "description": "Primary KYC verification service",
+        "endpoint": "https://kyc-provider.example.com/verify",
+        "role": "kyc-issuer",
+        "enabled": true
+      },
+      {
+        "name": "kyc-provider-backup",
+        "address": "GBZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
+        "description": "Backup KYC service — staged rollout, not yet active",
+        "endpoint": "https://kyc-backup.example.com/verify",
+        "role": "kyc-issuer",
+        "enabled": false
+      }
+    ]
+  }
+}
+```
+
+Both fragments pass `anchorkit offline validate` without errors or warnings.
+
+### Validating the snippet
+
+Run the offline validator to confirm the fragment is schema-conforming before
+committing:
+
+```bash
+anchorkit offline validate --config configs/my-anchor.toml
+```
+
+A passing run prints `✓ configs/my-anchor.toml` and exits 0.  No network
+access is required.
+
+---
+
 ## Role Definitions
 
 ### 1. kyc-issuer

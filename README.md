@@ -248,37 +248,33 @@ Anchor configs live in `configs/` as JSON or TOML. Validate them with:
 
 Schema reference: `config_schema.json`
 
-### Validating a config locally (no network or credentials required)
+### Strict unknown-field rejection
 
-You can check any config file offline using `anchorkit offline validate`.
-The command parses the file, validates it against the embedded JSON Schema,
-and checks cross-field constraints — no contract deployment, no network
-connection, and no credentials are needed.
+The schema sets `additionalProperties: false` on every object section. Any key
+that is not explicitly listed in the schema causes validation to fail
+immediately. This catches typos in field names before a misconfigured anchor
+reaches production.
 
-```bash
-# Validate a single file
-anchorkit offline validate --config configs/remittance-anchor.toml
+For example, a misspelled top-level key is rejected with an actionable path:
 
-# Validate all files in configs/
-anchorkit offline validate
+```json
+{
+  "contract": { "name": "my-anchor", "version": "1.0.0", "network": "stellar-testnet" },
+  "attestors": { "registry": [ ... ] },
+  "monitorring": {}
+}
 ```
 
-A passing run prints nothing and exits 0. An error prints a description of
-the first validation failure and exits non-zero, for example:
-
 ```
-error: contract.name cannot be empty or whitespace
+schema validation failed:
+(root): [additionalProperties] Additional properties are not allowed ('monitorring' was unexpected)
 ```
 
-Both `.json` and `.toml` files are accepted. Any other extension produces:
-
-```
-error: unsupported config file extension '.yaml' (supported formats: .json, .toml)
-```
-
-This walkthrough does not require credentials or network access. For a
-full deployment walkthrough see
-[`examples/full_deployment_walkthrough.sh`](examples/full_deployment_walkthrough.sh).
+The fix is to correct the spelling to `monitoring`. Unknown keys are never
+silently ignored — if you need environment-specific values that should not be
+validated, keep them in a separate file (e.g. a `.env` file or a CI secret)
+and reference them by environment variable rather than embedding them in the
+anchor config.
 
 ### Runtime config hot-reload
 

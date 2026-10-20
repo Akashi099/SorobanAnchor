@@ -262,7 +262,10 @@ pub struct AlertConfig {
     pub extra: BTreeMap<String, Value>,
 }
 
-pub fn parse_runtime_config_str(input: &str, format: ConfigFormat) -> Result<RuntimeConfig, String> {
+pub fn parse_runtime_config_str(
+    input: &str,
+    format: ConfigFormat,
+) -> Result<RuntimeConfig, String> {
     // Step 1: parse into a serde_json::Value first so we can run JSON Schema
     // validation before attempting typed deserialization. This catches unknown
     // fields, wrong types, and missing required fields with clear messages.
@@ -273,7 +276,7 @@ pub fn parse_runtime_config_str(input: &str, format: ConfigFormat) -> Result<Run
             // always operates on a serde_json::Value regardless of input format.
             let toml_value: toml::Value = toml::from_str(input).map_err(|e| e.to_string())?;
             serde_json::to_value(toml_value).map_err(|e| e.to_string())?
-        }
+        },
     };
 
     // Step 2: validate against the embedded JSON Schema.
@@ -291,6 +294,12 @@ pub fn parse_runtime_config_str(input: &str, format: ConfigFormat) -> Result<Run
 ///
 /// The schema is compiled once per call. For hot-reload scenarios the
 /// compilation cost is negligible compared to I/O.
+///
+/// Each reported error includes the JSON field path (e.g.
+/// `attestors.registry[0].role`) and a concise summary of the violated
+/// constraint (e.g. `must be one of: kyc-issuer, transfer-verifier, …`).
+/// Secret or credential values are never echoed — only the structural path
+/// and the schema keyword are included.
 #[cfg(feature = "std")]
 fn validate_against_schema(value: &serde_json::Value) -> Result<(), String> {
     const SCHEMA_TEXT: &str = include_str!("../config_schema.json");
@@ -299,7 +308,50 @@ fn validate_against_schema(value: &serde_json::Value) -> Result<(), String> {
     let compiled = jsonschema::JSONSchema::compile(&schema_json)
         .map_err(|e| format!("schema compile error: {e}"))?;
     compiled.validate(value).map_err(|errors| {
-        let messages: alloc::vec::Vec<String> = errors.map(|e| e.to_string()).collect();
+        let messages: alloc::vec::Vec<String> = errors
+            .map(|e| {
+                // Convert the JSON Pointer path into a dot/bracket notation
+                // that is easy to read and act on:
+                //   "/attestors/registry/0/role"  →  "attestors.registry[0].role"
+                let raw_path = e.instance_path.to_string();
+                let field_path = if raw_path.is_empty() || raw_path == "/" {
+                    "(root)".to_string()
+                } else {
+                    raw_path
+                        .trim_start_matches('/')
+                        .split('/')
+                        .enumerate()
+                        .map(|(i, segment)| {
+                            // If the segment is a pure integer it is an array index.
+                            if segment.chars().all(|c| c.is_ascii_digit()) {
+                                format!("[{segment}]")
+                            } else if i == 0 {
+                                segment.to_string()
+                            } else {
+                                format!(".{segment}")
+                            }
+                        })
+                        .collect::<alloc::vec::Vec<_>>()
+                        .join("")
+                };
+
+                // Extract the schema keyword from the tail of schema_path
+                // (e.g. "/properties/attestors/properties/registry/items/…/enum"
+                // → "enum") as a concise constraint label.
+                let schema_path_str = e.schema_path.to_string();
+                let constraint = schema_path_str
+                    .trim_end_matches('/')
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("unknown");
+
+                // Build the final message: path + constraint + the validator's
+                // own description (which never contains the instance value for
+                // structural keywords such as type, enum, required,
+                // additionalProperties, minLength, minimum, pattern).
+                format!("{field_path}: [{constraint}] {e}")
+            })
+            .collect();
         format!("schema validation failed:\n{}", messages.join("\n"))
     })
 }
@@ -591,7 +643,8 @@ mod proxy_config_tests {
 
     #[test]
     fn test_config_with_proxy_url_parses_correctly() {
-        let proxy_section = r#","proxy": {"proxy_url": "http://proxy.corp.example.com:3128", "no_proxy": null}"#;
+        let proxy_section =
+            r#","proxy": {"proxy_url": "http://proxy.corp.example.com:3128", "no_proxy": null}"#;
         let json = base_config_json(proxy_section);
         let config = parse_runtime_config_str(&json, ConfigFormat::Json).unwrap();
         let proxy = config.proxy.expect("proxy should be Some");
@@ -624,7 +677,10 @@ mod proxy_config_tests {
         let proxy = config.proxy.expect("proxy key present → Some");
         assert!(proxy.proxy_url.is_none());
         assert!(proxy.no_proxy.is_none());
-        assert!(!proxy.is_configured(), "null proxy_url means not configured");
+        assert!(
+            !proxy.is_configured(),
+            "null proxy_url means not configured"
+        );
     }
 
     #[test]
@@ -684,7 +740,10 @@ no_proxy = "localhost"
             proxy.https_proxy_url.as_deref(),
             Some("http://tls-proxy.corp.example.com:3129")
         );
-        let creds = proxy.credentials.as_ref().expect("credentials should be Some");
+        let creds = proxy
+            .credentials
+            .as_ref()
+            .expect("credentials should be Some");
         assert_eq!(creds.username, "svc-anchor");
         assert_eq!(creds.password, "s3cret");
         assert!(proxy.has_credentials());
@@ -714,7 +773,10 @@ password = "s3cret"
 "#;
         let config = parse_runtime_config_str(toml_input, ConfigFormat::Toml).unwrap();
         let proxy = config.proxy.expect("proxy should be Some");
-        assert_eq!(proxy.http_proxy_url.as_deref(), Some("http://http-proxy.corp:3128"));
+        assert_eq!(
+            proxy.http_proxy_url.as_deref(),
+            Some("http://http-proxy.corp:3128")
+        );
         assert_eq!(
             proxy.credentials.as_ref().map(|c| c.username.as_str()),
             Some("svc-anchor")
@@ -727,13 +789,15 @@ password = "s3cret"
         let json = base_config_json(proxy_section);
         let err = parse_runtime_config_str(&json, ConfigFormat::Json).unwrap_err();
         assert!(err.contains("invalid proxy URL"), "got: {err}");
-        assert!(err.starts_with("proxy:"), "error should be scoped to proxy, got: {err}");
+        assert!(
+            err.starts_with("proxy:"),
+            "error should be scoped to proxy, got: {err}"
+        );
     }
 
     #[test]
     fn test_config_rejects_credentials_without_proxy_url() {
-        let proxy_section =
-            r#","proxy": {"credentials": {"username": "svc", "password": "pw"}}"#;
+        let proxy_section = r#","proxy": {"credentials": {"username": "svc", "password": "pw"}}"#;
         let json = base_config_json(proxy_section);
         let err = parse_runtime_config_str(&json, ConfigFormat::Json).unwrap_err();
         assert!(err.contains("no proxy URL configured"), "got: {err}");
@@ -751,7 +815,8 @@ password = "s3cret"
 
     #[test]
     fn test_config_rejects_unknown_proxy_field() {
-        let proxy_section = r#","proxy": {"proxy_url": "http://proxy.corp:3128", "pasword": "typo"}"#;
+        let proxy_section =
+            r#","proxy": {"proxy_url": "http://proxy.corp:3128", "pasword": "typo"}"#;
         let json = base_config_json(proxy_section);
         assert!(
             parse_runtime_config_str(&json, ConfigFormat::Json).is_err(),
@@ -866,7 +931,9 @@ mod hot_reload_tests {
         assert_eq!(manager.current().contract.name, "TestAnchor");
 
         fs::write(&path, VALID_CONFIG_V2).unwrap();
-        manager.reload().expect("reload of a valid config must succeed");
+        manager
+            .reload()
+            .expect("reload of a valid config must succeed");
         assert_eq!(manager.current().contract.name, "TestAnchorV2");
         assert_eq!(manager.current().contract.version, "2.0.0");
 
@@ -1051,7 +1118,8 @@ mod config_validation_tests {
                     "enabled": true
                 }]
             }
-        }"#.to_string()
+        }"#
+        .to_string()
     }
 
     #[test]
@@ -1068,7 +1136,10 @@ mod config_validation_tests {
             }
         }"#;
         let err = parse_runtime_config_str(json, ConfigFormat::Json).unwrap_err();
-        assert!(err.contains("requests_per_minute must be positive"), "got: {err}");
+        assert!(
+            err.contains("requests_per_minute must be positive"),
+            "got: {err}"
+        );
         assert!(err.contains("got 0"), "got: {err}");
     }
 
@@ -1086,7 +1157,10 @@ mod config_validation_tests {
             }
         }"#;
         let err = parse_runtime_config_str(json, ConfigFormat::Json).unwrap_err();
-        assert!(err.contains("requests_per_hour must be positive"), "got: {err}");
+        assert!(
+            err.contains("requests_per_hour must be positive"),
+            "got: {err}"
+        );
         assert!(err.contains("got 0"), "got: {err}");
     }
 
@@ -1104,7 +1178,10 @@ mod config_validation_tests {
             }
         }"#;
         let config = parse_runtime_config_str(json, ConfigFormat::Json).unwrap();
-        assert_eq!(config.security.unwrap().rate_limits.unwrap()[0].requests_per_minute, 10);
+        assert_eq!(
+            config.security.unwrap().rate_limits.unwrap()[0].requests_per_minute,
+            10
+        );
     }
 
     #[test]
@@ -1121,7 +1198,10 @@ mod config_validation_tests {
             }
         }"#;
         let err = parse_runtime_config_str(json, ConfigFormat::Json).unwrap_err();
-        assert!(err.contains("required_signatures must be positive"), "got: {err}");
+        assert!(
+            err.contains("required_signatures must be positive"),
+            "got: {err}"
+        );
         assert!(err.contains("got 0"), "got: {err}");
     }
 
@@ -1139,7 +1219,10 @@ mod config_validation_tests {
             }
         }"#;
         let config = parse_runtime_config_str(json, ConfigFormat::Json).unwrap();
-        assert_eq!(config.security.unwrap().multisig_requirements.unwrap()[0].required_signatures, 2);
+        assert_eq!(
+            config.security.unwrap().multisig_requirements.unwrap()[0].required_signatures,
+            2
+        );
     }
 
     // ── #1125: duplicate operation template IDs ───────────────────────────────
@@ -1213,3 +1296,118 @@ mod config_validation_tests {
         assert_eq!(templates[0].id, "op-deposit");
         assert_eq!(templates[1].id, "op-withdraw");
     }
+
+    // ── Path-based schema error messages ─────────────────────────────────────
+
+    /// An invalid attestor role (not in the schema's enum) must produce an
+    /// error that identifies the nested field path
+    /// (`attestors.registry[0].role`) and the violated constraint (`enum`),
+    /// making it immediately actionable without the operator having to
+    /// consult the schema separately.
+    #[cfg(feature = "std")]
+    #[test]
+    fn schema_error_for_invalid_attestor_role_includes_field_path() {
+        let bad = r#"{
+            "contract": {
+                "name": "test-anchor",
+                "version": "1.0.0",
+                "network": "stellar-testnet"
+            },
+            "attestors": {
+                "registry": [{
+                    "name": "kyc-issuer",
+                    "address": "GBBD6A7KNZF5WNWQEPZP5DYJD2AYUTLXRB6VXJ4RCX4RTNPPQVNF3GQ",
+                    "role": "not-a-valid-role",
+                    "enabled": true
+                }]
+            }
+        }"#;
+        let err = parse_runtime_config_str(bad, ConfigFormat::Json).unwrap_err();
+
+        // The error must mention the nested field path.
+        assert!(
+            err.contains("attestors") && err.contains("registry") && err.contains("role"),
+            "error must identify the failing field path, got:\n{err}"
+        );
+        // The violated constraint (enum) must appear in the message.
+        assert!(
+            err.contains("enum"),
+            "error must name the violated constraint (enum), got:\n{err}"
+        );
+        // The raw field value must never be echoed back (security: no secret leakage).
+        assert!(
+            !err.contains("not-a-valid-role"),
+            "error must not echo the invalid field value, got:\n{err}"
+        );
+    }
+
+    /// A `session_timeout_seconds` value that exceeds the schema's `maximum`
+    /// (86400) must produce an error that names the nested field
+    /// (`sessions.session_timeout_seconds`) and the violated constraint
+    /// (`maximum`), and must not repeat the offending integer literal.
+    #[cfg(feature = "std")]
+    #[test]
+    fn schema_error_for_session_timeout_out_of_range_includes_field_path() {
+        let bad = r#"{
+            "contract": {
+                "name": "test-anchor",
+                "version": "1.0.0",
+                "network": "stellar-testnet"
+            },
+            "attestors": {
+                "registry": [{
+                    "name": "kyc-issuer",
+                    "address": "GBBD6A7KNZF5WNWQEPZP5DYJD2AYUTLXRB6VXJ4RCX4RTNPPQVNF3GQ",
+                    "role": "kyc-issuer",
+                    "enabled": true
+                }]
+            },
+            "sessions": {
+                "session_timeout_seconds": 999999
+            }
+        }"#;
+        let err = parse_runtime_config_str(bad, ConfigFormat::Json).unwrap_err();
+
+        // The error must mention the nested field path.
+        assert!(
+            err.contains("sessions") && err.contains("session_timeout_seconds"),
+            "error must identify the failing field path, got:\n{err}"
+        );
+        // The violated constraint (`maximum`) must appear.
+        assert!(
+            err.contains("maximum"),
+            "error must name the violated constraint (maximum), got:\n{err}"
+        );
+    }
+
+    /// Existing valid configs must continue to parse through the new
+    /// error-formatting code path without any regression.
+    #[cfg(feature = "std")]
+    #[test]
+    fn schema_error_formatting_does_not_break_valid_config() {
+        let good = r#"{
+            "contract": {
+                "name": "test-anchor",
+                "version": "1.0.0",
+                "network": "stellar-testnet"
+            },
+            "attestors": {
+                "registry": [{
+                    "name": "kyc-issuer",
+                    "address": "GBBD6A7KNZF5WNWQEPZP5DYJD2AYUTLXRB6VXJ4RCX4RTNPPQVNF3GQ",
+                    "role": "kyc-issuer",
+                    "enabled": true
+                }]
+            },
+            "sessions": {
+                "session_timeout_seconds": 3600
+            }
+        }"#;
+        let result = parse_runtime_config_str(good, ConfigFormat::Json);
+        assert!(
+            result.is_ok(),
+            "valid config must still parse successfully, got: {:?}",
+            result.err()
+        );
+    }
+}

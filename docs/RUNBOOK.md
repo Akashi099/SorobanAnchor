@@ -53,6 +53,24 @@ Run pre-deployment validation:
 
 This validates all config files against the schema and checks dependencies.
 
+You can also run the offline validator directly, without any network access,
+to check config files before the full pre-deploy suite:
+
+```bash
+# Validate all files in configs/
+anchorkit offline validate
+
+# Validate a single file
+anchorkit offline validate --config configs/my-anchor.toml
+```
+
+The offline validator checks JSON schema compliance, required fields, and
+cross-field references (duplicate attestor names, unknown attestors referenced
+in operation templates, etc.).  It makes no network calls and is safe to run
+in air-gapped environments.
+
+See also: `anchorkit offline validate --help` for accepted formats and options.
+
 ---
 
 ## Build and Packaging
@@ -92,6 +110,48 @@ The release bundle in `dist/anchorkit-<VERSION>/` contains:
 
 ## Deployment
 
+### Mainnet Confirmation
+
+Deploying to mainnet requires an explicit confirmation step to prevent
+accidental production deployments.
+
+**Interactive (default):** When `--network mainnet` is used without `--yes` or
+`--no-interactive`, the CLI prints the following prompt to stderr and waits for
+input:
+
+```
+⚠️  You are about to deploy to MAINNET. Continue? [y/N]:
+```
+
+Only `y` or `yes` (case-insensitive) proceeds. Any other input, an empty
+reply, or pressing Enter on the default `N` aborts the deploy with exit code 1
+and the message:
+
+```
+Aborted: mainnet deployment not confirmed.
+hint: re-run with --yes to skip this prompt in scripted/CI environments.
+```
+
+**Non-interactive / automation:** Pass `--yes` to bypass the prompt entirely.
+This is the correct approach for CI pipelines, deployment scripts, and any
+environment where stdin is not a terminal:
+
+```bash
+./target/release/anchorkit deploy --network mainnet --yes
+```
+
+`--no-interactive` also bypasses the prompt (it suppresses all interactive
+prompts tool-wide), but `--yes` is preferred for mainnet deploys because it
+makes the intent explicit.
+
+> **Note:** If the deploy runs in an environment where stdin is unavailable
+> (a subprocess with no TTY, a container with closed stdin, etc.) and `--yes`
+> is not supplied, `read_line` will fail and the deployment will be aborted.
+> Always pass `--yes` in automated pipelines.
+
+**Non-mainnet networks** (testnet, futurenet, custom profiles) never show this
+prompt regardless of flags.
+
 ### Initial Deployment
 
 1. Verify the WASM checksum:
@@ -101,7 +161,14 @@ sha256sum dist/anchorkit-<VERSION>/anchorkit.wasm
 
 2. Deploy using the CLI:
 ```bash
-./target/release/anchorkit deploy --network $SOROBAN_NETWORK
+# testnet (no confirmation required)
+./target/release/anchorkit deploy --network testnet
+
+# mainnet — interactive confirmation
+./target/release/anchorkit deploy --network mainnet
+
+# mainnet — non-interactive / CI
+./target/release/anchorkit deploy --network mainnet --yes
 ```
 
 3. Initialize the contract with admin address:
