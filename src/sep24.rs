@@ -90,9 +90,11 @@ pub struct Sep24TransactionStatusResponse {
 /// [`validate_anchor_domain`], which enforces https-only, no userinfo, no IP
 /// literals, and a valid registered domain.
 ///
-/// When `allowed_origin` is `Some`, the scheme + host (+ optional port) of
-/// `url` must match it case-insensitively. Any mismatch returns
-/// [`ErrorCode::InvalidEndpointFormat`].
+/// When `allowed_origin` is `Some`, the normalized scheme, host, and effective
+/// port of `url` must match it. Host and scheme comparisons are case-insensitive;
+/// default ports are normalized away. The path, query, and fragment may differ,
+/// but a different scheme, host, or non-default port is a cross-origin URL and
+/// returns [`ErrorCode::InvalidEndpointFormat`].
 ///
 /// # Examples
 ///
@@ -566,6 +568,16 @@ mod tests {
     #[test]
     fn test_validate_interactive_url_strips_default_port() {
         assert!(validate_interactive_url("https://anchor.example.com:443/deposit", None).is_ok());
+    }
+
+    #[test]
+    fn test_validate_interactive_url_rejects_cross_origin_redirect() {
+        let err = validate_interactive_url(
+            "https://evil.example.com/dep",
+            Some("https://anchor.example.com"),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidEndpointFormat);
     }
 
     #[test]
