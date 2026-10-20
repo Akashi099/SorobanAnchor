@@ -473,6 +473,47 @@ mod webhook_middleware_tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Issue #1286 — maximum delivery attempts with always-failing transport
+    // -----------------------------------------------------------------------
+
+    /// A transport that always returns a connection error must be called exactly
+    /// max_attempts times, the result must be WebhookDeliveryFailed, and the DLQ
+    /// entry must record attempts_made == max_attempts with status 0 (transport err).
+    #[test]
+    fn test_always_failing_transport_exhausts_configured_attempts() {
+        let call_count = Arc::new(Mutex::new(0u32));
+        let cc = call_count.clone();
+        let max_attempts = 4u32;
+
+        let mut dlq: BTreeMap<String, Vec<DlqEntry>> = BTreeMap::new();
+        let result = deliver_webhook(
+            &config(max_attempts),
+            r#"{"event":"ping"}"#,
+            &mut dlq,
+            move |_url, _body, _sig| {
+                *cc.lock().unwrap() += 1;
+                Err("connection refused".to_string())
+            },
+            |_| {},
+            || 1_000_000u64,
+        );
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, ErrorCode::WebhookDeliveryFailed);
+        assert_eq!(
+            *call_count.lock().unwrap(),
+            max_attempts,
+            "transport must be called exactly max_attempts={} times",
+            max_attempts,
+        );
+        let entries = get_dead_letter_webhooks(&dlq, "test_dlq");
+        assert_eq!(entries.len(), 1, "exactly one DLQ entry must be written");
+        assert_eq!(entries[0].attempts_made, max_attempts);
+        assert_eq!(entries[0].last_status_code, 0, "transport failure sets status to 0");
+    }
+
     /// Non-empty nonces retain their normal signature, age, and replay semantics.
     #[test]
     fn test_nonempty_nonce_normal_semantics() {
