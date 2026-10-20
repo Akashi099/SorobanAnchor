@@ -1664,4 +1664,50 @@ mod retry_tests {
         assert_eq!(config.strategy, BackoffStrategy::Linear);
         assert_eq!(config.jitter_policy, JitterPolicy::None);
     }
+
+    // -----------------------------------------------------------------------
+    // Issue #1284 — exponential backoff cap
+    // -----------------------------------------------------------------------
+
+    /// Delay equals max_delay_ms once exponential growth would exceed it.
+    ///
+    /// base=100ms, ×2 multiplier, cap=500ms, no jitter.
+    /// Uncapped values: attempt 0→100, 1→200, 2→400, 3→800 (>500), 5→3200 (>500).
+    /// The cap must clamp those to exactly 500.
+    #[test]
+    fn test_exponential_backoff_capped_at_max_delay() {
+        let config = RetryConfig::new(10, 100, 500, 2).unwrap()
+            .with_jitter_policy(JitterPolicy::None);
+        let mut js = MockJitterSource::new(vec![0]);
+
+        assert_eq!(config.delay_for_attempt(3, &mut js), 500,
+            "uncapped=800 must be clamped to max_delay_ms=500");
+        assert_eq!(config.delay_for_attempt(5, &mut js), 500,
+            "uncapped=3200 must be clamped to max_delay_ms=500");
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #1285 — non-retryable error classification
+    // -----------------------------------------------------------------------
+
+    /// A non-retryable ErrorCode results in exactly one attempt and the original
+    /// error is returned without modification.
+    #[test]
+    fn test_non_retryable_error_code_produces_single_attempt() {
+        use crate::errors::ErrorCode;
+        let config = RetryConfig::new(5, 0, 1_000, 2).unwrap();
+        let mut calls = 0u32;
+        let mut js = MockJitterSource::new(vec![0]);
+
+        let result = retry_with_backoff(
+            &config,
+            |_| { calls += 1; Err::<i32, ErrorCode>(ErrorCode::ValidationError) },
+            |&code| is_retryable(code),
+            |_| {},
+            &mut js,
+        );
+
+        assert_eq!(result, Err(ErrorCode::ValidationError));
+        assert_eq!(calls, 1, "non-retryable error must stop after a single attempt");
+    }
 }
