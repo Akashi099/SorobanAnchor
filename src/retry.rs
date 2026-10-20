@@ -1664,4 +1664,66 @@ mod retry_tests {
         assert_eq!(config.strategy, BackoffStrategy::Linear);
         assert_eq!(config.jitter_policy, JitterPolicy::None);
     }
+
+    // -----------------------------------------------------------------------
+    // Issue #1281 — first-attempt success
+    // -----------------------------------------------------------------------
+
+    /// A successful first attempt must invoke the operation exactly once,
+    /// preserve the returned value, and never fire the sleep callback.
+    #[test]
+    fn test_first_attempt_success_single_call_no_sleep_value_preserved() {
+        let config = RetryConfig::new(3, 50, 5_000, 2).unwrap();
+        let mut calls = 0u32;
+        let mut sleep_calls = 0u32;
+        let mut js = MockJitterSource::new(vec![0]);
+
+        let result = retry_with_backoff(
+            &config,
+            |_| {
+                calls += 1;
+                Ok::<u32, TestError>(77)
+            },
+            is_retryable_test,
+            |_| sleep_calls += 1,
+            &mut js,
+        );
+
+        assert_eq!(result, Ok(77), "success value must be preserved");
+        assert_eq!(calls, 1, "operation must be invoked exactly once on first-attempt success");
+        assert_eq!(sleep_calls, 0, "no delay may fire when the first attempt succeeds");
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #1282 — retry limit counts total attempts
+    // -----------------------------------------------------------------------
+
+    /// `max_attempts` is the total number of invocations including the first try,
+    /// not a retry count.  With `max_attempts = 4` a permanently failing
+    /// operation must be called exactly 4 times — not 3.
+    #[test]
+    fn test_max_attempts_counts_total_invocations_not_retries() {
+        let config = RetryConfig::new(4, 0, 1_000, 1).unwrap();
+        let mut calls = 0u32;
+        let mut js = MockJitterSource::new(vec![0]);
+
+        let result = retry_with_backoff(
+            &config,
+            |_| {
+                calls += 1;
+                Err::<i32, _>(TestError::Transient)
+            },
+            is_retryable_test,
+            |_| {},
+            &mut js,
+        );
+
+        assert!(result.is_err());
+        // max_attempts = 4 → 4 total attempts (attempt 0 through 3);
+        // retries = max_attempts - 1 = 3.
+        assert_eq!(
+            calls, 4,
+            "max_attempts is total attempts including the first try, not a retry count"
+        );
+    }
 }

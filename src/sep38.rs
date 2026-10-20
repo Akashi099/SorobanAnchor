@@ -720,6 +720,18 @@ pub struct CachedQuoteEntry {
 ///
 /// Entries are keyed by an arbitrary `String` (e.g. anchor ID or asset pair).
 /// A `get` call returns `None` for both unknown keys and stale (past-TTL) entries.
+///
+/// ## Expired-entry behaviour
+///
+/// When an entry's TTL has elapsed (`now >= cached_at + ttl_seconds`), `get`
+/// returns `None` — identical to a cache miss for an unknown key.  There is no
+/// stale-serving fallback: expired data is never returned regardless of whether
+/// a fresh replacement is available.  To eagerly reclaim memory from expired
+/// entries call `evict_stale`; until then they remain in the backing store but
+/// are invisible to readers.  The observable contract is therefore: a TTL expiry
+/// is indistinguishable from a miss at the `get` call-site.  For the on-chain
+/// governance policy that bounds the TTL of metadata and capability cache entries,
+/// see [`crate::cache_governance::CachePolicy`].
 #[derive(Debug, Default)]
 pub struct QuoteCache {
     entries: AllocVec<CachedQuoteEntry>,
@@ -2451,5 +2463,39 @@ mod partial_quote_tests {
         assert!(!is_valid_positive_decimal("1.2.3"));
         assert!(!is_valid_positive_decimal("-1"));
         assert!(!is_valid_positive_decimal("+1"));
+    }
+
+    // ── Issue #1279 — one provider failure must not discard a successful quote ──
+
+    /// Two simulated providers: A returns a complete raw quote; B fails with a
+    /// deterministic error (no network access).  After processing, Provider A's
+    /// quote must remain available and Provider B's failure must not affect it.
+    #[test]
+    fn test_one_provider_failure_preserves_successful_quote() {
+        // Provider A: succeeds and returns a complete raw quote.
+        let provider_a: Result<RawPartialFirmQuote, &str> = Ok(raw_full());
+        // Provider B: fails with a deterministic, non-network error.
+        let provider_b: Result<RawPartialFirmQuote, &str> = Err("provider_b_unavailable");
+
+        // Parse each successful provider result into a PartialFirmQuote.
+        let partial_quotes: AllocVec<PartialFirmQuote> = [provider_a, provider_b]
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .map(parse_partial_quote)
+            .collect();
+
+        assert_eq!(
+            partial_quotes.len(), 1,
+            "one provider failure must not discard the successful quote"
+        );
+        assert!(
+            partial_quotes[0].is_complete(),
+            "the surviving quote must be complete (no missing fields)"
+        );
+        assert_eq!(partial_quotes[0].id, Some("q-partial".into()));
+        assert!(
+            partial_quotes[0].missing_fields.is_empty(),
+            "successful quote carries no diagnostic metadata from the failed provider"
+        );
     }
 }
