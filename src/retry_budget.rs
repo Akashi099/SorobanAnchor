@@ -383,4 +383,34 @@ mod tests {
 
         assert_eq!(sleep_calls, 2);
     }
+
+    // -----------------------------------------------------------------------
+    // Issue #1283 — retry budget exhaustion
+    // -----------------------------------------------------------------------
+
+    /// Consuming all budget attempts externally and then calling execute_with_budget
+    /// must not invoke the operation — the budget-exhausted path fires immediately.
+    #[test]
+    fn budget_exhausted_before_execute_denies_operation_without_calling_it() {
+        let mut budget = RetryBudget::new("req-exhaust", 3);
+        for _ in 0..3 {
+            let _ = budget.consume();
+        }
+        assert!(budget.is_exhausted());
+        assert_eq!(budget.remaining(), 0);
+
+        let mut calls = 0u32;
+        let result: Result<u32, &str> = execute_with_budget(
+            &mut budget,
+            |_| { calls += 1; Ok(1) },
+            |_| true,
+            |_| {},
+            |_| "exhausted",
+            |_| 0,
+        );
+
+        assert_eq!(result, Err("exhausted"));
+        assert_eq!(calls, 0, "operation must not be invoked when budget is already exhausted");
+        assert_eq!(budget.consumed(), 3, "consumed count must not change after exhaustion");
+    }
 }

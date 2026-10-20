@@ -247,6 +247,63 @@ mod fallback_quote_tests {
     }
 
     // -------------------------------------------------------------------------
+    // #1270: Fallback triggered specifically when preferred quote is expired
+    // Two otherwise comparable quotes; only the non-expired one must be selected.
+    // No real-time clock is used — all timestamps are deterministic constants.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_route_fallback_after_expired_quote() {
+        let env = make_env();
+        let (admin, client) = setup(&env);
+
+        let expired_anchor = Address::generate(&env);
+        let valid_anchor = Address::generate(&env);
+        register_anchor(&env, &client, &expired_anchor);
+        register_anchor(&env, &client, &valid_anchor);
+
+        // Both anchors have identical metadata so that fee / reputation cannot
+        // distinguish them — only expiry differs.
+        client.set_anchor_metadata(&expired_anchor, &80u32, &60u64, &80u32, &99u32, &1_000u64);
+        client.set_anchor_metadata(&valid_anchor, &80u32, &60u64, &80u32, &99u32, &1_000u64);
+
+        // Quote A: expires at t=1_000_500, i.e. 500 s after the ledger base time.
+        client.submit_quote(
+            &expired_anchor,
+            &String::from_str(&env, "USD"),
+            &String::from_str(&env, "USDC"),
+            &10_000u64,
+            &25u32,   // same fee as valid_anchor
+            &100u64,
+            &100_000u64,
+            &1_000_500u64, // expires soon
+        );
+
+        // Quote B: valid for one hour from base time.
+        client.submit_quote(
+            &valid_anchor,
+            &String::from_str(&env, "USD"),
+            &String::from_str(&env, "USDC"),
+            &10_000u64,
+            &25u32,   // same fee — only validity differs
+            &100u64,
+            &100_000u64,
+            &1_003_600u64, // valid for 1 hour
+        );
+
+        // Advance ledger past Quote A's expiry so that it becomes ineligible.
+        set_ledger(&env, 1_001_000);
+
+        // route_with_fallback uses expired_anchor as the preferred anchor,
+        // but its quote has expired.  The router must fall back to valid_anchor.
+        let result = client.route_with_fallback(&base_options(&env, &admin), &expired_anchor);
+        assert_eq!(
+            result.anchor, valid_anchor,
+            "expired quote must never be selected; valid fallback quote must be chosen"
+        );
+    }
+
+    // -------------------------------------------------------------------------
     // No fallback available — must panic with NoQuotesAvailable
     // -------------------------------------------------------------------------
 

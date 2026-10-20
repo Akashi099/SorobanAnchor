@@ -316,6 +316,89 @@ mod routing_reason_contract_tests {
             "reason must survive InProgress→Failed"
         );
     }
+
+    // ── #1269: Fee-based selection reason assertion ───────────────────────────
+
+    /// When two anchors submit quotes with distinct fees and the "lowest_fee"
+    /// routing reason, the route_transaction result must select the lower-fee
+    /// anchor AND carry the "lowest_fee" routing reason.  This test verifies
+    /// that the chosen route and its explanatory reason are consistent.
+    ///
+    /// Fee is the sole decisive criterion (both anchors have identical metadata
+    /// in every other dimension), so any other outcome would indicate a bug in
+    /// the fee-ranking logic.
+    #[test]
+    fn test_fee_based_selection_reason_matches_selected_anchor() {
+        use soroban_sdk::{Symbol, Vec};
+        use anchorkit::contract::{RoutingOptions, RoutingRequest};
+
+        let env = make_env();
+        set_ledger(&env, 1_000_000);
+        let (client, _) = setup(&env);
+
+        let low_fee_anchor = Address::generate(&env);
+        let high_fee_anchor = Address::generate(&env);
+        register_anchor(&env, &client, &low_fee_anchor);
+        register_anchor(&env, &client, &high_fee_anchor);
+
+        // Identical metadata — fee is the only differentiator.
+        client.set_anchor_metadata(&low_fee_anchor, &8000u32, &300u64, &8000u32, &9900u32, &1_000_000u64);
+        client.set_anchor_metadata(&high_fee_anchor, &8000u32, &300u64, &8000u32, &9900u32, &1_000_000u64);
+
+        // Low-fee anchor quotes 10 bps; reason tagged as "lowest_fee".
+        client.submit_quote_with_reason(
+            &low_fee_anchor,
+            &String::from_str(&env, "USD"),
+            &String::from_str(&env, "USDC"),
+            &10_000u64, &10u32, &100u64, &100_000u64, &1_003_600u64,
+            &Some(String::from_str(&env, "lowest_fee")),
+        );
+
+        // High-fee anchor quotes 80 bps; also tagged with "lowest_fee" so that
+        // the only way to assert correctness is to check the selected anchor.
+        client.submit_quote_with_reason(
+            &high_fee_anchor,
+            &String::from_str(&env, "USD"),
+            &String::from_str(&env, "USDC"),
+            &10_000u64, &80u32, &100u64, &100_000u64, &1_003_600u64,
+            &Some(String::from_str(&env, "lowest_fee")),
+        );
+
+        let mut strategy = Vec::new(&env);
+        strategy.push_back(Symbol::new(&env, "LowestFee"));
+        let options = RoutingOptions {
+            request: RoutingRequest {
+                base_asset: String::from_str(&env, "USD"),
+                quote_asset: String::from_str(&env, "USDC"),
+                amount: 5_000,
+                operation_type: 1,
+            },
+            strategy,
+            min_reputation: 0,
+            max_anchors: 10,
+            require_kyc: false,
+            require_compliance: false,
+            subject: Address::generate(&env),
+            fee_weight: 333,
+            speed_weight: 333,
+            reputation_weight: 334,
+        };
+
+        let best = client.route_transaction(&options);
+
+        // The selected anchor must be the one with the lowest fee.
+        assert_eq!(
+            best.anchor, low_fee_anchor,
+            "LowestFee strategy must select the anchor with the smaller fee_percentage"
+        );
+
+        // The winning quote's routing reason must match the fee-selection label.
+        assert_eq!(
+            best.routing_reason,
+            Some(String::from_str(&env, "lowest_fee")),
+            "routing reason on the selected quote must agree with the fee-ranking outcome"
+        );
+    }
 }
 
 // ── Tracker-level unit tests ─────────────────────────────────────────────────

@@ -251,6 +251,30 @@ mod tests {
         assert_eq!(guard.window_size(), 2);
     }
 
+    // ── Empty request ID (#1245) ─────────────────────────────────────────────
+
+    /// The guard performs no request-ID validation: `""` is an ordinary dedup
+    /// key. The first empty ID is accepted and recorded; any later empty ID in
+    /// the window — even from a different actor, i.e. an unrelated operation —
+    /// collapses onto that key and is reported as a replay. Callers that need
+    /// to distinguish such requests must reject empty IDs before the guard.
+    #[test]
+    fn test_empty_request_id_is_accepted_then_replayed() {
+        let mut guard = HostReplayGuard::new(300);
+        assert!(guard.check("", "GXXX", 1_000).is_accepted());
+        assert!(guard.is_known(""));
+
+        // The actor is not part of the key, so another submitter's empty ID
+        // is a replay of the first one.
+        let result = guard.check("", "GYYY", 1_001);
+        assert_eq!(result, CheckResult::Replay { first_seen_at: 1_000 });
+        assert_eq!(guard.accepted_count, 1);
+        assert_eq!(guard.replay_count, 1);
+
+        // A non-empty ID is an independent key and is unaffected.
+        assert!(guard.check("req-001", "GXXX", 1_001).is_accepted());
+    }
+
     // ── Window expiry / pruning ──────────────────────────────────────────────
 
     #[test]

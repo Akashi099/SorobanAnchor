@@ -728,6 +728,40 @@ mod deterministic_hash_tests {
     }
 
     // -------------------------------------------------------------------------
+    // Nested JSON key order (#1247)
+    // -------------------------------------------------------------------------
+
+    /// Hash a JSON payload using the nested-payload rule above: canonicalize
+    /// the value, then feed its bytes in as a `Bytes` field. serde_json's
+    /// `Value` map is a `BTreeMap` (`preserve_order` is not enabled), so object
+    /// keys serialize sorted at every depth while arrays keep their order.
+    fn canonical_json_hash(env: &Env, json: &str) -> BytesN<32> {
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        let bytes = Bytes::from_slice(env, &serde_json::to_vec(&value).unwrap());
+        compute_canonical_hash(env, &[CanonicalField::Bytes(&bytes)])
+    }
+
+    #[test]
+    fn test_nested_json_key_order_does_not_change_hash() {
+        let env = Env::default();
+        let a = r#"{"id":"txn-1","meta":{"asset":{"code":"USDC","issuer":"GABC"},"amount":"10"},"tags":["kyc","fast"]}"#;
+        let b = r#"{"tags":["kyc","fast"],"meta":{"amount":"10","asset":{"issuer":"GABC","code":"USDC"}},"id":"txn-1"}"#;
+        assert_eq!(
+            canonical_json_hash(&env, a),
+            canonical_json_hash(&env, b),
+            "reordering nested object keys must not change the digest"
+        );
+
+        // Array order is data, not formatting.
+        let c = r#"{"id":"txn-1","meta":{"asset":{"code":"USDC","issuer":"GABC"},"amount":"10"},"tags":["fast","kyc"]}"#;
+        assert_ne!(
+            canonical_json_hash(&env, a),
+            canonical_json_hash(&env, c),
+            "reordering array elements must change the digest"
+        );
+    }
+
+    // -------------------------------------------------------------------------
     // Domain-separation constant — task 4
     // -------------------------------------------------------------------------
 

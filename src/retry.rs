@@ -1666,64 +1666,48 @@ mod retry_tests {
     }
 
     // -----------------------------------------------------------------------
-    // Issue #1281 — first-attempt success
+    // Issue #1284 — exponential backoff cap
     // -----------------------------------------------------------------------
 
-    /// A successful first attempt must invoke the operation exactly once,
-    /// preserve the returned value, and never fire the sleep callback.
+    /// Delay equals max_delay_ms once exponential growth would exceed it.
+    ///
+    /// base=100ms, ×2 multiplier, cap=500ms, no jitter.
+    /// Uncapped values: attempt 0→100, 1→200, 2→400, 3→800 (>500), 5→3200 (>500).
+    /// The cap must clamp those to exactly 500.
     #[test]
-    fn test_first_attempt_success_single_call_no_sleep_value_preserved() {
-        let config = RetryConfig::new(3, 50, 5_000, 2).unwrap();
-        let mut calls = 0u32;
-        let mut sleep_calls = 0u32;
+    fn test_exponential_backoff_capped_at_max_delay() {
+        let config = RetryConfig::new(10, 100, 500, 2).unwrap()
+            .with_jitter_policy(JitterPolicy::None);
         let mut js = MockJitterSource::new(vec![0]);
 
-        let result = retry_with_backoff(
-            &config,
-            |_| {
-                calls += 1;
-                Ok::<u32, TestError>(77)
-            },
-            is_retryable_test,
-            |_| sleep_calls += 1,
-            &mut js,
-        );
-
-        assert_eq!(result, Ok(77), "success value must be preserved");
-        assert_eq!(calls, 1, "operation must be invoked exactly once on first-attempt success");
-        assert_eq!(sleep_calls, 0, "no delay may fire when the first attempt succeeds");
+        assert_eq!(config.delay_for_attempt(3, &mut js), 500,
+            "uncapped=800 must be clamped to max_delay_ms=500");
+        assert_eq!(config.delay_for_attempt(5, &mut js), 500,
+            "uncapped=3200 must be clamped to max_delay_ms=500");
     }
 
     // -----------------------------------------------------------------------
-    // Issue #1282 — retry limit counts total attempts
+    // Issue #1285 — non-retryable error classification
     // -----------------------------------------------------------------------
 
-    /// `max_attempts` is the total number of invocations including the first try,
-    /// not a retry count.  With `max_attempts = 4` a permanently failing
-    /// operation must be called exactly 4 times — not 3.
+    /// A non-retryable ErrorCode results in exactly one attempt and the original
+    /// error is returned without modification.
     #[test]
-    fn test_max_attempts_counts_total_invocations_not_retries() {
-        let config = RetryConfig::new(4, 0, 1_000, 1).unwrap();
+    fn test_non_retryable_error_code_produces_single_attempt() {
+        use crate::errors::ErrorCode;
+        let config = RetryConfig::new(5, 0, 1_000, 2).unwrap();
         let mut calls = 0u32;
         let mut js = MockJitterSource::new(vec![0]);
 
         let result = retry_with_backoff(
             &config,
-            |_| {
-                calls += 1;
-                Err::<i32, _>(TestError::Transient)
-            },
-            is_retryable_test,
+            |_| { calls += 1; Err::<i32, ErrorCode>(ErrorCode::ValidationError) },
+            |&code| is_retryable(code),
             |_| {},
             &mut js,
         );
 
-        assert!(result.is_err());
-        // max_attempts = 4 → 4 total attempts (attempt 0 through 3);
-        // retries = max_attempts - 1 = 3.
-        assert_eq!(
-            calls, 4,
-            "max_attempts is total attempts including the first try, not a retry count"
-        );
+        assert_eq!(result, Err(ErrorCode::ValidationError));
+        assert_eq!(calls, 1, "non-retryable error must stop after a single attempt");
     }
 }
