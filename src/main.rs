@@ -3648,3 +3648,68 @@ mod cli_validation_tests {
         assert!(confirm_mainnet_deploy("mainnet", false, true));
     }
 }
+
+// ── CLI flag-vs-environment-variable precedence tests ────────────────────────
+//
+// The Cli struct uses clap's `env` attribute, which means:
+//   1. An explicit flag on the command line always wins.
+//   2. When the flag is absent, clap reads the named env var.
+//   3. When neither is set, the field is None / false / the default_value.
+//
+// These tests cover the pure-logic helpers (try_resolve_source) that implement
+// the signing-key priority stack, which is the most security-sensitive
+// precedence chain in the CLI.
+
+#[cfg(test)]
+mod cli_env_flag_precedence_tests {
+    use super::*;
+
+    fn no_env(_: &str) -> Option<String> { None }
+    fn env_with_secret(val: &str) -> impl Fn(&str) -> Option<String> + '_ {
+        move |k: &str| {
+            if k == "ANCHOR_ADMIN_SECRET" { Some(val.to_string()) } else { None }
+        }
+    }
+
+    const VALID_KEY: &str = "SCZANGBA5IIPMEFXBI5LZU7RVJZOLBYHJYFJ2KYN3CQPUOVFRDPCNTY";
+    const OTHER_KEY: &str = "SBPD5ZCVZDKGAAYQJHMPBPBBAXNALZQKM7BGQTMJPXIFWMXNRFZGPMU4";
+
+    /// Explicit --ephemeral-token flag beats ANCHOR_ADMIN_SECRET env var.
+    #[test]
+    fn test_ephemeral_token_beats_env_var() {
+        let result = try_resolve_source(
+            Some(VALID_KEY), None, None, None, false,
+            &env_with_secret(OTHER_KEY),
+        );
+        assert_eq!(result.unwrap(), VALID_KEY);
+    }
+
+    /// Explicit --secret-key flag beats ANCHOR_ADMIN_SECRET env var.
+    #[test]
+    fn test_explicit_secret_key_beats_env_var() {
+        let result = try_resolve_source(
+            None, Some(VALID_KEY), None, None, false,
+            &env_with_secret(OTHER_KEY),
+        );
+        assert_eq!(result.unwrap(), VALID_KEY);
+    }
+
+    /// ANCHOR_ADMIN_SECRET env var is used when no flag is supplied.
+    #[test]
+    fn test_env_var_used_when_no_flag() {
+        let result = try_resolve_source(
+            None, None, None, None, false,
+            &env_with_secret(VALID_KEY),
+        );
+        assert_eq!(result.unwrap(), VALID_KEY);
+    }
+
+    /// When none of the sources are provided, the error message names all options.
+    #[test]
+    fn test_no_source_error_names_all_options() {
+        let err = try_resolve_source(None, None, None, None, false, &no_env).unwrap_err();
+        assert!(err.contains("--secret-key"), "got: {err}");
+        assert!(err.contains("ANCHOR_ADMIN_SECRET"), "got: {err}");
+        assert!(err.contains("--keypair-file"), "got: {err}");
+    }
+}

@@ -496,8 +496,15 @@ impl ConfigFormat {
         match path.extension().and_then(|ext| ext.to_str()) {
             Some("json") => Ok(Self::Json),
             Some("toml") => Ok(Self::Toml),
-            Some(ext) => Err(format!("unsupported config extension: {ext}")),
-            None => Err("config path has no extension".to_string()),
+            Some(ext) => Err(format!(
+                "unsupported config file extension '.{ext}' \
+                 (supported formats: .json, .toml)"
+            )),
+            None => Err(
+                "config path has no file extension \
+                 (supported formats: .json, .toml)"
+                    .to_string(),
+            ),
         }
     }
 }
@@ -1033,6 +1040,62 @@ mod hot_reload_tests {
             !err.contains("blank"),
             "missing-file error must not say 'blank', got: {err}"
         );
+    }
+
+    // ── #unsupported-format: clear diagnostic for bad extensions ─────────────
+
+    #[test]
+    fn test_load_yaml_extension_names_supported_formats() {
+        let path = scratch_path("config.yaml");
+        fs::write(&path, "{}").unwrap();
+        let err = load_runtime_config_file(&path).unwrap_err();
+        fs::remove_file(&path).ok();
+        assert!(
+            err.contains(".json") && err.contains(".toml"),
+            "unsupported extension error must name both supported formats, got: {err}",
+        );
+    }
+
+    #[test]
+    fn test_load_extensionless_path_names_supported_formats() {
+        let path = scratch_path("configrc");       // no dot → no extension
+        fs::write(&path, "{}").unwrap();
+        let err = load_runtime_config_file(&path).unwrap_err();
+        fs::remove_file(&path).ok();
+        assert!(
+            err.contains(".json") && err.contains(".toml"),
+            "no-extension error must name both supported formats, got: {err}",
+        );
+    }
+
+    #[test]
+    fn test_load_json_extension_still_parses_successfully() {
+        let path = scratch_path("valid_ext_check.json");
+        fs::write(&path, VALID_CONFIG).unwrap();
+        let result = load_runtime_config_file(&path);
+        fs::remove_file(&path).ok();
+        assert!(result.is_ok(), "valid .json config must load, got: {:?}", result);
+    }
+
+    #[test]
+    fn test_load_toml_extension_still_parses_successfully() {
+        let toml = r#"
+[contract]
+name = "TestAnchor"
+version = "1.0.0"
+network = "testnet"
+
+[[attestors.registry]]
+name = "attestor-1"
+address = "GABC123"
+role = "primary"
+enabled = true
+"#;
+        let path = scratch_path("valid_ext_check.toml");
+        fs::write(&path, toml).unwrap();
+        let result = load_runtime_config_file(&path);
+        fs::remove_file(&path).ok();
+        assert!(result.is_ok(), "valid .toml config must load, got: {:?}", result);
     }
 }
 

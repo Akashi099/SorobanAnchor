@@ -137,6 +137,37 @@ in [`docs/RUNBOOK.md`](RUNBOOK.md#admin-capability-management).
 
 ## 5  Day-to-day workflows
 
+### CLI flag and environment variable precedence
+
+Several CLI flags read from environment variables when the flag is omitted.
+When both are supplied, the explicit flag always wins.
+
+| Flag | Environment variable | Notes |
+|---|---|---|
+| `--contract-id` | `ANCHOR_CONTRACT_ID` | Contract to operate on; required for most subcommands |
+| `--network` | `STELLAR_NETWORK` | `testnet`, `mainnet`, `futurenet`, or a custom profile name |
+| `--no-interactive` | `ANCHORKIT_NO_INTERACTIVE` | Set to `1` to suppress all interactive prompts |
+| `--ephemeral-token` | `ANCHORKIT_EPHEMERAL_TOKEN` | Single-use signing token; highest priority over all other key sources |
+
+For signing key resolution the precedence order is, from highest to lowest:
+
+1. `--ephemeral-token` / `ANCHORKIT_EPHEMERAL_TOKEN`
+2. `--secret-key`
+3. `ANCHOR_ADMIN_SECRET` environment variable
+4. `--keypair-file`
+5. `--credential-name` (interactive keystore; not available when `--no-interactive` is set)
+
+Example — flag overrides the environment variable:
+
+```bash
+export STELLAR_NETWORK=testnet
+anchorkit deploy --network mainnet   # deploys to mainnet despite the env var
+```
+
+Never put real keys in shell history. Prefer `ANCHOR_ADMIN_SECRET` for
+automated flows, or `--keypair-file` pointing to a file excluded from version
+control.
+
 ### Making a change
 
 ```bash
