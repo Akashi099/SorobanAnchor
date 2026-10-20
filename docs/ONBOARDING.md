@@ -168,6 +168,22 @@ cargo test --features stress-tests      # load tests (slow)
 ./scripts/pre_deploy_validate.sh  # full pre-deploy check
 ```
 
+**Strict unknown-field rejection.** The schema uses `additionalProperties: false`
+on every object section. Any key not listed in the schema causes validation to
+fail immediately — this catches typos before they reach a running anchor. For
+example, writing `monitorring` instead of `monitoring` produces:
+
+```
+schema validation failed:
+(root): [additionalProperties] Additional properties are not allowed ('monitorring' was unexpected)
+```
+
+Correct the spelling and re-run validation. If you need values that vary per
+environment (feature flags, credentials, local overrides) keep them out of the
+anchor config file entirely and pass them via environment variables or a
+separate secrets store. The anchor config is for structural deployment
+configuration only.
+
 ### Generating API docs
 
 Refresh the browsable crate reference whenever the public exports change:

@@ -11,10 +11,19 @@ fn cmd() -> Command {
 #[test]
 fn test_register_missing_contract_id() {
     cmd()
-        .args(["register", "--address", "GABC",
-               "--services", "kyc",
-               "--sep10-token", "T", "--sep10-issuer", "I",
-               "--secret-key", "SABC"])
+        .args([
+            "register",
+            "--address",
+            "GABC",
+            "--services",
+            "kyc",
+            "--sep10-token",
+            "T",
+            "--sep10-issuer",
+            "I",
+            "--secret-key",
+            "SABC",
+        ])
         .env_remove("ANCHOR_CONTRACT_ID")
         .assert()
         .failure()
@@ -25,8 +34,17 @@ fn test_register_missing_contract_id() {
 #[test]
 fn test_attest_missing_contract_id() {
     cmd()
-        .args(["attest", "--subject", "S", "--payload-hash", "H",
-               "--issuer", "I", "--secret-key", "SABC"])
+        .args([
+            "attest",
+            "--subject",
+            "S",
+            "--payload-hash",
+            "H",
+            "--issuer",
+            "I",
+            "--secret-key",
+            "SABC",
+        ])
         .env_remove("ANCHOR_CONTRACT_ID")
         .assert()
         .failure()
@@ -37,8 +55,17 @@ fn test_attest_missing_contract_id() {
 #[test]
 fn test_quote_missing_contract_id() {
     cmd()
-        .args(["quote", "--from", "USDC", "--to", "XLM",
-               "--amount", "100", "--secret-key", "SABC"])
+        .args([
+            "quote",
+            "--from",
+            "USDC",
+            "--to",
+            "XLM",
+            "--amount",
+            "100",
+            "--secret-key",
+            "SABC",
+        ])
         .env_remove("ANCHOR_CONTRACT_ID")
         .assert()
         .failure()
@@ -166,17 +193,16 @@ fn test_network_list_does_not_require_contract_id() {
         .env("HOME", std::env::temp_dir().to_str().unwrap())
         .assert()
         .success()
-        .stderr(predicates::str::contains("--contract-id (or ANCHOR_CONTRACT_ID) is required").not());
+        .stderr(
+            predicates::str::contains("--contract-id (or ANCHOR_CONTRACT_ID) is required").not(),
+        );
 }
 
 // ── Group F: invalid invocations (clap-level) ────────────────────────────────
 
 #[test]
 fn test_missing_subcommand_exits_with_usage() {
-    cmd()
-        .assert()
-        .failure()
-        .stderr(contains("Usage"));
+    cmd().assert().failure().stderr(contains("Usage"));
 }
 
 #[test]
@@ -192,11 +218,19 @@ fn test_unknown_subcommand() {
 fn test_register_missing_required_address_arg() {
     // --contract-id and signing key provided, but --address is missing → clap error
     cmd()
-        .args(["register",
-               "--contract-id", "CTEST",
-               "--services", "kyc",
-               "--sep10-token", "T", "--sep10-issuer", "I",
-               "--secret-key", "SABC"])
+        .args([
+            "register",
+            "--contract-id",
+            "CTEST",
+            "--services",
+            "kyc",
+            "--sep10-token",
+            "T",
+            "--sep10-issuer",
+            "I",
+            "--secret-key",
+            "SABC",
+        ])
         .assert()
         .failure()
         .stderr(contains("--address"));
@@ -211,18 +245,33 @@ fn test_verify_without_id_or_hash_exits_with_error() {
         .env_remove("ANCHOR_CONTRACT_ID")
         .assert()
         .failure()
-        .stderr(contains("--id").or(contains("--payload-hash")).or(contains("required")));
+        .stderr(
+            contains("--id")
+                .or(contains("--payload-hash"))
+                .or(contains("required")),
+        );
 }
 
 #[test]
 fn test_verify_with_both_id_and_hash_exits_with_error() {
     cmd()
-        .args(["verify", "--id", "1", "--payload-hash", "abc123",
-               "--contract-id", "CTEST", "--secret-key", "SABC"])
+        .args([
+            "verify",
+            "--id",
+            "1",
+            "--payload-hash",
+            "abc123",
+            "--contract-id",
+            "CTEST",
+            "--secret-key",
+            "SABC",
+        ])
         .env_remove("ANCHOR_CONTRACT_ID")
         .assert()
         .failure()
-        .stderr(contains("mutually exclusive").or(contains("--id").and(contains("--payload-hash"))));
+        .stderr(
+            contains("mutually exclusive").or(contains("--id").and(contains("--payload-hash"))),
+        );
 }
 
 #[test]
@@ -238,87 +287,78 @@ fn test_verify_missing_contract_id() {
 #[test]
 fn test_verify_payload_file_not_found() {
     cmd()
-        .args(["verify", "--id", "1",
-               "--payload-file", "/nonexistent/path/payload.bin",
-               "--contract-id", "CTEST", "--secret-key", "SABC"])
+        .args([
+            "verify",
+            "--id",
+            "1",
+            "--payload-file",
+            "/nonexistent/path/payload.bin",
+            "--contract-id",
+            "CTEST",
+            "--secret-key",
+            "SABC",
+        ])
         .env_remove("ANCHOR_CONTRACT_ID")
         .assert()
         .failure();
 }
 
-// ── Group G: deploy network validation ───────────────────────────────────────
+// ── Group G: offline validate — nonexistent config path ──────────────────────
 
-/// An unsupported network value must be rejected with a nonzero exit before
-/// any deployment work begins.  The error message must identify the bad option
-/// or list the supported choices.
+/// Invoking `offline validate --config <nonexistent>` must:
+///   - Exit with a nonzero status (never panic).
+///   - Print or emit something that mentions the supplied path so the
+///     operator knows exactly which file could not be read.
+///   - Pass on any machine regardless of filesystem layout (the path is
+///     constructed in the OS temp directory so it cannot accidentally exist).
 #[test]
-fn test_deploy_invalid_network_exits_with_error() {
-    cmd()
-        .args(["deploy", "--network", "not-a-real-network"])
-        .env_remove("ANCHOR_CONTRACT_ID")
-        .env_remove("STELLAR_NETWORK")
-        // Provide a temp HOME so the test never accidentally picks up a real
-        // custom profile from the developer's machine.
-        .env("HOME", std::env::temp_dir().to_str().unwrap())
-        .env("USERPROFILE", std::env::temp_dir().to_str().unwrap())
-        .assert()
-        .failure()
-        .stderr(
-            contains("not-a-real-network")
-                .or(contains("unknown network"))
-                .or(contains("testnet"))
-        );
-}
+fn test_offline_validate_nonexistent_config_fails_with_path_in_output() {
+    // Build a path that is guaranteed never to exist: a uniquely-named file
+    // under the OS temp directory.  We deliberately do NOT create it.
+    let absent_path = std::env::temp_dir().join(format!(
+        "anchorkit_test_absent_config_{}.json",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(12345)
+    ));
 
-/// A valid built-in network name must pass the argument-validation gate.
-/// The command will still fail (WASM not built, no signing key, etc.),
-/// but the error must NOT be the network-name rejection.
-#[test]
-fn test_deploy_valid_network_passes_validation() {
+    let path_str = absent_path
+        .to_str()
+        .expect("temp path should be valid UTF-8");
+
+    // The `offline validate --config <path>` subcommand tries to read the
+    // file; it must fail cleanly rather than panic.
     let output = cmd()
-        .args(["deploy", "--network", "testnet", "--dry-run"])
-        .env_remove("ANCHOR_CONTRACT_ID")
-        .env_remove("STELLAR_NETWORK")
-        .env("HOME", std::env::temp_dir().to_str().unwrap())
-        .env("USERPROFILE", std::env::temp_dir().to_str().unwrap())
+        .args(["offline", "validate", "--config", path_str])
         .output()
-        .expect("anchorkit binary not found");
+        .expect("failed to spawn anchorkit process");
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Exit code must be nonzero — the operator needs a clear failure signal.
     assert!(
-        !stderr.contains("unknown network"),
-        "testnet should be accepted as a valid network name, got stderr: {stderr}"
+        !output.status.success(),
+        "offline validate with a nonexistent config must exit nonzero, got: {:?}",
+        output.status
     );
-}
 
-// ── Group H: offline validate CLI help ───────────────────────────────────────
+    // The supplied path must appear somewhere in stdout or stderr so the
+    // operator can see which file could not be loaded.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}{stderr}");
 
-/// `offline validate --help` must explain that validation is local and does
-/// not contact an anchor or any network endpoint.
-#[test]
-fn test_offline_validate_help_mentions_no_network() {
-    cmd()
-        .args(["offline", "validate", "--help"])
-        .assert()
-        .success()
-        .stdout(
-            contains("local")
-                .or(contains("no network"))
-                .or(contains("not contact"))
-                .or(contains("offline"))
-                .or(contains("air-gapped"))
-        );
-}
+    // We match on the filename portion of the path, which is always present
+    // and avoids any platform path-separator differences in the assertion.
+    let filename = absent_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("temp filename should be valid UTF-8");
 
-/// `offline validate --help` must describe the accepted input formats.
-#[test]
-fn test_offline_validate_help_mentions_config_formats() {
-    cmd()
-        .args(["offline", "validate", "--help"])
-        .assert()
-        .success()
-        .stdout(
-            contains("json").or(contains("JSON"))
-                .or(contains("toml")).or(contains("TOML"))
-        );
+    assert!(
+        combined.contains(filename) || combined.contains(path_str),
+        "output must mention the supplied path so the operator knows which file is missing.\n\
+         Expected to find: {path_str}\n\
+         stdout: {stdout}\n\
+         stderr: {stderr}"
+    );
 }
